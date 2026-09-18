@@ -1,4 +1,4 @@
-use super::statusline::{settings_path, Adapter};
+use super::statusline::Adapter;
 use crate::cache::CacheStore;
 use crate::model::Provider;
 use crate::providers::agy::parse_statusline;
@@ -11,31 +11,26 @@ const CONFIG: Adapter = Adapter {
     label: "Agy",
     subcommand: "agy-statusline",
     backup_file: "agy-statusline.original.json",
+    settings_env: "AGY_SETTINGS_FILE",
+    default_settings_relative: ".gemini/antigravity-cli/settings.json",
 };
 
 pub fn check() -> Result<()> {
-    CONFIG.check(&settings_path(
-        "AGY_SETTINGS_FILE",
-        ".gemini/antigravity-cli/settings.json",
-    )?)
+    let state = CacheStore::from_env()
+        .ok()
+        .map(|cache| cache.root().to_path_buf());
+    CONFIG.check(&CONFIG.settings_path()?, state.as_deref())
 }
 
 pub fn apply() -> Result<()> {
     let cache = CacheStore::from_env()?;
     let executable = std::env::current_exe().context("resolve plugin executable")?;
-    apply_at(
-        &settings_path("AGY_SETTINGS_FILE", ".gemini/antigravity-cli/settings.json")?,
-        cache.root(),
-        &executable,
-    )
+    apply_at(&CONFIG.settings_path()?, cache.root(), &executable)
 }
 
 pub fn uninstall() -> Result<()> {
     let cache = CacheStore::from_env()?;
-    uninstall_at(
-        &settings_path("AGY_SETTINGS_FILE", ".gemini/antigravity-cli/settings.json")?,
-        cache.root(),
-    )
+    uninstall_at(&CONFIG.settings_path()?, cache.root())
 }
 
 pub fn apply_at(settings: &Path, state: &Path, executable: &Path) -> Result<()> {

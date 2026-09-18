@@ -1,4 +1,4 @@
-use super::statusline::{settings_path, Adapter};
+use super::statusline::Adapter;
 use crate::cache::{CacheStore, DEFAULT_WATCH_INTERVAL_SECONDS};
 use crate::model::Provider;
 use crate::presentation::pace_segment;
@@ -8,24 +8,28 @@ use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::Path;
 
+/// Backups are keyed by the settings file this adapter took over, because one
+/// machine runs several Claude HOMEs through `CLAUDE_SETTINGS_FILE`.
 const CONFIG: Adapter = Adapter {
     label: "Claude",
     subcommand: "claude-statusline",
     backup_file: "claude-statusline.original.json",
+    settings_env: "CLAUDE_SETTINGS_FILE",
+    default_settings_relative: ".claude/settings.json",
 };
 
 pub fn check() -> Result<()> {
-    CONFIG.check(&settings_path(
-        "CLAUDE_SETTINGS_FILE",
-        ".claude/settings.json",
-    )?)
+    let state = CacheStore::from_env()
+        .ok()
+        .map(|cache| cache.root().to_path_buf());
+    CONFIG.check(&CONFIG.settings_path()?, state.as_deref())
 }
 
 pub fn apply() -> Result<()> {
     let cache = CacheStore::from_env()?;
     let executable = std::env::current_exe().context("resolve plugin executable")?;
     apply_at_with_refresh_interval(
-        &settings_path("CLAUDE_SETTINGS_FILE", ".claude/settings.json")?,
+        &CONFIG.settings_path()?,
         cache.root(),
         &executable,
         cache.watch_interval_seconds(),
@@ -36,7 +40,7 @@ pub fn apply_with_refresh_interval(refresh_interval_seconds: u64) -> Result<()> 
     let cache = CacheStore::from_env()?;
     let executable = std::env::current_exe().context("resolve plugin executable")?;
     apply_at_with_refresh_interval(
-        &settings_path("CLAUDE_SETTINGS_FILE", ".claude/settings.json")?,
+        &CONFIG.settings_path()?,
         cache.root(),
         &executable,
         refresh_interval_seconds,
@@ -45,10 +49,7 @@ pub fn apply_with_refresh_interval(refresh_interval_seconds: u64) -> Result<()> 
 
 pub fn uninstall() -> Result<()> {
     let cache = CacheStore::from_env()?;
-    uninstall_at(
-        &settings_path("CLAUDE_SETTINGS_FILE", ".claude/settings.json")?,
-        cache.root(),
-    )
+    uninstall_at(&CONFIG.settings_path()?, cache.root())
 }
 
 pub fn apply_at(settings: &Path, state: &Path, executable: &Path) -> Result<()> {
