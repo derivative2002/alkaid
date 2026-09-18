@@ -1,0 +1,103 @@
+# GitLab CI pipeline, mirroring .github/workflows/ci.yml.
+#
+# The GitHub workflow stays in the repository on purpose: this file is the
+# equivalent, not a replacement, so a fork that is mirrored to both forges
+# gets the same gates on either side. When a gate changes, change it in both.
+#
+# The same set runs locally via scripts/check-local.sh, which is the third
+# copy of these commands and the one a contributor uses before pushing.
+
+stages:
+  - lint
+  - test
+  - build
+  - audit
+
+# Mirror of the GitHub `on:` block. GitHub triggers on pushes to main, pull
+# requests, manual dispatch, and a weekly scheduled run; GitLab spells those
+# as pipeline sources.
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+# rust-toolchain.toml pins 1.95.0 with the rustfmt and clippy components, so
+# the image tag and the pin agree and `rustup show` has nothing to download.
+default:
+  image: rust:1.95.0
+  # A superseded pipeline is worthless; killing it frees the runner for the
+  # next push to the same branch or merge request.
+  interruptible: true
+  cache:
+    # target/ is the whole point: a cold Rust build of this crate compiles
+    # bundled SQLite and is minutes long, an incremental one is seconds.
+    # Keyed on Cargo.lock so a dependency change invalidates it.
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - target/
+  # Same workflow-level env as GitHub. RUSTFLAGS applies -D warnings to every
+  # rustc invocation, so a warning fails lint, test, and build alike.
+  variables:
+    CARGO_TERM_COLOR: always
+    RUSTFLAGS: "-D warnings"
+  before_script:
+    # Installs the toolchain rust-toolchain.toml pins, components included.
+    - rustup show
+    - rustc --version && cargo --version
+
+fmt:
+  stage: lint
+  script:
+    - cargo fmt --all -- --check
+
+clippy:
+  stage: lint
+  script:
+    - cargo clippy --all-targets --all-features -- -D warnings
+
+test:
+  stage: test
+  script:
+    - cargo test --all-targets --all-features --locked
+  # The GitHub workflow runs this job on ubuntu-latest and macos-latest.
+  # GitLab.com's macOS runners are not available on every plan, so the matrix
+  # collapses to Linux here; run the macOS half through the GitHub workflow,
+  # or add a `macos` job on a macOS runner when the project has one.
+
+# Herdr refuses to load a plugin whose root manifest is missing or malformed,
+# so a broken manifest must fail here rather than on install. python:3.12 has
+# tomllib in the standard library, which is what the GitHub job relies on.
+manifest:
+  stage: test
+  image: python:3.12-slim
+  cache: {}
+  script:
+    - |
+      python3 - <<'PY'
+      import sys, tomllib
+      with open("herdr-plugin.toml", "rb") as handle:
+          manifest = tomllib.load(handle)
+      for key in ("id", "name", "version", "min_herdr_version", "description"):
+          if not manifest.get(key):
+              sys.exit(f"herdr-plugin.toml is missing required key: {key}")
+      print("herdr-plugin.toml is valid")
+      PY
+
+build:
+  stage: build
+  script:
+    - cargo build --release --locked
+
+# This plugin reads credential stores and sends bearer tokens to provider
+# billing endpoints, so a known-vulnerable dependency is a security issue,
+# not a chore. GitHub installs cargo-audit with taiki-e/install-action and
+# runs it on every trigger; the copy keeps the weekly schedule honest.
+audit:
+  stage: audit
+  script:
+    - cargo install --locked cargo-audit
+    - cargo audit --deny warnings
