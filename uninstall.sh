@@ -3,14 +3,14 @@
 #
 # Usage:
 #   ./uninstall.sh                    # restore config, then unlink
-#   ./uninstall.sh --agent grok       # remove only that agent, stay installed
+#   ./uninstall.sh --agent codex      # remove only that agent, stay installed
 #
 # A full uninstall also drops the saved sidebar-layout, row-gap,
 # quota-percent, fields, brand-colors, agent-order, and low-quota-alert prefs,
 # and hands Herdr's agent panel back its own ordering.
 #
 # The restore action runs, and is waited for, before unlinking: Herdr owns the
-# plugin state directory holding the Claude/Agy statusLine backups, and
+# plugin state directory holding the Claude statusLine backup, and
 # `herdr plugin action invoke` returns before the action has finished.
 set -euo pipefail
 

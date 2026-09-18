@@ -123,64 +123,6 @@ impl CacheStore {
         Self::atomic_replace(&destination, &temporary, bytes)
     }
 
-    /// One sanitized report per OMP provider retains all reported account
-    /// pins without spawning the CLI once for each pane/account.
-    pub fn load_omp_usage(
-        &self,
-        target: &BillingTarget,
-    ) -> Option<crate::providers::omp::ProviderUsage> {
-        let bytes = fs::read(
-            self.root
-                .join(format!("{}.usage.json", target.cache_identity())),
-        )
-        .ok()?;
-        serde_json::from_slice(&bytes).ok()
-    }
-
-    pub fn save_omp_usage(
-        &self,
-        target: &BillingTarget,
-        usage: &crate::providers::omp::ProviderUsage,
-    ) -> Result<()> {
-        self.ensure()?;
-        let mut usage = usage.clone();
-        let previous_accounts = self
-            .load_omp_usage(target)
-            .map(|report| report.accounts)
-            .unwrap_or_else(|| {
-                self.load_target(target)
-                    .ok()
-                    .flatten()
-                    .map(|snapshot| {
-                        vec![crate::providers::omp::AccountUsage {
-                            pin: snapshot.account_id,
-                            windows: snapshot.windows,
-                            fetched_at_unix: snapshot.fetched_at_unix,
-                        }]
-                    })
-                    .unwrap_or_default()
-            });
-        for account in previous_accounts {
-            if account.pin.is_some()
-                && usage.oauth_without_usage_pins.contains(&account.pin)
-                && !usage
-                    .accounts
-                    .iter()
-                    .any(|current| current.pin == account.pin)
-            {
-                usage.accounts.push(account);
-            }
-        }
-        let name = format!("{}.usage.json", target.cache_identity());
-        Self::atomic_replace(
-            &self.root.join(&name),
-            &self
-                .root
-                .join(format!(".{name}.{}.tmp", std::process::id())),
-            serde_json::to_vec(&usage)?,
-        )
-    }
-
     pub fn should_debounce_target(
         &self,
         target: &BillingTarget,
@@ -1276,7 +1218,7 @@ mod tests {
 
     fn snapshot() -> ProviderSnapshot {
         ProviderSnapshot::new(
-            Provider::Grok,
+            Provider::Claude,
             vec![UsageWindow::new(WindowKind::Weekly, 42.5, None).unwrap()],
             123,
         )
@@ -1305,80 +1247,16 @@ mod tests {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
         cache.save(&snapshot()).unwrap();
-        assert_eq!(cache.load(Provider::Grok).unwrap(), Some(snapshot()));
+        assert_eq!(cache.load(Provider::Claude).unwrap(), Some(snapshot()));
     }
 
     #[test]
-    fn omp_upgrade_preserves_only_an_explicitly_confirmed_failed_account() {
-        let directory = tempdir().unwrap();
-        let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::omp("anthropic");
-        let mut previous = snapshot();
-        previous.account_id = Some("old-pin".into());
-        cache.save_target(&target, &previous).unwrap();
-        let usage = crate::providers::omp::ProviderUsage {
-            oauth_without_usage_pins: vec![Some("old-pin".into())],
-            ..Default::default()
-        };
-        cache.save_omp_usage(&target, &usage).unwrap();
-        let migrated = cache.load_omp_usage(&target).unwrap();
-        assert_eq!(migrated.accounts.len(), 1);
-        assert_eq!(migrated.accounts[0].windows, previous.windows);
-        cache.save_omp_usage(&target, &usage).unwrap();
-        assert_eq!(cache.load_omp_usage(&target).unwrap(), migrated);
-        cache
-            .save_omp_usage(
-                &target,
-                &crate::providers::omp::ProviderUsage {
-                    oauth_without_usage_pins: vec![Some("new-pin".into())],
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert!(cache.load_omp_usage(&target).unwrap().accounts.is_empty());
-    }
-
-    #[test]
-    fn opencode_go_lease_does_not_touch_original_four_cache_files() {
-        let directory = tempdir().unwrap();
-        let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::opencode_go();
-        let lease = cache.try_lock_target_refresh(&target).unwrap();
-        assert!(lease.is_some());
-        assert!(directory
-            .path()
-            .join("opencode-go.opencode-store.refresh.lock")
-            .exists());
-        for filename in [
-            "codex-app-server.json",
-            "grok-cli-billing.json",
-            "claude-statusline.json",
-            "agy-statusline.json",
-            "codex-app-server.refresh.lock",
-            "grok-cli-billing.refresh.lock",
-            "claude-statusline.refresh.lock",
-            "agy-statusline.refresh.lock",
-            "codex-app-server.refresh",
-            "grok-cli-billing.refresh",
-            "claude-statusline.refresh",
-            "agy-statusline.refresh",
-        ] {
-            assert!(
-                !directory.path().join(filename).exists(),
-                "OpenCode lease created {filename}"
-            );
-        }
-    }
-
-    #[test]
-    fn original_four_snapshots_use_canonical_0_2_cache_filenames() {
+    fn canonical_snapshots_use_their_0_2_cache_filenames() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
         for (provider, filename) in [
             (Provider::Codex, "codex-app-server.json"),
-            (Provider::Grok, "grok-cli-billing.json"),
             (Provider::Claude, "claude-statusline.json"),
-            (Provider::Agy, "agy-statusline.json"),
         ] {
             cache
                 .save(&ProviderSnapshot::new(provider, vec![], 1))
@@ -2046,7 +1924,7 @@ mod tests {
         let latest = snapshot().with_context(Some(ContextUsage::new(24.0).unwrap()));
         cache.save_preserving_context(latest).unwrap();
         let saved_context = cache
-            .load(Provider::Grok)
+            .load(Provider::Claude)
             .unwrap()
             .unwrap()
             .context
@@ -2063,7 +1941,7 @@ mod tests {
         cache
             .save_preserving_context_for_session(current, Some("session-1"))
             .unwrap();
-        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        let saved = cache.load(Provider::Claude).unwrap().unwrap();
         assert_eq!(
             saved
                 .context_for_session(Some("session-1"))
@@ -2092,7 +1970,7 @@ mod tests {
         cache
             .save_preserving_context_for_session(current, Some("session-1"))
             .unwrap();
-        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        let saved = cache.load(Provider::Claude).unwrap().unwrap();
         assert_eq!(saved.session_models["session-1"], "Sonnet");
     }
 
@@ -2101,10 +1979,10 @@ mod tests {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
         let mut previous = snapshot().with_account_id(Some("account-1".to_string()));
-        previous.model = Some("grok-4.6".to_string());
+        previous.model = Some("gpt-5-codex".to_string());
         previous
             .session_models
-            .insert("session-1".to_string(), "grok-4.6".to_string());
+            .insert("session-1".to_string(), "gpt-5-codex".to_string());
         previous
             .session_contexts
             .insert("session-1".to_string(), ContextUsage::new(24.0).unwrap());
@@ -2112,9 +1990,9 @@ mod tests {
 
         let latest = snapshot().with_account_id(Some("account-1".to_string()));
         cache.save_preserving_diagnostics(latest).unwrap();
-        let saved = cache.load(Provider::Grok).unwrap().unwrap();
-        assert_eq!(saved.model.as_deref(), Some("grok-4.6"));
-        assert_eq!(saved.session_models["session-1"], "grok-4.6");
+        let saved = cache.load(Provider::Claude).unwrap().unwrap();
+        assert_eq!(saved.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(saved.session_models["session-1"], "gpt-5-codex");
         assert!(saved.session_contexts.contains_key("session-1"));
     }
 
@@ -2139,30 +2017,31 @@ mod tests {
                 None,
             )
             .unwrap();
-        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        let saved = cache.load(Provider::Claude).unwrap().unwrap();
         assert!(saved.context_for_session(Some("new-session")).is_none());
     }
 
-    /// A Herdr agent event names one pane, so Grok's fetch enriches only that
-    /// session. The panes it did not look at must keep their context instead
-    /// of losing it and being republished as a cleared token — every such
-    /// write risks a visible repaint.
+    /// A Herdr agent event names one pane, so a direct fetch enriches only
+    /// that session. The panes it did not look at must keep their context
+    /// instead of losing it and being republished as a cleared token — every
+    /// such write risks a visible repaint.
     #[test]
     fn a_single_pane_refresh_keeps_the_other_panes_diagnostics() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
-        let mut previous = snapshot();
+        let codex_snapshot = || ProviderSnapshot::new(Provider::Codex, vec![], 123);
+        let mut previous = codex_snapshot();
         for session_id in ["pane-a", "pane-b"] {
             previous
                 .session_contexts
                 .insert(session_id.to_string(), ContextUsage::new(42.0).unwrap());
             previous
                 .session_models
-                .insert(session_id.to_string(), "grok-4.6".to_string());
+                .insert(session_id.to_string(), "gpt-5-codex".to_string());
         }
         cache.save(&previous).unwrap();
 
-        let mut latest = snapshot();
+        let mut latest = codex_snapshot();
         latest
             .session_contexts
             .insert("pane-a".to_string(), ContextUsage::new(51.0).unwrap());
@@ -2170,7 +2049,7 @@ mod tests {
             .save_preserving_diagnostics_for_sessions(&mut latest, &["pane-a".to_string()], None)
             .unwrap();
 
-        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        let saved = cache.load(Provider::Codex).unwrap().unwrap();
         assert_eq!(
             saved
                 .context_for_session(Some("pane-a"))
@@ -2185,14 +2064,14 @@ mod tests {
             Some(42.0),
             "an untouched session must keep its last known context"
         );
-        assert_eq!(saved.session_models["pane-b"], "grok-4.6");
+        assert_eq!(saved.session_models["pane-b"], "gpt-5-codex");
     }
 
     #[test]
     fn direct_provider_diagnostics_remain_bounded() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
-        let mut previous = snapshot();
+        let mut previous = ProviderSnapshot::new(Provider::Codex, vec![], 123);
         for index in 0..(MAX_STATUSLINE_SESSIONS + 8) {
             let session_id = format!("session-{index}");
             previous
@@ -2204,8 +2083,10 @@ mod tests {
         }
         cache.save(&previous).unwrap();
 
-        cache.save_preserving_diagnostics(snapshot()).unwrap();
-        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        cache
+            .save_preserving_diagnostics(ProviderSnapshot::new(Provider::Codex, vec![], 124))
+            .unwrap();
+        let saved = cache.load(Provider::Codex).unwrap().unwrap();
         assert_eq!(saved.session_models.len(), MAX_STATUSLINE_SESSIONS);
         assert_eq!(saved.session_contexts.len(), MAX_STATUSLINE_SESSIONS);
     }
@@ -2322,7 +2203,7 @@ mod tests {
         cache
             .save_preserving_context_for_session(same_session, Some("session-1"))
             .unwrap();
-        let saved = cache.load(Provider::Grok).unwrap().unwrap();
+        let saved = cache.load(Provider::Claude).unwrap().unwrap();
         let saved_cache = saved.context.unwrap().cache.unwrap();
         assert_eq!(saved_cache.session_totals, previous_cache.session_totals);
         assert_eq!(saved_cache.transcript_offset, 512);
@@ -2339,7 +2220,7 @@ mod tests {
             .save_preserving_context_for_session(new_session, Some("session-2"))
             .unwrap();
         let saved_cache = cache
-            .load(Provider::Grok)
+            .load(Provider::Claude)
             .unwrap()
             .unwrap()
             .context
@@ -2655,7 +2536,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(cache
-            .try_lock_provider_refresh(Provider::Agy)
+            .try_lock_provider_refresh(Provider::Codex)
             .unwrap()
             .is_some());
     }

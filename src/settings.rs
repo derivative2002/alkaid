@@ -19,6 +19,7 @@ use crate::cli::{
 use crate::model::Harness;
 use crate::prefs;
 use anyhow::{Context, Result};
+use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, IsTerminal, Write};
@@ -329,7 +330,7 @@ fn interactive(applied: Settings) -> Result<()> {
             print!(
                 "{}{}{frame}",
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                crossterm::cursor::MoveTo(0, 0)
+                MoveTo(0, 0)
             );
             io::stdout().flush()?;
             painted = Some(frame);
@@ -677,8 +678,8 @@ mod tests {
         assert!(!draft.fields.contains(SidebarField::Cache));
         assert!(draft.fields.contains(SidebarField::Ttl));
 
-        draft.cycle(Row::Agent(Harness::Grok), 1);
-        assert!(!draft.has_agent(Harness::Grok));
+        draft.cycle(Row::Agent(Harness::Codex), 1);
+        assert!(!draft.has_agent(Harness::Codex));
         assert!(draft.has_agent(Harness::Claude));
     }
 
@@ -691,14 +692,14 @@ mod tests {
         let mut draft = settings();
         draft.cycle(Row::Choice(Choice::Percent), 1);
         draft.cycle(Row::Field(SidebarField::Topic), 1);
-        draft.cycle(Row::Agent(Harness::Pi), 1);
+        draft.cycle(Row::Agent(Harness::Codex), 1);
         assert_eq!(
             draft.apply_arguments(),
             vec![
                 "configure",
                 "--apply",
                 "--agent",
-                "claude,codex,grok,agy,opencode,omp,devin,muse,cursor",
+                "claude",
                 "--quota-percent",
                 "used",
                 "--sidebar-layout",
@@ -744,18 +745,6 @@ mod tests {
         let arguments = settings().apply_arguments();
         let agent = arguments.iter().position(|flag| flag == "--agent").unwrap();
         assert_eq!(arguments[agent + 1], "all");
-    }
-
-    #[test]
-    fn turning_the_newest_agent_off_is_an_exact_cli_list() {
-        let mut draft = settings();
-        draft.cycle(Row::Agent(Harness::Cursor), 1);
-        let arguments = draft.apply_arguments();
-        let agent = arguments.iter().position(|flag| flag == "--agent").unwrap();
-        assert_eq!(
-            arguments[agent + 1],
-            "claude,codex,grok,agy,opencode,pi,omp,devin,muse"
-        );
     }
 
     /// Turning every field off is a real choice, and `configure` accepts the
@@ -841,17 +830,6 @@ mod tests {
     }
 
     /// A selection below the fold has to bring its own row into view.
-    #[test]
-    fn the_list_scrolls_to_keep_the_selection_visible() {
-        let rows = rows();
-        let last = rows.len() - 1;
-        let frame = render(&settings(), settings(), last, 24, None);
-        assert!(frame.contains("pi"), "{frame}");
-        assert!(frame.contains("\u{2191} more"), "{frame}");
-        let top = render(&settings(), settings(), first_selectable(&rows), 24, None);
-        assert!(top.contains("\u{2193} more"), "{top}");
-    }
-
     #[test]
     fn intervals_read_as_minutes_when_they_divide_evenly() {
         assert_eq!(format_interval(30), "30s");

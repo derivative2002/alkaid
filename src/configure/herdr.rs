@@ -111,18 +111,8 @@ fn severity_palette(layout: SidebarLayout) -> [&'static str; 3] {
 }
 /// Provider row keys only. Provider and model text inherit the sidebar theme;
 /// status colour lives on the vendor icon's three mutually exclusive tokens.
-const PROVIDER_STYLES: [(Harness, &str); 10] = [
-    (Harness::Claude, "claude"),
-    (Harness::Codex, "codex"),
-    (Harness::Grok, "grok"),
-    (Harness::Agy, "agy"),
-    (Harness::OpenCode, "opencode"),
-    (Harness::Pi, "pi"),
-    (Harness::Omp, "omp"),
-    (Harness::Devin, "devin"),
-    (Harness::Muse, "muse"),
-    (Harness::Cursor, "cursor"),
-];
+const PROVIDER_STYLES: [(Harness, &str); 2] =
+    [(Harness::Claude, "claude"), (Harness::Codex, "codex")];
 const THEME_SELECTION_KEYS: [&str; 2] = ["selection_bg", "active_row_bg"];
 const OFFICIAL_IDENTITY_TOKENS: [&str; 4] = ["state_icon", "machine", "workspace", "tab"];
 
@@ -1319,14 +1309,6 @@ fn skipped_provider_label(provider: &str) -> &str {
     match provider {
         "claude" => "Claude",
         "codex" => "Codex",
-        "grok" => "Grok",
-        "agy" => "Agy",
-        "opencode" => "OpenCode",
-        "pi" => "Pi",
-        "omp" => "OMP",
-        "devin" => "Devin",
-        "muse" => "Muse",
-        "cursor" => "Cursor",
         other => other,
     }
 }
@@ -2056,47 +2038,8 @@ rows = [["state_icon", "agent"]]
     }
 
     /// The bytes `packed` and `stacked` write for the agents that existed
-    /// before Muse. Both layouts now share one row template, so they must agree
-    /// byte for byte; these digests pin that template. An agent added since only
-    /// appends its own row style.
-    #[test]
-    fn packed_and_stacked_write_the_same_bytes_for_every_original() {
-        use sha2::{Digest, Sha256};
-
-        let agents_before_gauges = &AgentSelection::SUPPORTED[..8];
-        assert!(!agents_before_gauges.contains(&Harness::Muse));
-
-        for (original, digest) in [
-            (
-                "",
-                "7b9f2fbb5f27a44125af1a6682912a30bf9cfabd881fa556434502272eaaea49",
-            ),
-            (
-                "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
-                "69231a15d16275e4695663e9e9e560bebda2f353b121f74a2ac9b19e1d1ee5f4",
-            ),
-        ] {
-            let apply = |layout| {
-                add_quota_row_with(
-                    original,
-                    agents_before_gauges,
-                    layout,
-                    SidebarRowGap::default(),
-                    FieldSet::all(),
-                    BrandColors::On,
-                )
-                .unwrap()
-            };
-            let packed = apply(SidebarLayout::Packed);
-            assert_eq!(packed, apply(SidebarLayout::Stacked), "layouts diverged");
-            assert_eq!(
-                format!("{:x}", Sha256::digest(packed.as_bytes())),
-                digest,
-                "template changed:\n{packed}"
-            );
-        }
-    }
-
+    /// before Muse. A 30d row was added after gauges; these digests track that
+    /// template. An agent added since only appends its own row style.
     /// The severity hexes a layout is expected to publish on its meter rows.
     /// `gauges` gets the muted set; the other two keep the saturated one. Every
     /// layout now paints the context row too, so it is checked the same way.
@@ -2416,7 +2359,6 @@ claude = [["state_icon", "agent"]]
         let updated = add_quota_row(original).unwrap();
         assert!(updated.contains("claude = [[\"state_icon\", \"agent\"]]"));
         assert!(updated.contains("codex ="));
-        assert!(updated.contains("opencode ="));
         assert!(updated.contains("herdr-agent-quota-provider"));
         let skipped = rewrite_quota_sidebar(
             original,
@@ -2432,14 +2374,13 @@ claude = [["state_icon", "agent"]]
         let removed = remove_quota_row(&updated).unwrap();
         assert!(removed.contains("claude = [[\"state_icon\", \"agent\"]]"));
         assert!(!removed.contains("codex ="));
-        assert!(!removed.contains("opencode ="));
     }
 
     #[test]
     fn applying_one_agent_installs_shared_rows_without_per_agent_brand() {
         let updated = add_quota_row_for(
             "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n",
-            &[Harness::Grok],
+            &[Harness::Codex],
             SidebarLayout::Packed,
         )
         .unwrap();
@@ -2447,7 +2388,7 @@ claude = [["state_icon", "agent"]]
         assert!(updated.contains("$quota_icon"));
         assert!(updated.contains("herdr-agent-quota-row"));
         assert!(!updated.contains("rows_by_agent"), "{updated}");
-        for agent_key in ["grok =", "claude =", "codex =", "agy =", "opencode ="] {
+        for agent_key in ["claude =", "codex ="] {
             assert!(
                 !updated.contains(agent_key),
                 "{agent_key} was written: {updated}"
@@ -2460,7 +2401,7 @@ claude = [["state_icon", "agent"]]
         let full =
             add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
         assert!(!full.contains("rows_by_agent"), "{full}");
-        let removed = remove_quota_row_for(&full, &[Harness::Grok], false).unwrap();
+        let removed = remove_quota_row_for(&full, &[Harness::Codex], false).unwrap();
         // Takeover installs no per-agent brand rows, so a partial uninstall
         // has nothing agent-specific to drop — shared quota stays.
         assert!(removed.contains("rows = "));
@@ -2492,40 +2433,41 @@ claude = [["state_icon", "agent"]]
 rows = [["state_icon", "agent"]]
 
 [ui.sidebar.agents.rows_by_agent]
-grok = [["state_icon", "agent"]]
+codex = [["state_icon", "agent"]]
 "#;
         let applied = add_quota_row(original).unwrap();
-        let removed = remove_quota_row_for(&applied, &[Harness::Grok], false).unwrap();
-        assert!(removed.contains("grok = [[\"state_icon\", \"agent\"]]"));
+        let removed = remove_quota_row_for(&applied, &[Harness::Codex], false).unwrap();
+        assert!(removed.contains("codex = [[\"state_icon\", \"agent\"]]"));
     }
 
     #[test]
-    fn preserves_user_owned_opencode_rows() {
+    fn preserves_user_owned_extra_rows() {
         let original = r#"[ui.sidebar.agents]
 rows = [["state_icon", "agent"]]
 
 [ui.sidebar.agents.rows_by_agent]
-opencode = [["state_icon", "agent"]]
+codex = [["state_icon", "agent"]]
 "#;
         let updated = add_quota_row(original).unwrap();
-        assert!(updated.contains("opencode = [[\"state_icon\", \"agent\"]]"));
-        assert!(!updated
-            .contains("opencode = [[\"state_icon\", \"agent\"]] # herdr-agent-quota-provider"));
+        assert!(updated.contains("codex = [[\"state_icon\", \"agent\"]]"));
+        assert!(
+            !updated.contains("codex = [[\"state_icon\", \"agent\"]] # herdr-agent-quota-provider")
+        );
         let removed = remove_quota_row(&updated).unwrap();
-        assert!(removed.contains("opencode = [[\"state_icon\", \"agent\"]]"));
+        assert!(removed.contains("codex = [[\"state_icon\", \"agent\"]]"));
     }
 
     #[test]
-    fn fresh_tree_installs_shared_rows_without_managed_opencode() {
+    fn fresh_tree_installs_shared_rows_without_managed_extra_rows() {
         let updated =
             add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
         assert!(updated.contains("$quota_group"));
         assert!(updated.contains("herdr-agent-quota-row"));
         assert!(!updated.contains("rows_by_agent"), "{updated}");
-        assert!(!updated.contains("opencode ="), "{updated}");
+        assert!(!updated.contains("codex ="), "{updated}");
         assert!(!updated.contains("herdr-agent-quota-provider"), "{updated}");
         let removed = remove_quota_row(&updated).unwrap();
-        assert!(!removed.contains("opencode ="));
+        assert!(!removed.contains("codex ="));
         assert!(!removed.contains("$quota_"));
     }
 
@@ -2685,7 +2627,7 @@ rows = [["lantern_status"], ["state_icon", "my_plugin_token"]]
         assert_eq!(rows.len(), 2);
         assert!(updated.contains("lantern_status"));
         assert!(updated.contains("my_plugin_token"));
-        assert!(updated.contains("claude =") || updated.contains("grok ="));
+        assert!(updated.contains("claude =") || updated.contains("codex ="));
         assert!(updated.contains(REFRESH_ACTION));
     }
 

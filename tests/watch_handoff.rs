@@ -52,7 +52,7 @@ printf '%s\n' '{"result":{"agents":[]}}'
         cmd
     };
     assert!(command()
-        .args([entrypoint, "--provider", "agy"])
+        .args([entrypoint, "--provider", "claude"])
         .env("HERDR_BIN_PATH", &current)
         .env("HERDR_SOCKET_PATH", &socket)
         .status()
@@ -73,7 +73,7 @@ printf '%s\n' '{"result":{"agents":[]}}'
     }
     let before = fs::read_to_string(&log).unwrap().lines().count();
     let mut child = command()
-        .args(["watch", "--provider", "agy"])
+        .args(["watch", "--provider", "claude"])
         .env("HERDR_BIN_PATH", &old)
         .env("HERDR_SOCKET_PATH", dir.path().join("old.sock"))
         .spawn()
@@ -109,11 +109,6 @@ fn every_supported_working_harness_keeps_the_watcher_alive() {
             .env("HERDR_BIN_PATH", herdr)
             .env("TEST_INVENTORY", dir.path().join("inventory"))
             .env("CODEX_BIN_PATH", dir.path().join("absent"))
-            .env("GROK_AUTH_FILE", dir.path().join("absent"))
-            .env("DEVIN_CREDENTIALS_FILE", dir.path().join("absent"))
-            .env("MUSE_AUTH_PATH", dir.path().join("absent"))
-            .env("CURSOR_AUTH_FILE", dir.path().join("absent"))
-            .env("CURSOR_STATE_DB", dir.path().join("absent"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -140,7 +135,7 @@ fn partial_install_startup_and_events_ignore_unselected_working_agents() {
     let dir = tempfile::tempdir().unwrap();
     let herdr = dir.path().join("herdr");
     let log = dir.path().join("calls");
-    fs::write(dir.path().join("agents"), "agy\n").unwrap();
+    fs::write(dir.path().join("agents"), "claude\n").unwrap();
     fs::write(
         &herdr,
         r#"#!/bin/sh
@@ -159,11 +154,6 @@ printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","agent":"codex","agent_st
             .env("HERDR_AGENT_QUOTA_AGENT_ORDER", "default")
             .env("HERDR_BIN_PATH", &herdr)
             .env("CODEX_BIN_PATH", dir.path().join("absent"))
-            .env("GROK_AUTH_FILE", dir.path().join("absent"))
-            .env("DEVIN_CREDENTIALS_FILE", dir.path().join("absent"))
-            .env("MUSE_AUTH_PATH", dir.path().join("absent"))
-            .env("CURSOR_AUTH_FILE", dir.path().join("absent"))
-            .env("CURSOR_STATE_DB", dir.path().join("absent"))
             .env("TEST_LOG", &log)
             .stdout(Stdio::null())
             .stderr(Stdio::null());

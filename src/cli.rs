@@ -16,8 +16,7 @@ pub struct Cli {
 pub enum Command {
     /// Fetch each selected provider's quota and publish it to its Herdr panes.
     ///
-    /// Never reads pane output. OpenCode Go is not selectable here: it is
-    /// fetched only for a pane that resolved to that subscription.
+    /// Never reads pane output.
     Refresh {
         /// Providers to refresh.
         #[arg(long, default_value = "all")]
@@ -28,14 +27,6 @@ pub enum Command {
         /// Print the per-provider outcome as JSON.
         #[arg(long)]
         json: bool,
-        /// Approve macOS Keychain access for Muse interactively (one-time).
-        ///
-        /// Without a recorded approval, background reads skip the keychain
-        /// silently instead of prompting. Run once in a terminal and click
-        /// Always Allow (not Allow) on the macOS prompt; afterwards all
-        /// refreshes work unattended.
-        #[arg(long)]
-        keychain_approve: bool,
     },
     /// Keep selected working providers' quotas fresh with one global poller.
     /// This is started automatically by the Herdr status event hook.
@@ -84,8 +75,8 @@ pub enum Command {
         /// configuration. Without `--agent` this removes everything.
         #[arg(long, conflicts_with_all = ["check", "apply"])]
         uninstall: bool,
-        /// Agents to configure: all, claude, codex, grok, agy, opencode, pi,
-        /// omp, devin, muse, cursor. Repeat or comma-separate to pick several. Defaults to
+        /// Agents to configure: all, claude, codex. Repeat or comma-separate
+        /// to pick several. Defaults to
         /// every supported agent (or $HERDR_AGENT_QUOTA_AGENTS when set), so
         /// `--uninstall` alone still removes everything this plugin installed.
         #[arg(long, value_delimiter = ',')]
@@ -135,23 +126,13 @@ pub enum Command {
     Settings,
     /// Claude statusLine hook. Claude Code invokes this; not for manual use.
     ClaudeStatusline,
-    /// Agy statusLine hook. Antigravity invokes this; not for manual use.
-    AgyStatusline,
-    /// Cursor CLI afterAgentResponse/stop/preCompact hook. Cursor invokes this;
-    /// not for manual use.
-    CursorHooks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ProviderSelection {
     All,
     Codex,
-    Grok,
     Claude,
-    Agy,
-    Devin,
-    Muse,
-    Cursor,
 }
 
 impl ProviderSelection {
@@ -159,12 +140,7 @@ impl ProviderSelection {
         match self {
             Self::All => Provider::ALL.to_vec(),
             Self::Codex => vec![Provider::Codex],
-            Self::Grok => vec![Provider::Grok],
             Self::Claude => vec![Provider::Claude],
-            Self::Agy => vec![Provider::Agy],
-            Self::Devin => vec![Provider::Devin],
-            Self::Muse => vec![Provider::Muse],
-            Self::Cursor => vec![Provider::Cursor],
         }
     }
 }
@@ -178,14 +154,6 @@ pub enum AgentSelection {
     All,
     Claude,
     Codex,
-    Grok,
-    Agy,
-    Opencode,
-    Pi,
-    Omp,
-    Devin,
-    Muse,
-    Cursor,
 }
 
 /// How quota tokens are arranged in Herdr's agent sidebar.
@@ -788,32 +756,11 @@ impl SidebarLayout {
 
 impl AgentSelection {
     /// Every agent `configure` supports, in the order they are reported.
-    ///
-    /// New agents are appended, never inserted, so a saved complete list from
-    /// an earlier build is a proper prefix of this array and can still mean
-    /// "everything on" after a provider is added.
-    pub const SUPPORTED: [Harness; 10] = [
-        Harness::Claude,
-        Harness::Codex,
-        Harness::Grok,
-        Harness::Agy,
-        Harness::OpenCode,
-        Harness::Pi,
-        Harness::Omp,
-        Harness::Devin,
-        Harness::Muse,
-        Harness::Cursor,
-    ];
-
-    /// Length of the first complete list the settings pane persisted.
-    ///
-    /// Shorter enumerations were always subsets. Prefixes of this length or
-    /// more were "everything on" at write time.
-    pub(crate) const FIRST_PERSISTED_FULL: usize = 6;
+    pub const SUPPORTED: [Harness; 2] = [Harness::Claude, Harness::Codex];
 
     /// Token `as_stored_list` puts in front of a subset so it is not mistaken
-    /// for a legacy complete list. `--agent` never carries it: clap has no
-    /// such value, and an explicit flag is already exact.
+    /// for a complete list. `--agent` never carries it: clap has no such
+    /// value, and an explicit flag is already exact.
     const EXPLICIT: &'static str = "only";
 
     fn harness(self) -> Option<Harness> {
@@ -821,14 +768,6 @@ impl AgentSelection {
             Self::All => None,
             Self::Claude => Some(Harness::Claude),
             Self::Codex => Some(Harness::Codex),
-            Self::Grok => Some(Harness::Grok),
-            Self::Agy => Some(Harness::Agy),
-            Self::Opencode => Some(Harness::OpenCode),
-            Self::Pi => Some(Harness::Pi),
-            Self::Omp => Some(Harness::Omp),
-            Self::Devin => Some(Harness::Devin),
-            Self::Muse => Some(Harness::Muse),
-            Self::Cursor => Some(Harness::Cursor),
         }
     }
 
@@ -836,14 +775,6 @@ impl AgentSelection {
         match harness {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
-            Harness::Grok => "grok",
-            Harness::Agy => "agy",
-            Harness::OpenCode => "opencode",
-            Harness::Pi => "pi",
-            Harness::Omp => "omp",
-            Harness::Devin => "devin",
-            Harness::Muse => "muse",
-            Harness::Cursor => "cursor",
         }
     }
 
@@ -854,7 +785,7 @@ impl AgentSelection {
     /// never reaches it. The plugin config directory is the channel that does
     /// work, and it is what `install.sh` writes. A direct-CLI environment
     /// override is still honoured first, but it is explicit and therefore
-    /// parsed exactly; only persisted preferences get the legacy-full upgrade.
+    /// parsed exactly.
     ///
     /// Anything unparsable falls through to the next source and finally to
     /// every supported agent, so `--uninstall` alone still removes everything.
@@ -863,25 +794,17 @@ impl AgentSelection {
             return Self::resolve(values);
         }
         if let Ok(raw) = std::env::var("HERDR_AGENT_QUOTA_AGENTS") {
-            if let Some(agents) = Self::parse_list(&raw, false) {
+            if let Some(agents) = Self::parse_list(&raw) {
                 return agents;
             }
         }
         crate::prefs::read(crate::prefs::AGENTS)
-            .and_then(|raw| Self::parse_list(&raw, true))
+            .and_then(|raw| Self::parse_list(&raw))
             .unwrap_or_else(|| Self::SUPPORTED.to_vec())
     }
 
     /// A comma-separated selection, or `None` when it names nothing valid.
-    ///
-    /// When `upgrade_legacy_full` is true, an unmarked list that is a proper
-    /// prefix of `SUPPORTED` of length [`Self::FIRST_PERSISTED_FULL`] or more
-    /// was complete when written, so it is read as every agent. That upgrade
-    /// is for persisted preferences only; direct environment overrides are
-    /// explicit selections and stay exact. `only` keeps a newly-stored subset
-    /// from colliding with the legacy persisted form.
-    fn parse_list(raw: &str, upgrade_legacy_full: bool) -> Option<Vec<Harness>> {
-        let mut explicit = false;
+    fn parse_list(raw: &str) -> Option<Vec<Harness>> {
         let mut parsed = Vec::new();
         for name in raw
             .split(',')
@@ -889,7 +812,6 @@ impl AgentSelection {
             .filter(|name| !name.is_empty())
         {
             if name.eq_ignore_ascii_case(Self::EXPLICIT) {
-                explicit = true;
                 continue;
             }
             if let Some(value) = Self::parse(name) {
@@ -899,12 +821,7 @@ impl AgentSelection {
         if parsed.is_empty() {
             return None;
         }
-        let resolved = Self::resolve(&parsed);
-        if upgrade_legacy_full && !explicit && Self::is_legacy_full(&resolved) {
-            Some(Self::SUPPORTED.to_vec())
-        } else {
-            Some(resolved)
-        }
+        Some(Self::resolve(&parsed))
     }
 
     fn parse(name: &str) -> Option<Self> {
@@ -912,14 +829,6 @@ impl AgentSelection {
             "all" => Some(Self::All),
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
-            "grok" => Some(Self::Grok),
-            "agy" => Some(Self::Agy),
-            "opencode" => Some(Self::Opencode),
-            "pi" => Some(Self::Pi),
-            "omp" => Some(Self::Omp),
-            "devin" => Some(Self::Devin),
-            "muse" => Some(Self::Muse),
-            "cursor" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -928,18 +837,7 @@ impl AgentSelection {
         agents == Self::SUPPORTED
     }
 
-    fn is_legacy_full(agents: &[Harness]) -> bool {
-        let n = agents.len();
-        n >= Self::FIRST_PERSISTED_FULL
-            && n < Self::SUPPORTED.len()
-            && agents == &Self::SUPPORTED[..n]
-    }
-
     /// Preference form: `all` when complete, `only,<names>` when a subset.
-    ///
-    /// `only` is what stops a subset that matches a legacy complete list —
-    /// turning Muse off today writes the pre-Muse full list — from being
-    /// read as every agent the next time a provider is added.
     pub(crate) fn as_stored_list(agents: &[Harness]) -> String {
         if Self::is_complete(agents) {
             return "all".to_string();
@@ -982,6 +880,7 @@ impl AgentSelection {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
     fn an_agent_order_round_trips_through_its_stored_form() {
@@ -1015,64 +914,49 @@ mod tests {
         assert!(ten.triggers(10));
         assert!(!ten.triggers(11));
     }
-    use super::*;
 
     #[test]
     fn a_selection_keeps_supported_order_and_drops_duplicates() {
         assert_eq!(
-            AgentSelection::resolve(&[AgentSelection::Grok, AgentSelection::Claude]),
-            vec![Harness::Claude, Harness::Grok]
+            AgentSelection::resolve(&[AgentSelection::Codex, AgentSelection::Claude]),
+            vec![Harness::Claude, Harness::Codex]
         );
         assert_eq!(
-            AgentSelection::resolve(&[AgentSelection::Grok, AgentSelection::Grok]),
-            vec![Harness::Grok]
+            AgentSelection::resolve(&[AgentSelection::Codex, AgentSelection::Codex]),
+            vec![Harness::Codex]
         );
     }
 
     #[test]
     fn an_unusable_environment_selection_falls_back_to_everything() {
-        assert_eq!(AgentSelection::parse("Grok"), Some(AgentSelection::Grok));
-        assert_eq!(AgentSelection::parse("Pi"), Some(AgentSelection::Pi));
+        assert_eq!(AgentSelection::parse("Codex"), Some(AgentSelection::Codex));
         assert_eq!(AgentSelection::parse("nonsense"), None);
         // An explicit flag must win over the environment, which is checked in
         // `from_args_or_env` before the variable is read at all.
         assert_eq!(
-            AgentSelection::from_args_or_env(&[AgentSelection::Grok]),
-            vec![Harness::Grok]
-        );
-    }
-
-    #[test]
-    fn an_explicit_list_matching_a_legacy_full_prefix_stays_exact() {
-        let raw = "claude,codex,grok,agy,opencode,pi";
-        assert_eq!(
-            AgentSelection::parse_list(raw, false),
-            Some(AgentSelection::SUPPORTED[..AgentSelection::FIRST_PERSISTED_FULL].to_vec())
-        );
-        assert_eq!(
-            AgentSelection::parse_list(raw, true),
-            Some(AgentSelection::SUPPORTED.to_vec())
+            AgentSelection::from_args_or_env(&[AgentSelection::Codex]),
+            vec![Harness::Codex]
         );
     }
 
     /// The environment cannot reach a Herdr plugin action, so the config-dir
     /// preference is the channel `install.sh` / `uninstall.sh` actually use.
-    /// A selection that fails to arrive means `--uninstall --agent grok`
+    /// A selection that fails to arrive means `--uninstall --agent codex`
     /// removes every agent, so this path is load-bearing.
     #[test]
     fn a_config_directory_preference_narrows_the_selection() {
         let directory = tempfile::tempdir().unwrap();
         crate::prefs::testing::with_config_dir(directory.path(), || {
-            crate::prefs::write(crate::prefs::AGENTS, "grok,claude").unwrap();
+            crate::prefs::write(crate::prefs::AGENTS, "codex,claude").unwrap();
             assert_eq!(
                 AgentSelection::from_args_or_env(&[]),
-                vec![Harness::Claude, Harness::Grok]
+                vec![Harness::Claude, Harness::Codex]
             );
 
             // An explicit flag still wins over the stored preference.
             assert_eq!(
-                AgentSelection::from_args_or_env(&[AgentSelection::Agy]),
-                vec![Harness::Agy]
+                AgentSelection::from_args_or_env(&[AgentSelection::Codex]),
+                vec![Harness::Codex]
             );
 
             // Junk falls through to every agent rather than to none, so a
@@ -1082,86 +966,6 @@ mod tests {
                 AgentSelection::from_args_or_env(&[]),
                 AgentSelection::SUPPORTED.to_vec()
             );
-        });
-    }
-
-    /// A build before Muse wrote "everything on" as the eight names that then
-    /// existed. That list has to keep meaning every agent after Muse is added,
-    /// or `configure` judges it partial and a missing omp install becomes
-    /// fatal.
-    #[test]
-    fn a_saved_complete_list_from_before_a_new_agent_still_selects_everything() {
-        let directory = tempfile::tempdir().unwrap();
-        crate::prefs::testing::with_config_dir(directory.path(), || {
-            crate::prefs::write(
-                crate::prefs::AGENTS,
-                "claude,codex,grok,agy,opencode,pi,omp,devin",
-            )
-            .unwrap();
-            assert_eq!(
-                AgentSelection::from_args_or_env(&[]),
-                AgentSelection::SUPPORTED.to_vec()
-            );
-
-            crate::prefs::write(
-                crate::prefs::AGENTS,
-                " claude, codex, grok, agy, opencode, pi, omp, devin ",
-            )
-            .unwrap();
-            assert_eq!(
-                AgentSelection::from_args_or_env(&[]),
-                AgentSelection::SUPPORTED.to_vec()
-            );
-
-            // The six- and seven-agent complete lists the settings pane wrote
-            // before Devin and omp are the same shape.
-            crate::prefs::write(
-                crate::prefs::AGENTS,
-                "claude,codex,grok,agy,opencode,pi,omp",
-            )
-            .unwrap();
-            assert_eq!(
-                AgentSelection::from_args_or_env(&[]),
-                AgentSelection::SUPPORTED.to_vec()
-            );
-            crate::prefs::write(crate::prefs::AGENTS, "claude,codex,grok,agy,opencode,pi").unwrap();
-            assert_eq!(
-                AgentSelection::from_args_or_env(&[]),
-                AgentSelection::SUPPORTED.to_vec()
-            );
-        });
-    }
-
-    /// Turning Muse off produces the pre-Muse full list. Without a marker that
-    /// selection would be upgraded back to everything on the next repair.
-    #[test]
-    fn an_explicit_subset_matching_a_legacy_full_list_is_not_upgraded() {
-        let directory = tempfile::tempdir().unwrap();
-        crate::prefs::testing::with_config_dir(directory.path(), || {
-            crate::prefs::write(
-                crate::prefs::AGENTS,
-                "only,claude,codex,grok,agy,opencode,pi,omp,devin",
-            )
-            .unwrap();
-            let selected = AgentSelection::from_args_or_env(&[]);
-            assert_eq!(
-                selected,
-                vec![
-                    Harness::Claude,
-                    Harness::Codex,
-                    Harness::Grok,
-                    Harness::Agy,
-                    Harness::OpenCode,
-                    Harness::Pi,
-                    Harness::Omp,
-                    Harness::Devin,
-                ]
-            );
-            assert!(!selected.contains(&Harness::Muse));
-            assert!(!selected.contains(&Harness::Cursor));
-
-            crate::prefs::write(crate::prefs::AGENTS, "only,grok").unwrap();
-            assert_eq!(AgentSelection::from_args_or_env(&[]), vec![Harness::Grok]);
         });
     }
 
@@ -1176,40 +980,21 @@ mod tests {
             "all"
         );
         assert_eq!(
-            AgentSelection::as_stored_list(&[Harness::Grok, Harness::Claude]),
-            "only,grok,claude"
+            AgentSelection::as_stored_list(&[Harness::Codex]),
+            "only,codex"
         );
-        assert_eq!(
-            AgentSelection::as_cli_list(&[Harness::Grok, Harness::Claude]),
-            "grok,claude"
-        );
-        let pre_muse = &[
-            Harness::Claude,
-            Harness::Codex,
-            Harness::Grok,
-            Harness::Agy,
-            Harness::OpenCode,
-            Harness::Pi,
-            Harness::Omp,
-            Harness::Devin,
-        ];
-        assert_eq!(
-            AgentSelection::as_stored_list(pre_muse),
-            "only,claude,codex,grok,agy,opencode,pi,omp,devin"
-        );
-        assert_eq!(
-            AgentSelection::as_cli_list(pre_muse),
-            "claude,codex,grok,agy,opencode,pi,omp,devin"
-        );
-        let pre_cursor = &AgentSelection::SUPPORTED[..AgentSelection::SUPPORTED.len() - 1];
-        assert_eq!(
-            AgentSelection::as_stored_list(pre_cursor),
-            "only,claude,codex,grok,agy,opencode,pi,omp,devin,muse"
-        );
-        assert_eq!(
-            AgentSelection::as_cli_list(pre_cursor),
-            "claude,codex,grok,agy,opencode,pi,omp,devin,muse"
-        );
+        assert_eq!(AgentSelection::as_cli_list(&[Harness::Codex]), "codex");
+    }
+
+    /// A stored subset must survive a round trip through the preference file.
+    #[test]
+    fn an_explicit_subset_is_read_back_exactly() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::prefs::testing::with_config_dir(directory.path(), || {
+            let stored = AgentSelection::as_stored_list(&[Harness::Codex]);
+            crate::prefs::write(crate::prefs::AGENTS, &stored).unwrap();
+            assert_eq!(AgentSelection::from_args_or_env(&[]), vec![Harness::Codex]);
+        });
     }
 
     #[test]
@@ -1223,23 +1008,6 @@ mod tests {
         }
     }
 
-    /// Inserting a harness in the middle would make a saved complete list
-    /// either fail to upgrade or upgrade the wrong subset.
-    #[test]
-    fn supported_agents_are_appended_so_legacy_full_lists_stay_prefixes() {
-        assert_eq!(
-            &AgentSelection::SUPPORTED[..AgentSelection::FIRST_PERSISTED_FULL],
-            &[
-                Harness::Claude,
-                Harness::Codex,
-                Harness::Grok,
-                Harness::Agy,
-                Harness::OpenCode,
-                Harness::Pi,
-            ]
-        );
-    }
-
     #[test]
     fn all_wins_and_is_the_default_so_uninstall_alone_removes_everything() {
         assert_eq!(
@@ -1247,7 +1015,7 @@ mod tests {
             AgentSelection::SUPPORTED.to_vec()
         );
         assert_eq!(
-            AgentSelection::resolve(&[AgentSelection::Grok, AgentSelection::All]),
+            AgentSelection::resolve(&[AgentSelection::Codex, AgentSelection::All]),
             AgentSelection::SUPPORTED.to_vec()
         );
         assert_eq!(

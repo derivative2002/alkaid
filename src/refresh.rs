@@ -6,14 +6,10 @@ use crate::herdr::{
     publish_pane_tokens, publish_pane_tokens_with_scrolled_icons, publish_status_icons,
     refresh_pane_topic, AgentPane, AgentStatus, PaneQuotaUpdate, PaneTokens,
 };
-use crate::model::{
-    BillingTarget, CredentialScope, Harness, Provider, ProviderSnapshot, Resolution,
-};
-use crate::omp::OmpEvidence;
-use crate::opencode::OpenCodePaths;
+use crate::model::{BillingTarget, Harness, Provider, ProviderSnapshot, Resolution};
 use crate::presentation::{MetadataTokens, RowStyle, SidebarShape};
+use crate::providers::codex;
 use crate::providers::statusline::enrich_cache_session;
-use crate::providers::{codex, cursor, devin, grok, muse, omp as omp_provider, opencode_go};
 use crate::route;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -463,14 +459,7 @@ pub fn event() -> Result<()> {
     // here: status hooks set HERDR_PANE_ID to the *event* pane, so pane
     // current returns the finisher and would skip teal for every completion.
     // `handle_named_pane` folds the working set into status before publish.
-    // Pi's and omp's exact session files carry the routing evidence, and
-    // Muse/Cursor transcripts record the prompt itself. Reading their panes
-    // would add a visible repaint without improving attribution or the topic.
-    let topic_pane = (!matches!(
-        harness,
-        Harness::Pi | Harness::Omp | Harness::Muse | Harness::Cursor
-    ))
-    .then_some(pane_id);
+    let topic_pane = Some(pane_id);
     let result = handle_named_pane(
         &cache,
         pane,
@@ -722,17 +711,11 @@ fn publish_row(cache: &CacheStore) -> RowStyle {
     }
 }
 
-/// Muse last prompt and Cursor/Grok generated session titles are the same
-/// evidence other harnesses read off the screen, so they are also that pane's
-/// topic. Codex keeps a screen topic and stores the thread preview separately.
+/// A generated session summary becomes the pane's topic for harnesses whose
+/// transcript records the prompt itself. Codex keeps a screen topic and stores
+/// the thread preview separately.
 fn apply_session_summary(pane: &mut AgentPane, summary: &str) {
     pane.session_summary = summary.to_string();
-    if matches!(
-        pane.harness,
-        Harness::Muse | Harness::Cursor | Harness::Grok
-    ) {
-        pane.topic = summary.to_string();
-    }
 }
 
 fn resolved_pane_tokens(
@@ -747,14 +730,8 @@ fn resolved_pane_tokens(
         resolution,
         identity,
         context,
-        omp,
     } = resolved;
     let mut quota = match resolution {
-        Resolution::Subscription(target)
-            if target.credential_scope == CredentialScope::OMP_STORE =>
-        {
-            omp_quota(cache, &target, omp.as_ref(), now, row, force)
-        }
         Resolution::Subscription(target) => {
             if let Some(provider) = target.original_provider() {
                 let snapshot = cache.load(provider)?;
@@ -770,6 +747,7 @@ fn resolved_pane_tokens(
                         }
                     }
                 }
+                let _ = force;
                 tokens_for_loaded_snapshot(
                     provider,
                     snapshot.as_ref(),
@@ -780,21 +758,7 @@ fn resolved_pane_tokens(
                 )
                 .map(|values| PaneQuotaUpdate::Replace(Box::new(values)))
             } else {
-                // Not one of the original four, so it is never fetched by the
-                // provider list: this pane resolved to it, so this pane pays
-                // for at most one debounced request.
-                refresh_scoped_target(cache, &target, force);
-                let snapshot = cache.load(target.billing)?;
-                let usable = load_usable_snapshot(cache, target.billing)?;
-                tokens_for_loaded_snapshot(
-                    target.billing,
-                    snapshot.as_ref(),
-                    usable.as_ref(),
-                    now,
-                    pane.session.as_ref().and_then(|session| session.id()),
-                    row,
-                )
-                .map(|values| PaneQuotaUpdate::Replace(Box::new(values)))
+                None
             }
         }
         Resolution::NoSubscription if plugin_quota_present(&pane.tokens) || identity.is_some() => {
@@ -815,182 +779,6 @@ fn resolved_pane_tokens(
         identity,
         context,
     }))
-}
-
-/// Quota for an omp pane, from omp's own usage layer.
-///
-/// One `omp usage --json` per debounce window, for the one provider the pane
-/// is actually talking to — never a fan-out over omp's whole credential pool.
-/// Without an account to attribute the numbers to, the pane shows unavailable
-/// quota rather than retaining numbers from an unconfirmed account.
-fn omp_quota(
-    cache: &CacheStore,
-    target: &BillingTarget,
-    evidence: Option<&OmpEvidence>,
-    now: u64,
-    row: RowStyle,
-    force: bool,
-) -> Option<PaneQuotaUpdate> {
-    let evidence = evidence?;
-    omp_quota_with_refresh(cache, target, evidence, now, row, force, refresh_omp_target)
-}
-
-fn omp_quota_with_refresh(
-    cache: &CacheStore,
-    target: &BillingTarget,
-    evidence: &OmpEvidence,
-    now: u64,
-    row: RowStyle,
-    force: bool,
-    refresh: impl FnOnce(&CacheStore, &BillingTarget, &OmpEvidence, u64) -> OmpUsage,
-) -> Option<PaneQuotaUpdate> {
-    let pin = evidence.account_pin.as_deref();
-    let report = cache.load_omp_usage(target);
-    let legacy = cache.load_target(target).ok().flatten();
-    let cached = report
-        .as_ref()
-        .and_then(|usage| omp_provider::select_account(usage, pin))
-        .map(|account| omp_provider::snapshot(target, account))
-        .or_else(|| {
-            if report.is_some() {
-                return None;
-            }
-            legacy
-                .as_ref()
-                .filter(|snapshot| snapshot.usable_for_account(pin, None))
-                .cloned()
-        });
-    let unavailable = || {
-        Some(PaneQuotaUpdate::Replace(Box::new(
-            MetadataTokens::unavailable(target.billing, "quota account is not confirmed"),
-        )))
-    };
-    let debounced = cache
-        .should_debounce_target(target, now, 60)
-        .unwrap_or(false);
-    if debounce_reuses_snapshot(force, debounced, cached.as_ref(), pin, None, now) {
-        return cached
-            .as_ref()
-            .and_then(|snapshot| {
-                tokens_for_provider(Some(snapshot), now, None, row)
-                    .map(|values| PaneQuotaUpdate::Replace(Box::new(values)))
-            })
-            .or_else(unavailable);
-    }
-    match refresh(cache, target, evidence, now) {
-        OmpUsage::Account(snapshot) => tokens_for_provider(Some(&snapshot), now, None, row)
-            .map(|values| PaneQuotaUpdate::Replace(Box::new(values))),
-        // omp holds an API key for this provider and no subscription account
-        // at all, so any subscription numbers still on the pane belong to a
-        // login that is not paying for it.
-        OmpUsage::PayAsYouGo => Some(PaneQuotaUpdate::Clear),
-        OmpUsage::Unavailable if cached.is_none() => Some(PaneQuotaUpdate::Replace(Box::new(
-            MetadataTokens::unavailable(target.billing, "omp reported no quota data"),
-        ))),
-        OmpUsage::Unavailable | OmpUsage::Unknown => cached
-            .as_ref()
-            .and_then(|snapshot| {
-                tokens_for_provider(Some(snapshot), now, None, row)
-                    .map(|values| PaneQuotaUpdate::Replace(Box::new(values)))
-            })
-            .or_else(unavailable),
-    }
-}
-
-/// What one `omp usage --json` call established about a pane's provider.
-enum OmpUsage {
-    Account(Box<ProviderSnapshot>),
-    PayAsYouGo,
-    Unavailable,
-    Unknown,
-}
-
-/// Ask omp for one provider's usage, and cache the account this pane pins.
-///
-/// Process and parse failures remain silent and preserve the last good value.
-/// A successful CLI response that explicitly lists this OAuth account under
-/// `accountsWithoutUsage` is different: without an older snapshot it publishes
-/// `quota_error` and omits window rows so a failed upstream quota fetch is
-/// not mistaken for missing support.
-fn refresh_omp_target(
-    cache: &CacheStore,
-    target: &BillingTarget,
-    evidence: &OmpEvidence,
-    now: u64,
-) -> OmpUsage {
-    let Ok(Some(_lease)) = cache.try_lock_target_refresh(target) else {
-        return OmpUsage::Unknown;
-    };
-    // Marked before the call so a failing binary cannot be retried on every
-    // event; the window applies to attempts, not to successes.
-    if cache.mark_refresh_target(target, now).is_err() {
-        return OmpUsage::Unknown;
-    }
-    let Ok(usage) = omp_provider::fetch(&evidence.paths, &evidence.provider_id, now) else {
-        return OmpUsage::Unknown;
-    };
-    if cache.save_omp_usage(target, &usage).is_err() {
-        return OmpUsage::Unknown;
-    }
-    let Some(account) = omp_provider::select_account(&usage, evidence.account_pin.as_deref())
-    else {
-        if omp_provider::oauth_without_usage_matches(&usage, evidence.account_pin.as_deref()) {
-            return OmpUsage::Unavailable;
-        }
-        // Several accounts and no pin is not a coin flip either: only a
-        // provider that has an API key and nothing else is proved to be
-        // pay-as-you-go.
-        return if usage.accounts.is_empty()
-            && usage.oauth_without_usage_pins.is_empty()
-            && usage.has_api_key
-        {
-            OmpUsage::PayAsYouGo
-        } else {
-            OmpUsage::Unknown
-        };
-    };
-    let snapshot = omp_provider::snapshot(target, account);
-    if cache.save_target(target, &snapshot).is_err() {
-        return OmpUsage::Unknown;
-    }
-    OmpUsage::Account(Box::new(snapshot))
-}
-
-/// Refresh a billing target that has no 1:1 harness collector.
-///
-/// Failure is deliberately silent: the pane keeps the last good snapshot for
-/// this same target rather than being cleared, and a missing key is a normal
-/// state (the user may not have a Go subscription) rather than an error worth
-/// surfacing on every event.
-fn refresh_scoped_target(cache: &CacheStore, target: &BillingTarget, force: bool) {
-    let now = CacheStore::now_unix();
-    if should_skip_fetch(cache, target.billing, force, now).unwrap_or(true) {
-        return;
-    }
-    let Ok(Some(_lease)) = cache.try_lock_target_refresh(target) else {
-        return;
-    };
-    let Some(paths) = OpenCodePaths::from_env() else {
-        return;
-    };
-    let Some(key) = crate::opencode::go_key(&paths) else {
-        return;
-    };
-    // Marked before the request so a failing endpoint cannot be retried on
-    // every event; the debounce window applies to attempts, not successes.
-    if cache
-        .mark_refresh_account(
-            target.billing,
-            now,
-            Some(&crate::providers::credential_id(&key)),
-        )
-        .is_err()
-    {
-        return;
-    }
-    if let Ok(snapshot) = opencode_go::fetch(&key) {
-        let _ = cache.save(&snapshot);
-    }
 }
 
 fn covers_every_collector(providers: &[Provider]) -> bool {
@@ -1079,16 +867,7 @@ fn refresh_provider(
     cache.mark_refresh_account(provider, now, account_id.as_deref())?;
     let fetched = match provider {
         Provider::Codex => codex::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Grok => grok::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Devin => devin::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Muse => muse::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Cursor => cursor::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Claude | Provider::Agy => load_statusline_snapshot(cache, provider),
-        // OpenCode Go is fetched for a resolved pane, never through the
-        // provider list; see `fetch_opencode_go`.
-        Provider::OpenCodeGo | Provider::Omp => Err(anyhow::anyhow!(
-            "scoped providers are refreshed per resolved pane, not through --provider"
-        )),
+        Provider::Claude => load_statusline_snapshot(cache, provider),
     };
     match fetched {
         Ok(fetched) => {
@@ -1099,14 +878,7 @@ fn refresh_provider(
             } = fetched;
             if preserve_context {
                 cache.save_preserving_context_for_session(snapshot, session_id.as_deref())?;
-            } else if matches!(
-                provider,
-                Provider::Codex
-                    | Provider::Grok
-                    | Provider::Devin
-                    | Provider::Muse
-                    | Provider::Cursor
-            ) {
+            } else if matches!(provider, Provider::Codex) {
                 let (_, mtime) = current_account_gate(provider);
                 cache.save_preserving_diagnostics_for_sessions(
                     &mut snapshot,
@@ -1209,26 +981,8 @@ fn load_usable_snapshot(
 
 fn current_account_gate(provider: Provider) -> (Option<String>, Option<u64>) {
     match provider {
-        Provider::Grok => {
-            let path = grok::auth_path().ok();
-            let account_id = path
-                .as_ref()
-                .and_then(|path| grok::read_credentials(path).ok())
-                .map(|credentials| credentials.account_id());
-            let mtime = path.as_ref().and_then(|path| grok::auth_mtime_unix(path));
-            (account_id, mtime)
-        }
         Provider::Codex => (codex::current_account_id(), codex::auth_mtime_unix()),
-        Provider::Devin => (devin::current_account_id(), devin::auth_mtime_unix()),
-        Provider::Muse => (muse::current_account_id(), muse::auth_mtime_unix()),
-        Provider::Cursor => (cursor::current_account_id(), cursor::auth_mtime_unix()),
-        Provider::OpenCodeGo => (
-            OpenCodePaths::from_env()
-                .and_then(|paths| crate::opencode::go_key(&paths))
-                .map(|key| crate::providers::credential_id(&key)),
-            None,
-        ),
-        Provider::Claude | Provider::Agy | Provider::Omp => (None, None),
+        Provider::Claude => (None, None),
     }
 }
 
@@ -1250,10 +1004,7 @@ fn load_statusline_snapshot(cache: &CacheStore, provider: Provider) -> Result<Fe
             Provider::Claude => {
                 crate::providers::claude::parse_statusline(&value, snapshot.fetched_at_unix)?
             }
-            Provider::Agy => {
-                crate::providers::agy::parse_statusline(&value, snapshot.fetched_at_unix)?
-            }
-            _ => snapshot,
+            Provider::Codex => snapshot,
         };
     }
     let previous_cache = cache
@@ -1548,15 +1299,7 @@ fn tokens_for_loaded_snapshot(
     session_id: Option<&str>,
     row: RowStyle,
 ) -> Option<MetadataTokens> {
-    let mut overlaid = None;
-    let usable = match (provider, usable) {
-        (Provider::Cursor, Some(snapshot)) => {
-            let mut snapshot = snapshot.clone();
-            cursor::overlay_live_context(&mut snapshot, session_id);
-            Some(&*overlaid.insert(snapshot))
-        }
-        (_, usable) => usable,
-    };
+    let usable = usable;
     match (usable, raw) {
         (Some(snapshot), _) => tokens_for_provider(Some(snapshot), now_unix, session_id, row),
         (None, Some(raw)) => Some(MetadataTokens::unavailable_for_windows(
@@ -1589,31 +1332,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn muse_cursor_and_grok_session_summaries_replace_the_topic() {
-        let mut muse = test_pane("w1:p1", Harness::Muse);
-        muse.topic = "old prompt".to_string();
-        apply_session_summary(&mut muse, "new prompt");
-        assert_eq!(muse.topic, "new prompt");
-        assert_eq!(muse.session_summary, "new prompt");
-
-        let mut cursor = test_pane("w1:p3", Harness::Cursor);
-        cursor.topic = "old prompt".to_string();
-        apply_session_summary(&mut cursor, "hi");
-        assert_eq!(cursor.topic, "hi");
-
-        let mut grok = test_pane("w1:p4", Harness::Grok);
-        grok.topic = "old prompt".to_string();
-        apply_session_summary(&mut grok, "Chat honesty: unsupported answers");
-        assert_eq!(grok.topic, "Chat honesty: unsupported answers");
-
-        let mut codex = test_pane("w1:p2", Harness::Codex);
-        codex.topic = "screen topic".to_string();
-        apply_session_summary(&mut codex, "thread name");
-        assert_eq!(codex.topic, "screen topic");
-        assert_eq!(codex.session_summary, "thread name");
-    }
-
     fn test_pane_with_session(id: &str, harness: Harness, session: &str) -> AgentPane {
         let mut pane = test_pane(id, harness);
         pane.session = Some(crate::herdr::AgentSession {
@@ -1638,14 +1356,7 @@ mod tests {
     fn failed_new_login_attempts_are_debounced_without_reusing_old_quota() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        for provider in [
-            Provider::Codex,
-            Provider::Grok,
-            Provider::Devin,
-            Provider::Muse,
-            Provider::Cursor,
-            Provider::OpenCodeGo,
-        ] {
+        for provider in [Provider::Codex] {
             cache
                 .save(
                     &ProviderSnapshot::new(provider, vec![], 90)
@@ -1695,7 +1406,7 @@ mod tests {
     #[test]
     fn a_settled_provider_gets_a_pass_after_debounce_while_another_keeps_working() {
         let a = "codex-pane".to_string();
-        let b = "omp-pane".to_string();
+        let b = "other-pane".to_string();
         let mut settling = BTreeMap::new();
         assert!(watch_targets(
             std::slice::from_ref(&b),
@@ -1744,21 +1455,21 @@ mod tests {
             .unwrap();
         let panes = [
             test_pane("codex-idle", Harness::Codex),
-            test_pane("grok-working", Harness::Grok),
+            test_pane("other-working", Harness::Claude),
         ];
-        let grok = "grok-working".to_string();
+        let other = "other-working".to_string();
         let mut settling = BTreeMap::new();
         let affected = watch_pass_ids(
             &cache,
             &panes,
             &Provider::ALL,
-            std::slice::from_ref(&grok),
-            std::slice::from_ref(&grok),
+            std::slice::from_ref(&other),
+            std::slice::from_ref(&other),
             &mut settling,
             1_001,
         );
         assert!(affected.contains(&"codex-idle".to_string()));
-        assert!(affected.contains(&grok));
+        assert!(affected.contains(&other));
     }
 
     #[test]
@@ -1777,21 +1488,21 @@ mod tests {
             .unwrap();
         let panes = [
             test_pane("codex-idle", Harness::Codex),
-            test_pane("grok-working", Harness::Grok),
+            test_pane("other-working", Harness::Claude),
         ];
-        let grok = "grok-working".to_string();
+        let other = "other-working".to_string();
         let mut settling = BTreeMap::new();
         let affected = watch_pass_ids(
             &cache,
             &panes,
             &Provider::ALL,
-            std::slice::from_ref(&grok),
-            std::slice::from_ref(&grok),
+            std::slice::from_ref(&other),
+            std::slice::from_ref(&other),
             &mut settling,
             1_001,
         );
         assert!(!affected.contains(&"codex-idle".to_string()));
-        assert_eq!(affected, vec![grok]);
+        assert_eq!(affected, vec![other]);
     }
 
     #[test]
@@ -1807,21 +1518,21 @@ mod tests {
             .unwrap();
         let panes = [
             test_pane("codex-idle", Harness::Codex),
-            test_pane("grok-working", Harness::Grok),
+            test_pane("other-working", Harness::Claude),
         ];
-        let grok = "grok-working".to_string();
+        let other = "other-working".to_string();
         let mut settling = BTreeMap::new();
         let affected = watch_pass_ids(
             &cache,
             &panes,
-            &[Provider::Grok],
-            std::slice::from_ref(&grok),
-            std::slice::from_ref(&grok),
+            &[Provider::Claude],
+            std::slice::from_ref(&other),
+            std::slice::from_ref(&other),
             &mut settling,
             1_001,
         );
         assert!(!affected.contains(&"codex-idle".to_string()));
-        assert_eq!(affected, vec![grok]);
+        assert_eq!(affected, vec![other]);
     }
 
     #[test]
@@ -1841,16 +1552,16 @@ mod tests {
         let panes = [
             test_pane_with_session("claude-live", Harness::Claude, "live"),
             test_pane_with_session("claude-dead", Harness::Claude, "dead"),
-            test_pane("grok-working", Harness::Grok),
+            test_pane("other-working", Harness::Claude),
         ];
-        let grok = "grok-working".to_string();
+        let other = "other-working".to_string();
         let mut settling = BTreeMap::new();
         let affected = watch_pass_ids(
             &cache,
             &panes,
             &Provider::ALL,
-            std::slice::from_ref(&grok),
-            std::slice::from_ref(&grok),
+            std::slice::from_ref(&other),
+            std::slice::from_ref(&other),
             &mut settling,
             1_001,
         );
@@ -1874,16 +1585,16 @@ mod tests {
         let mut idle = test_pane_with_session("claude-idle", Harness::Claude, "s1");
         idle.tokens
             .insert("quota_provider".to_string(), "Claude".to_string());
-        let panes = [idle, test_pane("grok-working", Harness::Grok)];
-        let grok = "grok-working".to_string();
+        let panes = [idle, test_pane("other-working", Harness::Claude)];
+        let other = "other-working".to_string();
         let mut settling = BTreeMap::new();
 
         let unchanged = watch_pass_ids(
             &cache,
             &panes,
             &Provider::ALL,
-            std::slice::from_ref(&grok),
-            std::slice::from_ref(&grok),
+            std::slice::from_ref(&other),
+            std::slice::from_ref(&other),
             &mut settling,
             1_001,
         );
@@ -1902,8 +1613,8 @@ mod tests {
             &cache,
             &panes,
             &Provider::ALL,
-            std::slice::from_ref(&grok),
-            std::slice::from_ref(&grok),
+            std::slice::from_ref(&other),
+            std::slice::from_ref(&other),
             &mut settling,
             1_001,
         );
@@ -1949,20 +1660,20 @@ mod tests {
             "quota_headroom".to_string(),
             format!("{:03}", values.quota_headroom.unwrap()),
         );
-        let panes = [idle, test_pane("grok-working", Harness::Grok)];
-        let grok = "grok-working".to_string();
+        let panes = [idle, test_pane("other-working", Harness::Claude)];
+        let other = "other-working".to_string();
         let mut settling = BTreeMap::new();
 
         let affected = watch_pass_ids(
             &cache,
             &panes,
             &Provider::ALL,
-            std::slice::from_ref(&grok),
-            std::slice::from_ref(&grok),
+            std::slice::from_ref(&other),
+            std::slice::from_ref(&other),
             &mut settling,
             1_001,
         );
-        assert_eq!(affected, vec![grok]);
+        assert_eq!(affected, vec![other]);
     }
 
     #[test]
@@ -1980,8 +1691,8 @@ mod tests {
         second
             .tokens
             .insert("quota_provider".to_string(), "Claude".to_string());
-        let panes = [first, second, test_pane("grok-working", Harness::Grok)];
-        let grok = "grok-working".to_string();
+        let panes = [first, second, test_pane("other-working", Harness::Claude)];
+        let other = "other-working".to_string();
         let mut settling = BTreeMap::new();
 
         snapshot.session_windows.insert(
@@ -1994,58 +1705,14 @@ mod tests {
             &cache,
             &panes,
             &Provider::ALL,
-            std::slice::from_ref(&grok),
-            std::slice::from_ref(&grok),
+            std::slice::from_ref(&other),
+            std::slice::from_ref(&other),
             &mut settling,
             1_001,
         );
         assert!(affected.contains(&"claude-first".to_string()));
         assert!(!affected.contains(&"claude-second".to_string()));
     }
-    #[test]
-    fn omp_panes_keep_both_accounts_from_one_debounced_report() {
-        let dir = tempdir().unwrap();
-        let cache = CacheStore::new(dir.path());
-        let target = BillingTarget::omp("anthropic");
-        let mut usage = omp_provider::ProviderUsage::default();
-        for (pin, used) in [("a", 20.0), ("b", 80.0)] {
-            usage.accounts.push(omp_provider::AccountUsage {
-                pin: Some(pin.to_string()),
-                windows: vec![UsageWindow::new(WindowKind::Weekly, used, None).unwrap()],
-                fetched_at_unix: 100,
-            });
-        }
-        cache.save_omp_usage(&target, &usage).unwrap();
-        cache.mark_refresh_target(&target, 100).unwrap();
-        for (pin, expected) in [
-            ("a", "7d 80%"),
-            ("b", "7d 20%"),
-            ("a", "7d 80%"),
-            ("unknown", ""),
-        ] {
-            let evidence = OmpEvidence {
-                paths: crate::omp::OmpPaths {
-                    agent_dir: dir.path().into(),
-                    sessions: dir.path().join("sessions"),
-                },
-                provider_id: "anthropic".to_string(),
-                account_pin: Some(pin.to_string()),
-            };
-            let update = omp_quota_with_refresh(
-                &cache,
-                &target,
-                &evidence,
-                110,
-                RowStyle::default(),
-                false,
-                |_, _, _, _| panic!("must not spawn once per account"),
-            );
-            assert!(
-                matches!(update, Some(PaneQuotaUpdate::Replace(values)) if values.quota_week == expected)
-            );
-        }
-    }
-
     #[test]
     fn legacy_statusline_mailbox_is_migrated_from_raw_session_evidence() {
         let dir = tempdir().unwrap();
@@ -2111,11 +1778,11 @@ mod tests {
     #[test]
     fn the_threshold_is_inclusive_and_off_never_warns() {
         let alert = LowQuotaAlert::parse("10").unwrap();
-        let (warn, _) = low_quota_transitions(alert, &low(&[("Grok", 10)]), &[]);
-        assert_eq!(warn, vec!["Grok".to_string()]);
-        let (warn, _) = low_quota_transitions(alert, &low(&[("Grok", 11)]), &[]);
+        let (warn, _) = low_quota_transitions(alert, &low(&[("Claude", 10)]), &[]);
+        assert_eq!(warn, vec!["Claude".to_string()]);
+        let (warn, _) = low_quota_transitions(alert, &low(&[("Claude", 11)]), &[]);
         assert!(warn.is_empty(), "{warn:?}");
-        let (warn, _) = low_quota_transitions(LowQuotaAlert::OFF, &low(&[("Grok", 0)]), &[]);
+        let (warn, _) = low_quota_transitions(LowQuotaAlert::OFF, &low(&[("Claude", 0)]), &[]);
         assert!(warn.is_empty(), "{warn:?}");
     }
 
@@ -2161,12 +1828,12 @@ mod tests {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
         let snapshot = ProviderSnapshot::new(
-            Provider::Grok,
+            Provider::Claude,
             vec![UsageWindow::new(WindowKind::Weekly, 42.5, None).unwrap()],
             1,
         );
         cache.save(&snapshot).unwrap();
-        assert_eq!(cache.load(Provider::Grok).unwrap(), Some(snapshot));
+        assert_eq!(cache.load(Provider::Claude).unwrap(), Some(snapshot));
     }
 
     /// Both legs of the shape have to be live: the layout comes from the
@@ -2253,167 +1920,15 @@ mod tests {
     }
 
     #[test]
-    fn an_omp_oauth_account_without_usage_is_explicit_on_the_first_fetch() {
-        let directory = tempdir().unwrap();
-        let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::omp("anthropic");
-        let evidence = crate::omp::OmpEvidence {
-            paths: crate::omp::OmpPaths {
-                agent_dir: directory.path().join(".omp/agent"),
-                sessions: directory.path().join(".omp/agent/sessions"),
-            },
-            provider_id: "anthropic".to_string(),
-            account_pin: Some("account-pin".to_string()),
-        };
-        let update = omp_quota_with_refresh(
-            &cache,
-            &target,
-            &evidence,
-            100,
-            RowStyle::default(),
-            false,
-            |_, _, _, _| OmpUsage::Unavailable,
-        )
-        .expect("explicit unavailable update");
-        let PaneQuotaUpdate::Replace(values) = update else {
-            panic!("expected replacement");
-        };
-        assert_eq!(values.quota_week, "");
-        assert_eq!(
-            values.quota_error.as_deref(),
-            Some("omp reported no quota data")
-        );
-    }
-
-    #[test]
-    fn an_omp_failed_first_fetch_is_debounced_without_a_snapshot() {
-        let directory = tempdir().unwrap();
-        let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::omp("anthropic");
-        cache.mark_refresh_target(&target, 100).unwrap();
-        let evidence = crate::omp::OmpEvidence {
-            paths: crate::omp::OmpPaths {
-                agent_dir: directory.path().join(".omp/agent"),
-                sessions: directory.path().join(".omp/agent/sessions"),
-            },
-            provider_id: "anthropic".to_string(),
-            account_pin: Some("account-pin".to_string()),
-        };
-        let update = omp_quota_with_refresh(
-            &cache,
-            &target,
-            &evidence,
-            120,
-            RowStyle::default(),
-            false,
-            |_, _, _, _| panic!("debounced refresh must not run"),
-        );
-        assert!(
-            matches!(update, Some(PaneQuotaUpdate::Replace(values)) if values.quota_error.is_some())
-        );
-    }
-
-    #[test]
-    fn an_expired_omp_window_bypasses_the_fetch_debounce() {
-        let directory = tempdir().unwrap();
-        let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::omp("anthropic");
-        cache
-            .save_target(
-                &target,
-                &ProviderSnapshot::new(
-                    Provider::Claude,
-                    vec![window(WindowKind::FiveHour, 96.0, 1_000)],
-                    900,
-                )
-                .with_account_id(Some("account-pin".to_string())),
-            )
-            .unwrap();
-        cache.mark_refresh_target(&target, 980).unwrap();
-        let evidence = crate::omp::OmpEvidence {
-            paths: crate::omp::OmpPaths {
-                agent_dir: directory.path().join(".omp/agent"),
-                sessions: directory.path().join(".omp/agent/sessions"),
-            },
-            provider_id: "anthropic".to_string(),
-            account_pin: Some("account-pin".to_string()),
-        };
-        let update = omp_quota_with_refresh(
-            &cache,
-            &target,
-            &evidence,
-            1_001,
-            RowStyle::default(),
-            false,
-            |_, _, _, _| {
-                OmpUsage::Account(Box::new(
-                    ProviderSnapshot::new(
-                        Provider::Claude,
-                        vec![window(WindowKind::FiveHour, 0.0, 2_000)],
-                        1_001,
-                    )
-                    .with_account_id(Some("account-pin".to_string())),
-                ))
-            },
-        )
-        .expect("refreshed update");
-        let PaneQuotaUpdate::Replace(values) = update else {
-            panic!("expected replacement");
-        };
-        assert!(
-            values.quota_5h.starts_with("5h 100%"),
-            "{}",
-            values.quota_5h
-        );
-    }
-
-    #[test]
-    fn an_omp_usage_failure_keeps_the_same_accounts_last_good_snapshot() {
-        let directory = tempdir().unwrap();
-        let cache = CacheStore::new(directory.path());
-        let target = BillingTarget::omp("anthropic");
-        let snapshot = ProviderSnapshot::new(
-            Provider::Claude,
-            vec![UsageWindow::new(WindowKind::Weekly, 42.0, None).unwrap()],
-            90,
-        )
-        .with_account_id(Some("account-pin".to_string()));
-        cache.save_target(&target, &snapshot).unwrap();
-        let evidence = crate::omp::OmpEvidence {
-            paths: crate::omp::OmpPaths {
-                agent_dir: directory.path().join(".omp/agent"),
-                sessions: directory.path().join(".omp/agent/sessions"),
-            },
-            provider_id: "anthropic".to_string(),
-            account_pin: Some("account-pin".to_string()),
-        };
-        let update = omp_quota_with_refresh(
-            &cache,
-            &target,
-            &evidence,
-            200,
-            RowStyle::default(),
-            false,
-            |_, _, _, _| OmpUsage::Unavailable,
-        )
-        .expect("last good update");
-        let PaneQuotaUpdate::Replace(values) = update else {
-            panic!("expected replacement");
-        };
-        assert_eq!(values.quota_week, "7d 58%");
-        assert_eq!(values.quota_error, None);
-    }
-
-    #[test]
     fn other_account_snapshot_is_not_shown_as_the_current_quota() {
         let snapshot = ProviderSnapshot::new(
-            Provider::Grok,
+            Provider::Claude,
             vec![UsageWindow::new(WindowKind::Weekly, 100.0, None).unwrap()],
             1,
         )
         .with_account_id(Some("old-account".to_string()));
         let values = tokens_for_loaded_snapshot(
-            Provider::Grok,
+            Provider::Claude,
             Some(&snapshot),
             None,
             1,
@@ -2435,13 +1950,13 @@ mod tests {
     #[test]
     fn a_monthly_snapshot_for_the_wrong_account_omits_window_rows() {
         let snapshot = ProviderSnapshot::new(
-            Provider::Cursor,
+            Provider::Claude,
             vec![UsageWindow::new(WindowKind::Monthly, 7.0, None).unwrap()],
             1,
         )
         .with_account_id(Some("old-account".to_string()));
         let values = tokens_for_loaded_snapshot(
-            Provider::Cursor,
+            Provider::Claude,
             Some(&snapshot),
             None,
             1,
@@ -2462,10 +1977,7 @@ mod tests {
     fn an_expired_cached_window_bypasses_the_fetch_debounce() {
         let directory = tempdir().unwrap();
         let cache = CacheStore::new(directory.path());
-        for provider in Provider::ALL
-            .into_iter()
-            .chain(std::iter::once(Provider::OpenCodeGo))
-        {
+        for provider in Provider::ALL {
             cache
                 .save(
                     &ProviderSnapshot::new(
@@ -2529,29 +2041,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn debounce_does_not_keep_another_accounts_grok_snapshot() {
-        let directory = tempdir().unwrap();
-        let cache = CacheStore::new(directory.path());
-        let snapshot = ProviderSnapshot::new(
-            Provider::Grok,
-            vec![UsageWindow::new(WindowKind::Weekly, 100.0, None).unwrap()],
-            1,
-        )
-        .with_account_id(Some("old-account".to_string()));
-        cache.save(&snapshot).unwrap();
-        cache.mark_refresh(Provider::Grok, 100).unwrap();
-        assert!(
-            !should_skip_fetch(&cache, Provider::Grok, false, 120).unwrap(),
-            "a snapshot for another Grok login must be fetched even inside the debounce window"
-        );
-    }
-
     // Reading a pane repaints it, which visibly scrolls the agent's terminal.
     // An event must name exactly one pane to read, so the other panes of the
     // same provider are left alone.
     #[test]
-    fn unknown_and_opencode_events_select_no_collectors() {
+    fn unknown_and_named_events_select_the_right_collectors() {
         // `event` reads the agent name straight off the payload, so this is
         // the exact chain that decides whether a watch may start.
         fn collector(payload: &str) -> Option<Provider> {
@@ -2561,23 +2055,12 @@ mod tests {
         }
 
         assert_eq!(
-            collector(
-                r#"{"event":"pane_agent_status_changed",
-                    "data":{"pane_id":"w1:p9","agent":"opencode","status":"working"}}"#
-            ),
-            None
-        );
-        assert_eq!(
-            collector(r#"{"data":{"agent":"OpenCode","status":"working"}}"#),
-            None
-        );
-        assert_eq!(
-            collector(r#"{"data":{"agent":"cursor","status":"working"}}"#),
-            Some(Provider::Cursor)
-        );
-        assert_eq!(
             collector(r#"{"data":{"agent":"amp","status":"working"}}"#),
             None
+        );
+        assert_eq!(
+            collector(r#"{"data":{"agent":"codex","status":"working"}}"#),
+            Some(Provider::Codex)
         );
         assert_eq!(
             collector(r#"{"data":{"agent":"claude-code","pane_id":"w1:p1"}}"#),
@@ -2589,11 +2072,11 @@ mod tests {
     fn event_payload_names_the_single_pane_whose_topic_may_be_read() {
         let value: Value = serde_json::from_str(
             r#"{"event":"pane_agent_status_changed",
-                "data":{"pane_id":"w1:p2","agent":"grok","status":"working"}}"#,
+                "data":{"pane_id":"w1:p2","agent":"codex","status":"working"}}"#,
         )
         .unwrap();
         assert_eq!(find_pane_id(&value), Some("w1:p2"));
-        assert_eq!(find_agent(&value), Some("grok"));
+        assert_eq!(find_agent(&value), Some("codex"));
     }
 
     #[test]
@@ -2626,7 +2109,7 @@ mod tests {
     fn unfocused_idle_after_working_becomes_unseen_teal() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        let mut pane = test_pane("w1:p2", Harness::Cursor);
+        let mut pane = test_pane("w1:p2", Harness::Codex);
         pane.status = AgentStatus::Idle;
         pane.focused = false;
         pane.tokens
@@ -2643,7 +2126,7 @@ mod tests {
     fn working_set_survives_lost_working_icon() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        let mut working = test_pane("w1:p2", Harness::Cursor);
+        let mut working = test_pane("w1:p2", Harness::Codex);
         working.status = AgentStatus::Working;
         apply_icon_attention(
             std::slice::from_mut(&mut working),
@@ -2658,7 +2141,7 @@ mod tests {
         // Production trap: watch painted idle white and cleared the yellow
         // twin before the completion event ran. The working set must still
         // force teal.
-        let mut idle = test_pane("w1:p2", Harness::Cursor);
+        let mut idle = test_pane("w1:p2", Harness::Codex);
         idle.status = AgentStatus::Idle;
         idle.focused = false;
         idle.tokens.insert("quota_icon".into(), "white".into());
@@ -2672,7 +2155,7 @@ mod tests {
     fn focused_completion_waits_for_focus_event() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        let mut pane = test_pane("w1:p1", Harness::Cursor);
+        let mut pane = test_pane("w1:p1", Harness::Codex);
         pane.status = AgentStatus::Idle;
         pane.focused = true;
         pane.tokens
@@ -2688,7 +2171,7 @@ mod tests {
     fn completion_stays_teal_until_a_later_focus_event() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        let mut pane = test_pane("w1:p1", Harness::Cursor);
+        let mut pane = test_pane("w1:p1", Harness::Codex);
         pane.status = AgentStatus::Working;
         pane.focused = true;
         apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
@@ -2739,7 +2222,7 @@ mod tests {
     fn plain_unfocused_idle_does_not_become_teal() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        let mut pane = test_pane("w1:p3", Harness::Grok);
+        let mut pane = test_pane("w1:p3", Harness::Claude);
         pane.status = AgentStatus::Idle;
         pane.focused = false;
         apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
@@ -2752,7 +2235,7 @@ mod tests {
     fn single_pane_update_does_not_drop_sibling_unseen() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        let mut other = test_pane("w1:p9", Harness::Grok);
+        let mut other = test_pane("w1:p9", Harness::Claude);
         other.status = AgentStatus::Idle;
         other.focused = false;
         other
@@ -2761,7 +2244,7 @@ mod tests {
         apply_icon_attention(std::slice::from_mut(&mut other), &cache, None, false, false).unwrap();
         assert!(cache.icon_attention().unseen.contains("w1:p9"));
 
-        let mut pane = test_pane("w1:p1", Harness::Cursor);
+        let mut pane = test_pane("w1:p1", Harness::Codex);
         pane.status = AgentStatus::Working;
         apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, false).unwrap();
         assert!(
@@ -2775,7 +2258,7 @@ mod tests {
     fn force_seen_clears_unseen_even_when_inventory_is_unfocused() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        let mut pane = test_pane("w1:p1", Harness::Cursor);
+        let mut pane = test_pane("w1:p1", Harness::Codex);
         pane.status = AgentStatus::Idle;
         pane.focused = false;
         pane.tokens.insert("quota_icon_done".into(), "teal".into());
@@ -2801,7 +2284,7 @@ mod tests {
     fn focus_change_uses_last_focused_and_keeps_other_green_panes() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        let mut previous = test_pane("w1:p1", Harness::Cursor);
+        let mut previous = test_pane("w1:p1", Harness::Codex);
         previous.focused = true;
         previous.status = AgentStatus::Working;
         apply_icon_attention(
@@ -2835,7 +2318,7 @@ mod tests {
         previous
             .tokens
             .insert("quota_icon_done".into(), "green".into());
-        let mut next = test_pane("w2:p2", Harness::Grok);
+        let mut next = test_pane("w2:p2", Harness::Claude);
         next.focused = true;
         let mut unrelated = test_pane("w1:p3", Harness::Codex);
         unrelated.status = AgentStatus::Done;
@@ -2860,7 +2343,7 @@ mod tests {
         attention.last_focused = Some("w1:p1".into());
         cache.set_icon_attention(&attention).unwrap();
 
-        let mut pane = test_pane("w1:p2", Harness::Cursor);
+        let mut pane = test_pane("w1:p2", Harness::Codex);
         pane.focused = true;
         pane.status = AgentStatus::Working;
         apply_icon_attention(std::slice::from_mut(&mut pane), &cache, None, false, true).unwrap();
@@ -2881,7 +2364,7 @@ mod tests {
 
     #[test]
     fn unfocused_done_keeps_teal_icon_status() {
-        let mut pane = test_pane("w1:p2", Harness::Grok);
+        let mut pane = test_pane("w1:p2", Harness::Claude);
         pane.status = AgentStatus::Done;
         pane.focused = false;
         assert_eq!(
@@ -2911,7 +2394,7 @@ mod tests {
     fn hydrate_done_tokens_only_when_attention_file_is_missing() {
         let dir = tempdir().unwrap();
         let cache = CacheStore::new(dir.path());
-        let mut pane = test_pane("w1:p2", Harness::Cursor);
+        let mut pane = test_pane("w1:p2", Harness::Codex);
         pane.status = AgentStatus::Idle;
         pane.focused = false;
         pane.tokens.insert("quota_icon_done".into(), "teal".into());
@@ -2945,7 +2428,7 @@ mod tests {
 
     #[test]
     fn stale_done_icon_keeps_the_watcher_alive_until_cleared() {
-        let mut pane = test_pane("w1:p1", Harness::Cursor);
+        let mut pane = test_pane("w1:p1", Harness::Codex);
         pane.status = AgentStatus::Done;
         pane.focused = false;
         pane.tokens.insert("quota_icon_done".into(), "teal".into());

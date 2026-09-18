@@ -3,6 +3,7 @@ use crate::cli::PercentStyle;
 use crate::model::{Provider, ProviderSnapshot};
 use crate::presentation::dashboard_summary;
 use anyhow::Result;
+use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, IsTerminal, Write};
@@ -38,7 +39,7 @@ fn interactive(cache: &CacheStore) -> Result<()> {
             print!(
                 "{}{}{frame}",
                 crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-                crossterm::cursor::MoveTo(0, 0)
+                MoveTo(0, 0)
             );
             io::stdout().flush()?;
             painted = Some(frame);
@@ -73,15 +74,6 @@ fn render_snapshot(cache: &CacheStore) -> Result<String> {
     for provider in Provider::ALL {
         let snapshot = cache.load(provider)?;
         output.push_str(&render_provider(provider, snapshot.as_ref(), now, style));
-        output.push_str("\r\n");
-    }
-    // The dashboard is the only surface with room for a scoped collector's
-    // full window set, including the 30d bucket the sidebar has no token for.
-    for provider in Provider::SCOPED {
-        let Some(snapshot) = cache.load(provider)? else {
-            continue;
-        };
-        output.push_str(&render_provider(provider, Some(&snapshot), now, style));
         output.push_str("\r\n");
     }
     Ok(output)
@@ -167,37 +159,6 @@ mod tests {
 
     /// The sidebar has no monthly token, so the dashboard is where a Go plan's
     /// 30d bucket has to surface. It appears only once something is cached.
-    #[test]
-    fn a_scoped_collector_appears_with_its_monthly_window_once_cached() {
-        let directory = tempdir().unwrap();
-        let cache = CacheStore::new(directory.path());
-        assert!(!render_snapshot(&cache).unwrap().contains("OpenCode Go"));
-
-        cache
-            .save(&ProviderSnapshot::new(
-                Provider::OpenCodeGo,
-                vec![
-                    UsageWindow::new(
-                        WindowKind::FiveHour,
-                        10.0,
-                        Some(ResetAt::from_unix_seconds(2_000_000_000)),
-                    )
-                    .unwrap(),
-                    UsageWindow::new(
-                        WindowKind::Monthly,
-                        30.0,
-                        Some(ResetAt::from_unix_seconds(2_000_000_000)),
-                    )
-                    .unwrap(),
-                ],
-                0,
-            ))
-            .unwrap();
-        let rendered = render_snapshot(&cache).unwrap();
-        assert!(rendered.contains("OpenCode Go"), "{rendered}");
-        assert!(rendered.contains("30d 70% left"), "{rendered}");
-    }
-
     #[test]
     fn snapshot_lines_return_to_column_zero_in_herdr_pty() {
         let directory = tempdir().unwrap();

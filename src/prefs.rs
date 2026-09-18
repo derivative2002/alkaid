@@ -164,7 +164,7 @@ mod tests {
         // Direct CLI runs have no Herdr config directory; they must not fail.
         testing::without_config_dir(|| {
             assert_eq!(read(AGENTS), None);
-            assert!(write(AGENTS, "grok").is_ok());
+            assert!(write(AGENTS, "codex").is_ok());
             assert!(clear(AGENTS).is_ok());
         });
     }
@@ -175,8 +175,8 @@ mod tests {
         testing::with_config_dir(directory.path(), || {
             write(AGENTS, "  \n ").unwrap();
             assert_eq!(read(AGENTS), None);
-            write(AGENTS, " grok,claude \n").unwrap();
-            assert_eq!(read(AGENTS).as_deref(), Some("grok,claude"));
+            write(AGENTS, " codex,claude \n").unwrap();
+            assert_eq!(read(AGENTS).as_deref(), Some("codex,claude"));
             clear(AGENTS).unwrap();
             assert_eq!(read(AGENTS), None);
         });

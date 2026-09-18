@@ -38,7 +38,7 @@ cd herdr-agent-quota
 ./install.sh
 ```
 
-To enable a subset, use `./install.sh --agent claude,codex,omp`.
+To enable a subset, use `./install.sh --agent claude`.
 Existing sessions need restarting only when newly installed hooks or Herdr
 integrations must be loaded.
 
@@ -73,7 +73,7 @@ herdr plugin pane open --plugin herdr-agent-quota --entrypoint settings --focus
 | Fields | Provider, topic, model, context, short/long/monthly quota on by default; cache and TTL optional |
 | Agent order | Group by Space, least quota left first (default); or Herdr's own policy |
 | Low quota alert | Off or a threshold from 1% to 100% |
-| Agents | Claude, Codex, Grok, Agy, OpenCode, Pi, OMP, Devin, Muse, Cursor |
+| Agents | Claude, Codex |
 
 Use arrows or Space to edit, `a` to apply, and `q` to close.
 Installer options are also available through `./install.sh --help`.
@@ -83,15 +83,7 @@ Installer options are also available through `./install.sh --help`.
 | Agent | Quota source | Attribution |
 | --- | --- | --- |
 | Codex | Codex app-server; 5h and/or 7d | Current login in the plugin's `CODEX_HOME` |
-| Grok | CLI billing endpoint; 7d or 30d | Current CLI credentials |
-| Devin | CLI usage endpoint; 1d and 7d | Current CLI credentials |
-| Muse Code | CLI subscription endpoint; 5h and 7d | Current CLI account login; session via Muse's session lock (Linux) |
-| Cursor | CLI DashboardService usage; at, api, and 30d | Current CLI `auth.json`, else the desktop `state.vscdb` access token; model from local session files; topic from the generated session title; `cx` from `store.db` `token_details` (the CLI footer percent); cache from CLI hooks |
 | Claude Code | StatusLine; 5h and 7d | Exact session observation |
-| Agy / Antigravity | StatusLine; 5h, 7d, and api (third-party pool on Gemini) | Exact session and identifiable model pool |
-| OpenCode | OpenCode Go usage endpoint | Go credential; confirmed PAYG routes have no subscription quota |
-| Pi | Canonical Codex quota | Only when the recorded account matches |
-| OMP | `omp usage --json --provider <id>` | Reported account matching the session's credential pin |
 
 The Claude Code status line keeps the user's own statusLine output and appends
 a spending pace for the binding window, for example `⏱ 5h ↓12%`: quota used
@@ -104,33 +96,25 @@ reset further away than the window is long, or in the first 5% of the window.
 Quota windows retain their provider's meaning. Model, context, and cache data
 come from the identified session when available. `ttl≈` marks an estimated
 prompt-cache lifetime, not a guaranteed expiry. Topic extraction uses the
-named pane's visible screen for most agents and preserves the last topic when
-it scrolls away. Cursor and Grok use the generated session title from local
-session metadata instead; Muse uses the last prompt in its transcript.
+named pane's visible screen and preserves the last topic when it scrolls
+away.
 
 All supported working agents participate in one background watcher. Requests
 are debounced for 60 seconds, including a final refresh after a turn settles.
-OMP additionally retains its own five-minute usage cache. Idle panes sharing a
-verified quota source receive the same reading.
+Idle panes sharing a verified quota source receive the same reading.
 
-Native Codex, Grok, Devin, Muse, and Cursor collectors follow the plugin's current login,
-not separate accounts for each pane. Claude/Agy do not report a reliable serving
-account ID, so their observations are not shared across sessions. Unknown
-identity or model-pool attribution does not produce a guessed quota. Failed
-requests preserve the last verified reading for that same account; they do not
-turn failures into zero usage.
+The Codex collector follows the plugin's current login, not separate accounts
+for each pane. Claude does not report a reliable serving account ID, so its
+observations are not shared across sessions. Unknown identity does not produce
+a guessed quota. Failed requests preserve the last verified reading for that
+same account; they do not turn failures into zero usage.
 
 ## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
 | Session data is missing | Run `herdr integration status`; load missing integrations before restarting the affected agent |
-| Claude/Agy quota is missing | Send a turn so the session's StatusLine produces an observation |
-| OMP quota is missing | Check `omp usage --json --redact --provider <id>` |
-| Devin quota is missing | Check the CLI login and `DEVIN_CREDENTIALS_FILE` if customized |
-| Muse quota is missing | Run `muse login` (API-key logins have no subscription quota); check `MUSE_AUTH_PATH` if customized. On macOS, a `storage: "keychain"` login also needs a one-time Keychain approval: run `herdr-agent-quota refresh --provider muse --keychain-approve` and click **Always Allow** |
-| Cursor quota is missing | Run `cursor login`, or sign in to the Cursor desktop app; check `CURSOR_AUTH_FILE` if customized |
-| Cursor cache/context is missing | `cx` comes from that session's `store.db`; cache still needs the pane to have reloaded `hooks.json` and sent a turn (headless `--print` does not fire those hooks) |
+| Claude quota is missing | Send a turn so the session's StatusLine produces an observation |
 | Rows are missing | Run the configure action below to repair managed configuration |
 | The `gauges` meter disappears on a narrow sidebar | Expected below ~24 columns; widen the sidebar and refresh |
 | `gauges` still uses the old width after a resize | Refresh with `prefix+shift+r`; there is no live resize publish path |
@@ -142,7 +126,7 @@ herdr plugin action invoke configure --plugin herdr-agent-quota
 ```
 
 Uninstall everything with `./uninstall.sh`, or remove a subset with
-`./uninstall.sh --agent grok`. Configuration changes are reversible; user-owned
+`./uninstall.sh --agent codex`. Configuration changes are reversible; user-owned
 settings and other agents remain intact.
 
 ## Contributing

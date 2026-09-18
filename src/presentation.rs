@@ -713,7 +713,7 @@ mod tests {
     #[test]
     fn headroom_is_the_tightest_window_the_sidebar_actually_shows() {
         let snapshot = ProviderSnapshot::new(
-            Provider::OpenCodeGo,
+            Provider::Claude,
             vec![
                 window(WindowKind::FiveHour, 40.0, 3_600),
                 window(WindowKind::Weekly, 75.0, 183_600),
@@ -759,39 +759,21 @@ mod tests {
 
     #[test]
     fn a_provider_with_no_window_reports_no_headroom() {
-        let snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 0);
+        let snapshot = ProviderSnapshot::new(Provider::Codex, vec![], 0);
         assert_eq!(
             MetadataTokens::from_snapshot(&snapshot, 0).quota_headroom,
             None
         );
         assert_eq!(
-            MetadataTokens::unavailable(Provider::Grok, "switched account").quota_headroom,
+            MetadataTokens::unavailable(Provider::Codex, "switched account").quota_headroom,
             None
         );
     }
 
     #[test]
-    fn agy_third_party_pool_renders_as_api() {
-        let snapshot = ProviderSnapshot::new(
-            Provider::Agy,
-            vec![
-                window(WindowKind::FiveHour, 15.0, 14_820),
-                window(WindowKind::Weekly, 37.0, 518_400),
-                window(WindowKind::Monthly, 0.0, 518_400).with_source_window("api", None),
-            ],
-            0,
-        );
-        let values = MetadataTokens::from_snapshot(&snapshot, 0);
-        assert!(values.quota_5h.starts_with("5h "), "{values:?}");
-        assert!(values.quota_week.starts_with("7d "), "{values:?}");
-        assert!(values.quota_month.starts_with("api "), "{values:?}");
-        assert!(!values.quota_month.contains("30d"), "{values:?}");
-    }
-
-    #[test]
     fn a_monthly_window_has_its_own_sidebar_token() {
         let snapshot = ProviderSnapshot::new(
-            Provider::OpenCodeGo,
+            Provider::Claude,
             vec![
                 window(WindowKind::FiveHour, 10.0, 3_600),
                 window(WindowKind::Weekly, 20.0, 183_600),
@@ -821,7 +803,7 @@ mod tests {
     #[test]
     fn a_monthly_only_plan_fills_the_long_window_slot_with_its_own_label() {
         let snapshot = ProviderSnapshot::new(
-            Provider::Grok,
+            Provider::Codex,
             vec![window(WindowKind::Monthly, 30.0, 1_500_000)],
             0,
         );
@@ -834,13 +816,14 @@ mod tests {
 
     #[test]
     fn unavailable_omits_window_rows_instead_of_printing_na() {
-        let cursor = MetadataTokens::unavailable(Provider::Cursor, "signed-in account changed");
-        assert_eq!(cursor.quota_month, "");
-        assert_eq!(cursor.quota_month_severity, None);
-        assert_eq!(cursor.quota_week, "");
-        assert_eq!(cursor.quota_5h, "");
+        let unavailable =
+            MetadataTokens::unavailable(Provider::Claude, "signed-in account changed");
+        assert_eq!(unavailable.quota_month, "");
+        assert_eq!(unavailable.quota_month_severity, None);
+        assert_eq!(unavailable.quota_week, "");
+        assert_eq!(unavailable.quota_5h, "");
         assert_eq!(
-            cursor.quota_error.as_deref(),
+            unavailable.quota_error.as_deref(),
             Some("signed-in account changed")
         );
 
@@ -854,7 +837,7 @@ mod tests {
     #[test]
     fn unavailable_for_windows_does_not_invent_na_rows() {
         let values = MetadataTokens::unavailable_for_windows(
-            Provider::Grok,
+            Provider::Codex,
             "signed-in account changed",
             &[window(WindowKind::Monthly, 30.0, 1_500_000)],
         );
@@ -873,7 +856,7 @@ mod tests {
     #[test]
     fn a_weekly_window_always_wins_the_long_window_slot() {
         let snapshot = ProviderSnapshot::new(
-            Provider::OpenCodeGo,
+            Provider::Claude,
             vec![
                 window(WindowKind::Weekly, 20.0, 183_600),
                 window(WindowKind::Monthly, 90.0, 1_500_000),
@@ -1054,7 +1037,7 @@ mod tests {
 
     #[test]
     fn metadata_error_stays_within_herdr_token_limit() {
-        let values = MetadataTokens::unavailable(Provider::Grok, "x".repeat(120));
+        let values = MetadataTokens::unavailable(Provider::Codex, "x".repeat(120));
         assert_eq!(values.quota_error.as_deref().unwrap().len(), 80);
     }
 
@@ -1136,58 +1119,6 @@ mod tests {
     }
 
     #[test]
-    fn devin_pane_uses_configured_default_when_session_model_is_unknown() {
-        let snapshot = ProviderSnapshot::new(
-            Provider::Devin,
-            vec![window(WindowKind::Weekly, 10.0, 183_600)],
-            0,
-        )
-        .with_model(Some("SWE-1.7 Medium".to_string()));
-        let pane = MetadataTokens::from_snapshot_for_pane(
-            &snapshot,
-            0,
-            Some("session-a"),
-            PercentStyle::default(),
-            SidebarShape::default(),
-        );
-        assert_eq!(pane.quota_model, "SWE-1.7 Medium");
-        assert_eq!(pane.quota_provider_model, "Devin/SWE-1.7 Medium");
-    }
-
-    #[test]
-    fn devin_panes_keep_distinct_session_models() {
-        let mut snapshot = ProviderSnapshot::new(
-            Provider::Devin,
-            vec![window(WindowKind::Weekly, 10.0, 183_600)],
-            0,
-        )
-        .with_model(Some("SWE-1.7 Medium".to_string()));
-        snapshot
-            .session_models
-            .insert("session-a".to_string(), "Opus 4.6".to_string());
-
-        let switched = MetadataTokens::from_snapshot_for_pane(
-            &snapshot,
-            0,
-            Some("session-a"),
-            PercentStyle::default(),
-            SidebarShape::default(),
-        );
-        assert_eq!(switched.quota_model, "Opus 4.6");
-        assert_eq!(switched.quota_provider_model, "Devin/Opus 4.6");
-
-        let untouched = MetadataTokens::from_snapshot_for_pane(
-            &snapshot,
-            0,
-            Some("session-b"),
-            PercentStyle::default(),
-            SidebarShape::default(),
-        );
-        assert_eq!(untouched.quota_model, "SWE-1.7 Medium");
-        assert_eq!(untouched.quota_provider_model, "Devin/SWE-1.7 Medium");
-    }
-
-    #[test]
     fn metadata_uses_context_and_cache_for_the_pane_session() {
         let mut snapshot = ProviderSnapshot::new(Provider::Codex, vec![], 0);
         snapshot.session_contexts.insert(
@@ -1220,8 +1151,8 @@ mod tests {
 
     #[test]
     fn pane_without_session_id_does_not_broadcast_local_diagnostics() {
-        let snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 0)
-            .with_model(Some("grok-4.6".to_string()))
+        let snapshot = ProviderSnapshot::new(Provider::Codex, vec![], 0)
+            .with_model(Some("gpt-5-codex".to_string()))
             .with_context(Some(
                 crate::model::ContextUsage::new(43.2)
                     .unwrap()
@@ -1234,7 +1165,7 @@ mod tests {
             PercentStyle::default(),
             SidebarShape::default(),
         );
-        assert_eq!(values.quota_provider_model, "Grok/grok-4.6");
+        assert_eq!(values.quota_provider_model, "Codex/gpt-5-codex");
         assert_eq!(values.quota_context, "");
         assert_eq!(values.quota_cache, "");
         assert_eq!(values.quota_cache_ttl, "");
@@ -1243,8 +1174,8 @@ mod tests {
 
     #[test]
     fn a_narrow_sidebar_keeps_only_the_model_beside_the_logo() {
-        let snapshot =
-            ProviderSnapshot::new(Provider::Grok, vec![], 0).with_model(Some("grok-4.6".into()));
+        let snapshot = ProviderSnapshot::new(Provider::Codex, vec![], 0)
+            .with_model(Some("gpt-5-codex".into()));
         let wide = MetadataTokens::from_snapshot_for_pane(
             &snapshot,
             0,
@@ -1252,8 +1183,8 @@ mod tests {
             PercentStyle::default(),
             SidebarShape::new(SidebarLayout::Packed, 30),
         );
-        assert_eq!(wide.quota_provider_model, "Grok/grok-4.6");
-        assert_eq!(wide.quota_provider, "Grok");
+        assert_eq!(wide.quota_provider_model, "Codex/gpt-5-codex");
+        assert_eq!(wide.quota_provider, "Codex");
         let narrow = MetadataTokens::from_snapshot_for_pane(
             &snapshot,
             0,
@@ -1262,9 +1193,9 @@ mod tests {
             SidebarShape::new(SidebarLayout::Packed, 22),
         );
         // content_width = 22 - 4 = 18 < 22 → model only
-        assert_eq!(narrow.quota_provider_model, "grok-4.6");
+        assert_eq!(narrow.quota_provider_model, "gpt-5-codex");
         assert!(narrow.quota_provider.is_empty());
-        assert_eq!(narrow.quota_model, "grok-4.6");
+        assert_eq!(narrow.quota_model, "gpt-5-codex");
     }
 
     #[test]
@@ -1360,12 +1291,7 @@ mod tests {
 
     #[test]
     fn a_missing_five_hour_window_omits_the_row() {
-        for provider in [
-            Provider::Claude,
-            Provider::Agy,
-            Provider::Codex,
-            Provider::Grok,
-        ] {
+        for provider in [Provider::Claude, Provider::Codex] {
             let snapshot =
                 ProviderSnapshot::new(provider, vec![window(WindowKind::Weekly, 31.0, 518_400)], 0);
             let values = MetadataTokens::from_snapshot(&snapshot, 0);
@@ -1376,9 +1302,9 @@ mod tests {
     }
 
     #[test]
-    fn grok_does_not_invent_a_five_hour_row() {
+    fn a_weekly_only_plan_does_not_invent_a_five_hour_row() {
         let snapshot = ProviderSnapshot::new(
-            Provider::Grok,
+            Provider::Codex,
             vec![window(WindowKind::Weekly, 31.0, 518_400)],
             0,
         );
@@ -1388,21 +1314,21 @@ mod tests {
     }
 
     #[test]
-    fn grok_and_codex_panes_keep_account_quota_when_the_session_is_known() {
-        let grok = ProviderSnapshot::new(
-            Provider::Grok,
+    fn codex_panes_keep_account_quota_when_the_session_is_known() {
+        let codex_snapshot = ProviderSnapshot::new(
+            Provider::Codex,
             vec![window(WindowKind::Weekly, 31.0, 518_400)],
             0,
         );
-        let grok_pane = MetadataTokens::from_snapshot_for_pane(
-            &grok,
+        let codex_pane = MetadataTokens::from_snapshot_for_pane(
+            &codex_snapshot,
             0,
             Some("session-1"),
             PercentStyle::default(),
             SidebarShape::default(),
         );
-        assert_eq!(grok_pane.quota_week, "7d 69% 6d0h");
-        assert_eq!(grok_pane.quota_5h, "");
+        assert_eq!(codex_pane.quota_week, "7d 69% 6d0h");
+        assert_eq!(codex_pane.quota_5h, "");
 
         let codex = ProviderSnapshot::new(
             Provider::Codex,
@@ -1474,95 +1400,6 @@ mod tests {
         );
         assert_eq!(unknown.quota_5h, "");
         assert_eq!(unknown.quota_week, "");
-    }
-
-    #[test]
-    fn agy_sidebar_keeps_account_quota_when_herdr_session_is_a_subagent() {
-        let mut snapshot = ProviderSnapshot::new(
-            Provider::Agy,
-            vec![
-                window(WindowKind::FiveHour, 1.0, 14_820),
-                window(WindowKind::Weekly, 2.0, 518_400),
-            ],
-            0,
-        )
-        .session_local()
-        .with_model(Some("Gemini 3.8 Flash (High)".to_string()));
-        snapshot.session_windows.insert(
-            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
-            snapshot.windows.clone(),
-        );
-        snapshot.session_models.insert(
-            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
-            "Gemini 3.8 Flash (High)".to_string(),
-        );
-        snapshot.context = Some(crate::model::ContextUsage::new(3.427886962890625).unwrap());
-        snapshot.session_contexts.insert(
-            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
-            crate::model::ContextUsage::new(3.427886962890625).unwrap(),
-        );
-
-        let values = MetadataTokens::from_snapshot_for_pane(
-            &snapshot,
-            0,
-            Some("6a4d6f77-88be-4704-adcc-a51401ad7c03"),
-            PercentStyle::default(),
-            SidebarShape::default(),
-        );
-        assert_eq!(values.quota_5h, "5h 99% 4h07m");
-        assert_eq!(values.quota_week, "7d 98% 6d0h");
-        assert_eq!(values.quota_provider_model, "Agy/Gemini 3.8 Flash (High)");
-        assert_eq!(values.quota_context, "context 3%");
-        assert_eq!(values.quota_cache, "");
-    }
-
-    #[test]
-    fn agy_sidebar_does_not_show_another_panes_model_or_context() {
-        let mut snapshot = ProviderSnapshot::new(
-            Provider::Agy,
-            vec![window(WindowKind::FiveHour, 80.0, 14_820)],
-            0,
-        )
-        .session_local()
-        .with_model(Some("Claude Sonnet".to_string()));
-        snapshot.session_windows.insert(
-            "w1:p1".to_string(),
-            vec![window(WindowKind::FiveHour, 10.0, 14_820)],
-        );
-        snapshot.session_windows.insert(
-            "w1:p2".to_string(),
-            vec![window(WindowKind::FiveHour, 80.0, 14_820)],
-        );
-        snapshot
-            .session_models
-            .insert("w1:p2".to_string(), "Claude Sonnet".to_string());
-        snapshot.context = Some(crate::model::ContextUsage::new(70.0).unwrap());
-        snapshot.session_contexts.insert(
-            "w1:p2".to_string(),
-            crate::model::ContextUsage::new(70.0).unwrap(),
-        );
-
-        let pane_a = MetadataTokens::from_snapshot_for_pane(
-            &snapshot,
-            0,
-            Some("w1:p1"),
-            PercentStyle::default(),
-            SidebarShape::default(),
-        );
-        assert_eq!(pane_a.quota_5h, "5h 90% 4h07m");
-        assert_eq!(pane_a.quota_provider_model, "Agy");
-        assert_eq!(pane_a.quota_context, "");
-        assert_eq!(pane_a.quota_cache, "");
-
-        let pane_b = MetadataTokens::from_snapshot_for_pane(
-            &snapshot,
-            0,
-            Some("w1:p2"),
-            PercentStyle::default(),
-            SidebarShape::default(),
-        );
-        assert_eq!(pane_b.quota_provider_model, "Agy/Claude Sonnet");
-        assert_eq!(pane_b.quota_context, "context 70%");
     }
 
     #[test]
@@ -2134,11 +1971,11 @@ mod tests {
     #[test]
     fn a_label_too_long_for_the_gauges_column_keeps_the_non_gauge_shape() {
         let mut snapshot = ProviderSnapshot::new(
-            Provider::Omp,
+            Provider::Claude,
             vec![window(WindowKind::FiveHour, 58.0, 11_400).with_source_window("usage", None)],
             0,
         );
-        snapshot.source = "omp.acme".to_string();
+        snapshot.source = "custom.acme".to_string();
         let values = MetadataTokens::from_snapshot_for_session(
             &snapshot,
             0,
@@ -2154,7 +1991,7 @@ mod tests {
     #[test]
     fn a_week_row_folded_beside_context_still_carries_its_meter() {
         let snapshot = ProviderSnapshot::new(
-            Provider::Grok,
+            Provider::Codex,
             vec![window(WindowKind::Weekly, 17.0, 424_800)],
             0,
         );
@@ -2299,7 +2136,7 @@ mod tests {
         )
         .unwrap()
         .with_source_window("Monthly", None);
-        let snapshot = ProviderSnapshot::new(Provider::Omp, vec![long], 0);
+        let snapshot = ProviderSnapshot::new(Provider::Claude, vec![long], 0);
         let values = MetadataTokens::from_snapshot_for_session(
             &snapshot,
             0,

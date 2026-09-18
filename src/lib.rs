@@ -8,13 +8,7 @@ pub mod process;
 
 pub mod configure;
 pub mod dashboard;
-#[path = "herdr_wrapper.rs"]
 pub mod herdr;
-#[path = "herdr.rs"]
-mod herdr_base;
-pub mod omp;
-pub mod opencode;
-pub mod pi;
 pub mod providers;
 pub mod refresh;
 pub mod route;

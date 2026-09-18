@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -14,25 +13,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Codex,
-    Grok,
     Claude,
-    Agy,
-    /// OpenCode's Go subscription. Deliberately absent from [`Provider::ALL`]:
-    /// it has no 1:1 harness mapping and is only ever fetched for a pane that
-    /// resolved to it, so the original four keep their exact refresh behavior.
-    OpenCodeGo,
-    /// Quota reported by omp's own provider-agnostic usage layer. This is a
-    /// scoped collector only; it is never part of a bare provider refresh.
-    Omp,
-    /// Quota reported by Devin CLI's Connect RPC API. A 1:1 harness→billing
-    /// mapping like the original four, refreshed through `--provider all`.
-    Devin,
-    /// Muse Code's subscription windows, read from the key call the CLI makes.
-    /// A 1:1 harness→billing mapping refreshed through `--provider all`.
-    Muse,
-    /// Cursor Agent CLI's included monthly pool, read from DashboardService.
-    /// A 1:1 harness→billing mapping refreshed through `--provider all`.
-    Cursor,
 }
 
 /// Quota collector identity. The original four keep the historical
@@ -40,53 +21,20 @@ pub enum Provider {
 pub type Billing = Provider;
 
 impl Provider {
-    /// The collectors a bare `--provider all` refreshes. OpenCode Go is not
-    /// here on purpose; see the variant's note.
-    pub const ALL: [Self; 7] = [
-        Self::Codex,
-        Self::Grok,
-        Self::Claude,
-        Self::Agy,
-        Self::Devin,
-        Self::Muse,
-        Self::Cursor,
-    ];
-
-    /// Collectors fetched only for a pane that resolved to them.
-    ///
-    /// They are never refreshed through the provider list, so the dashboard
-    /// shows one only once it has something cached — a permanent
-    /// "unavailable" row for a subscription the user does not have would be
-    /// noise, not information.
-    pub const SCOPED: [Self; 1] = [Self::OpenCodeGo];
+    /// The collectors a bare `--provider all` refreshes.
+    pub const ALL: [Self; 2] = [Self::Codex, Self::Claude];
 
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
-            Self::Grok => "Grok",
             Self::Claude => "Claude",
-            Self::Agy => "Agy",
-            Self::OpenCodeGo => "OpenCode Go",
-            Self::Omp => "OMP",
-            Self::Devin => "Devin",
-            Self::Muse => "Muse",
-            Self::Cursor => "Cursor",
         }
     }
 
     pub fn source(self) -> &'static str {
         match self {
             Self::Codex => "codex-app-server",
-            Self::Grok => "grok-cli-billing",
             Self::Claude => "claude-statusline",
-            Self::Agy => "agy-statusline",
-            // Scoped to the OpenCode credential store so it can never collide
-            // with the original four's 0.2 filenames.
-            Self::OpenCodeGo => "opencode-go.opencode-store",
-            Self::Omp => "omp-usage",
-            Self::Devin => "devin-cli-billing",
-            Self::Muse => "muse-code-subscription",
-            Self::Cursor => "cursor-dashboard-usage",
         }
     }
 }
@@ -97,15 +45,7 @@ impl Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Harness {
     Codex,
-    Grok,
     Claude,
-    Agy,
-    OpenCode,
-    Pi,
-    Omp,
-    Devin,
-    Muse,
-    Cursor,
 }
 
 impl Harness {
@@ -114,31 +54,17 @@ impl Harness {
     pub fn from_agent_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "codex" => Some(Self::Codex),
-            "grok" => Some(Self::Grok),
             "claude" | "claude-code" | "anthropic" => Some(Self::Claude),
-            "agy" | "antigravity" | "antigravity-cli" => Some(Self::Agy),
-            "opencode" => Some(Self::OpenCode),
-            "pi" => Some(Self::Pi),
-            "omp" => Some(Self::Omp),
-            "devin" | "devin-cli" => Some(Self::Devin),
-            "muse" | "muse-code" => Some(Self::Muse),
-            "cursor" | "cursor-agent" | "cursor-cli" => Some(Self::Cursor),
             _ => None,
         }
     }
 
-    /// Original-four 1:1 map. Named harnesses without a collector, and
+    /// Harness→collector map. Named harnesses without a collector, and
     /// unknown names, return `None`.
     pub fn billing(self) -> Option<Billing> {
         match self {
             Self::Codex => Some(Provider::Codex),
-            Self::Grok => Some(Provider::Grok),
             Self::Claude => Some(Provider::Claude),
-            Self::Agy => Some(Provider::Agy),
-            Self::Devin => Some(Provider::Devin),
-            Self::Muse => Some(Provider::Muse),
-            Self::Cursor => Some(Provider::Cursor),
-            Self::OpenCode | Self::Pi | Self::Omp => None,
         }
     }
 
@@ -152,14 +78,8 @@ impl Harness {
 pub struct CredentialScope(&'static str);
 
 impl CredentialScope {
-    /// Canonical CLI stores for the original four collectors.
+    /// Canonical CLI stores for the collectors.
     pub const CANONICAL: Self = Self("canonical");
-    /// OpenCode default data store (`$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`).
-    pub const OPENCODE_STORE: Self = Self("opencode-store");
-    /// omp's own credential store (`<agent dir>/agent.db`). An omp pane is
-    /// billed to a subscription this plugin can also collect canonically, so
-    /// the scope is what keeps the two apart.
-    pub const OMP_STORE: Self = Self("omp-store");
 
     pub fn as_str(self) -> &'static str {
         self.0
@@ -171,10 +91,6 @@ impl CredentialScope {
 pub struct BillingTarget {
     pub billing: Provider,
     pub credential_scope: CredentialScope,
-    /// Stable discriminator for dynamic scoped collectors. OMP provider ids
-    /// are hashed so two providers never share a cache or debounce marker and
-    /// an arbitrary upstream id never becomes a filesystem path.
-    scope_hash: Option<[u8; 32]>,
 }
 
 impl BillingTarget {
@@ -182,28 +98,10 @@ impl BillingTarget {
         Self {
             billing: provider,
             credential_scope: CredentialScope::CANONICAL,
-            scope_hash: None,
         }
     }
 
-    pub fn opencode_go() -> Self {
-        Self {
-            billing: Provider::OpenCodeGo,
-            credential_scope: CredentialScope::OPENCODE_STORE,
-            scope_hash: None,
-        }
-    }
-
-    /// An omp-scoped target for a subscription omp routes a pane to.
-    pub fn omp(provider_id: &str) -> Self {
-        Self {
-            billing: Provider::Omp,
-            credential_scope: CredentialScope::OMP_STORE,
-            scope_hash: Some(Sha256::digest(provider_id.as_bytes()).into()),
-        }
-    }
-
-    /// The billing identity when it is one of the original four collectors.
+    /// The billing identity when it is one of the collectors.
     ///
     /// Those are refreshed through the provider list; anything else is fetched
     /// only for the pane that resolved to it.
@@ -215,36 +113,9 @@ impl BillingTarget {
 
     /// Cache, lease, and refresh-marker filename stem.
     ///
-    /// One authority for every target: the original four keep their 0.2 source
-    /// ids, and a scoped target carries its credential scope in the stem so it
-    /// cannot collide with them.
+    /// One authority for every target: collectors keep their 0.2 source ids.
     pub fn cache_identity(self) -> String {
-        if self.credential_scope == CredentialScope::OMP_STORE {
-            let discriminator = self
-                .scope_hash
-                .map(|hash| {
-                    hash.iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>()
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            return format!(
-                "{}-{discriminator}.{}",
-                self.billing.source(),
-                self.credential_scope.as_str()
-            );
-        }
-        let source = self.billing.source();
-        // OpenCode Go's 0.2 source id already carries its scope; the original
-        // four carry none because canonical is the absence of one. Anything
-        // else appends its scope so an omp-billed Claude can never overwrite
-        // the canonical Claude snapshot.
-        if self.credential_scope == CredentialScope::CANONICAL
-            || source.ends_with(self.credential_scope.as_str())
-        {
-            return source.to_string();
-        }
-        format!("{source}.{}", self.credential_scope.as_str())
+        self.billing.source().to_string()
     }
 }
 
@@ -687,22 +558,8 @@ impl ProviderSnapshot {
     }
 
     /// Resolve the session key used by per-session diagnostics.
-    ///
-    /// Non-Agy providers keep their exact existing lookup. Agy first honors an
-    /// exact statusLine conversation id. If Herdr supplied a different
-    /// subagent id, it may bridge to the sole observed conversation; once two
-    /// conversations are present, the mismatch fails closed.
     fn session_for_lookup<'a>(&'a self, session_id: &'a str) -> Option<&'a str> {
-        if self.provider != Provider::Agy {
-            return Some(session_id);
-        }
-        if self.session_windows.contains_key(session_id)
-            || self.session_models.contains_key(session_id)
-            || self.session_contexts.contains_key(session_id)
-        {
-            return Some(session_id);
-        }
-        self.only_observed_session()
+        Some(session_id)
     }
 
     /// Return the model for a pane's session.
@@ -713,57 +570,36 @@ impl ProviderSnapshot {
     /// in the DB gets its per-session active model. A pane without a
     /// `session_models` entry — a brand-new session, or one whose id is not in
     /// the DB — falls back to `snapshot.model`, the `config.json` default.
-    /// Agy may use the latest model only when every retained observation
-    /// points at this same conversation. An exact hit in `session_windows`
-    /// is not permission to borrow another pane's label.
+    /// An exact hit in `session_windows` is not permission to borrow another
+    /// pane's label.
     pub fn model_for_session(&self, session_id: Option<&str>) -> Option<&str> {
         let Some(session_id) = session_id else {
             // A session-local snapshot (Claude statusLine) holds the latest
             // pane's observation at the provider level. A pane with no
             // session id must not borrow it: that label belongs to whichever
-            // pane reported last. Agy keeps its documented latest-window rule.
-            if self.session_quota_only && self.provider != Provider::Agy {
+            // pane reported last.
+            if self.session_quota_only {
                 return None;
             }
             return self.model.as_deref();
         };
         let session_id = self.session_for_lookup(session_id)?;
-        if let Some(model) = self.session_models.get(session_id) {
-            return Some(model);
-        }
-        match self.provider {
-            // A Muse session with no completed model call yet runs the
-            // `settings.json` default, like a fresh Devin session.
-            Provider::Devin | Provider::Muse | Provider::Cursor => self.model.as_deref(),
-            Provider::Agy if self.only_observed_session() == Some(session_id) => {
-                self.model.as_deref()
-            }
-            _ => None,
-        }
+        self.session_models.get(session_id).map(String::as_str)
     }
 
     /// Return context/cache diagnostics for a pane's session. A known session
     /// never falls back to provider-level data, because an older snapshot may
     /// belong to another pane. The global value is used only when the caller
-    /// has no session id at all. Agy may use the latest context only when
-    /// every retained observation points at this same conversation.
+    /// has no session id at all.
     pub fn context_for_session(&self, session_id: Option<&str>) -> Option<&ContextUsage> {
         let Some(session_id) = session_id else {
-            if self.session_quota_only && self.provider != Provider::Agy {
+            if self.session_quota_only {
                 return None;
             }
             return self.context.as_ref();
         };
         let session_id = self.session_for_lookup(session_id)?;
-        if let Some(context) = self.session_contexts.get(session_id) {
-            return Some(context);
-        }
-        match self.provider {
-            Provider::Agy if self.only_observed_session() == Some(session_id) => {
-                self.context.as_ref()
-            }
-            _ => None,
-        }
+        self.session_contexts.get(session_id)
     }
 
     /// Return the quota windows for a pane's session.
@@ -783,9 +619,6 @@ impl ProviderSnapshot {
     ///    StatusLine cache written before session maps existed).
     /// 6. Keyed maps exist but this session is unknown → empty.
     pub fn windows_for_session(&self, session_id: Option<&str>) -> &[UsageWindow] {
-        if self.provider == Provider::Agy && session_id.is_none() {
-            return &self.windows;
-        }
         if self.session_quota_only {
             let Some(session_id) = session_id.and_then(|id| self.session_for_lookup(id)) else {
                 return &[];
@@ -834,7 +667,7 @@ impl ProviderSnapshot {
         current_account_id: Option<&str>,
         credentials_mtime_unix: Option<u64>,
     ) -> bool {
-        if matches!(self.provider, Provider::Claude | Provider::Agy)
+        if matches!(self.provider, Provider::Claude)
             && self.account_id.is_none()
             && !self.session_quota_only
         {
@@ -903,23 +736,12 @@ impl ProviderSnapshot {
     /// explicit window slice so a pane can be scored against its own
     /// session/account windows instead of the provider-wide top-level ones.
     pub fn severity_for_windows(
-        provider: Provider,
+        _provider: Provider,
         windows: &[UsageWindow],
         now_unix: u64,
     ) -> Severity {
         let live = live_windows(windows, now_unix);
-        let relevant = match provider {
-            Provider::Grok | Provider::Cursor => long_window(&live),
-            Provider::Codex
-            | Provider::Claude
-            | Provider::Agy
-            | Provider::OpenCodeGo
-            | Provider::Omp
-            | Provider::Devin
-            | Provider::Muse => {
-                window_in(&live, WindowKind::FiveHour).or_else(|| long_window(&live))
-            }
-        };
+        let relevant = window_in(&live, WindowKind::FiveHour).or_else(|| long_window(&live));
         relevant
             .map(|window| Severity::for_window(window, now_unix))
             .unwrap_or(Severity::Unknown)
@@ -1172,7 +994,7 @@ mod tests {
         let cache = CacheUsage::from_token_counts(10, 90, 0)
             .unwrap()
             .with_session_totals(CacheTotals::from_token_counts(10, 90, 0), "old-session", 0);
-        for provider in [Provider::Codex, Provider::Grok] {
+        for provider in [Provider::Codex] {
             let snapshot = ProviderSnapshot::new(provider, vec![], 0).with_context(Some(
                 ContextUsage::new(23.5)
                     .unwrap()
@@ -1187,7 +1009,7 @@ mod tests {
 
     #[test]
     fn cached_snapshot_from_another_account_is_not_usable() {
-        let snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 100)
+        let snapshot = ProviderSnapshot::new(Provider::Codex, vec![], 100)
             .with_account_id(Some("account-a".to_string()));
         assert!(!snapshot.usable_for_account(Some("account-b"), Some(50)));
         assert!(snapshot.usable_for_account(Some("account-a"), Some(200)));
@@ -1195,7 +1017,7 @@ mod tests {
 
     #[test]
     fn legacy_snapshot_is_dropped_when_credentials_are_newer_than_the_fetch() {
-        let snapshot = ProviderSnapshot::new(Provider::Grok, vec![], 100);
+        let snapshot = ProviderSnapshot::new(Provider::Codex, vec![], 100);
         assert!(!snapshot.usable_for_account(Some("account-b"), Some(150)));
         assert!(!snapshot.usable_for_account(Some("account-b"), Some(100)));
         assert!(!snapshot.usable_for_account(Some("account-b"), Some(50)));
@@ -1206,7 +1028,7 @@ mod tests {
     #[test]
     fn old_snapshots_deserialize_without_account_id() {
         let snapshot: ProviderSnapshot = serde_json::from_str(
-            r#"{"provider":"grok","source":"grok-cli-billing","fetched_at_unix":1,"windows":[]}"#,
+            r#"{"provider":"codex","source":"codex-app-server","fetched_at_unix":1,"windows":[]}"#,
         )
         .unwrap();
         assert_eq!(snapshot.account_id, None);
@@ -1340,17 +1162,15 @@ mod tests {
     #[test]
     fn provider_aliases_are_explicit() {
         assert_eq!("claude-code".parse::<Provider>().unwrap(), Provider::Claude);
-        assert_eq!("antigravity".parse::<Provider>().unwrap(), Provider::Agy);
-        assert!("opencode".parse::<Provider>().is_err());
-        assert!("OpenCode".parse::<Provider>().is_err());
-        assert!("pi".parse::<Provider>().is_err());
+        assert_eq!("codex".parse::<Provider>().unwrap(), Provider::Codex);
+        assert!("not-a-real-agent".parse::<Provider>().is_err());
     }
 
     /// `source` names the file a snapshot lives in, so a constructor that
     /// overrides it makes the cache and the snapshot disagree about identity.
     #[test]
     fn every_snapshot_reports_the_source_of_its_own_cache_file() {
-        for provider in Provider::ALL.into_iter().chain(Provider::SCOPED) {
+        for provider in Provider::ALL {
             assert_eq!(
                 ProviderSnapshot::new(provider, vec![], 0).source,
                 provider.source(),
@@ -1360,57 +1180,19 @@ mod tests {
     }
 
     #[test]
-    fn opencode_go_cache_identity_cannot_borrow_original_four_files() {
-        let target = BillingTarget::opencode_go();
-        assert_eq!(target.cache_identity(), "opencode-go.opencode-store");
-        assert_eq!(target.credential_scope, CredentialScope::OPENCODE_STORE);
-        assert!(target.original_provider().is_none());
-        for provider in Provider::ALL {
-            let original = BillingTarget::original_four(provider);
-            assert_eq!(original.cache_identity(), provider.source());
-            assert_eq!(original.credential_scope, CredentialScope::CANONICAL);
-            assert_ne!(target.cache_identity(), original.cache_identity());
-            assert!(!target.cache_identity().contains(provider.source()));
-        }
-    }
-
-    #[test]
     fn harness_identity_is_not_a_quota_collector() {
+        assert_eq!(Harness::from_agent_name("Claude"), Some(Harness::Claude));
         assert_eq!(
-            Harness::from_agent_name("OpenCode"),
-            Some(Harness::OpenCode)
-        );
-        assert_eq!(
-            Harness::from_agent_name("opencode"),
-            Some(Harness::OpenCode)
-        );
-        assert_eq!(Harness::billing_for_agent("opencode"), None);
-        assert_eq!(Harness::billing_for_agent("pi"), None);
-        assert_eq!(Harness::billing_for_agent("cursor"), Some(Provider::Cursor));
-        assert_eq!(
-            Harness::billing_for_agent("cursor-agent"),
-            Some(Provider::Cursor)
+            Harness::from_agent_name("claude-code"),
+            Some(Harness::Claude)
         );
         assert_eq!(
             Harness::billing_for_agent("claude-code"),
             Some(Provider::Claude)
         );
-        assert_eq!(
-            Harness::billing_for_agent("antigravity"),
-            Some(Provider::Agy)
-        );
         assert_eq!(Harness::billing_for_agent("codex"), Some(Provider::Codex));
-        assert_eq!(Harness::billing_for_agent("grok"), Some(Provider::Grok));
-        assert_eq!(Harness::billing_for_agent("devin"), Some(Provider::Devin));
-        assert_eq!(
-            Harness::billing_for_agent("devin-cli"),
-            Some(Provider::Devin)
-        );
-        assert_eq!(Harness::billing_for_agent("muse"), Some(Provider::Muse));
-        assert_eq!(
-            Harness::billing_for_agent("muse-code"),
-            Some(Provider::Muse)
-        );
+        assert_eq!(Harness::from_agent_name("not-a-real-agent"), None);
+        assert_eq!(Harness::billing_for_agent("not-a-real-agent"), None);
     }
 
     #[test]
@@ -1422,19 +1204,9 @@ mod tests {
                 "codex-app-server",
             ),
             (
-                r#"{"provider":"grok","source":"grok-cli-billing","fetched_at_unix":1,"windows":[]}"#,
-                Provider::Grok,
-                "grok-cli-billing",
-            ),
-            (
                 r#"{"provider":"claude","source":"claude-statusline","fetched_at_unix":1,"windows":[]}"#,
                 Provider::Claude,
                 "claude-statusline",
-            ),
-            (
-                r#"{"provider":"agy","source":"agy-statusline","fetched_at_unix":1,"windows":[]}"#,
-                Provider::Agy,
-                "agy-statusline",
             ),
         ];
         for (json, provider, source) in cases {
@@ -1629,35 +1401,9 @@ mod tests {
     }
 
     #[test]
-    fn devin_new_session_without_model_switch_uses_config_default() {
-        let mut snapshot = ProviderSnapshot::new(Provider::Devin, vec![], 0)
-            .with_model(Some("SWE-1.7 Medium".to_string()));
-        // A brand-new Devin session has a Herdr session id but no /model entry.
-        assert_eq!(
-            snapshot.model_for_session(Some("session-a")),
-            Some("SWE-1.7 Medium")
-        );
-        assert_eq!(
-            snapshot.model_for_session(Some("session-b")),
-            Some("SWE-1.7 Medium")
-        );
-        snapshot
-            .session_models
-            .insert("session-a".to_string(), "Opus 4.6".to_string());
-        assert_eq!(
-            snapshot.model_for_session(Some("session-a")),
-            Some("Opus 4.6")
-        );
-        assert_eq!(
-            snapshot.model_for_session(Some("session-b")),
-            Some("SWE-1.7 Medium")
-        );
-    }
-
-    #[test]
     fn account_level_windows_are_shared_when_no_session_has_reported() {
         let snapshot = ProviderSnapshot::new(
-            Provider::Grok,
+            Provider::Codex,
             vec![quota_window(WindowKind::Weekly, 31.0, 10_000)],
             1,
         );
@@ -1718,199 +1464,6 @@ mod tests {
                 .unwrap()
                 .used_percent,
             90.0
-        );
-    }
-
-    #[test]
-    fn agy_subagent_id_uses_the_only_observed_statusline_conversation() {
-        // Live failure: statusLine keys the parent conversation while Herdr's
-        // PreInvocation hook can report a spawned DeepCoderWorkerL0 id. With
-        // one observed Agy conversation the attribution is unambiguous.
-        let mut snapshot = ProviderSnapshot::new(
-            Provider::Agy,
-            vec![quota_window(WindowKind::FiveHour, 0.14411, 10_000)],
-            1,
-        )
-        .session_local()
-        .with_model(Some("Gemini 3.8 Flash (High)".to_string()));
-        snapshot.session_windows.insert(
-            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
-            snapshot.windows.clone(),
-        );
-        snapshot.session_models.insert(
-            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
-            "Gemini 3.8 Flash (High)".to_string(),
-        );
-        snapshot.context = Some(ContextUsage::new(3.427886962890625).unwrap());
-        snapshot.session_contexts.insert(
-            "ed02b39b-7ea3-46c9-9855-1672f4ef7e91".to_string(),
-            ContextUsage::new(3.427886962890625).unwrap(),
-        );
-
-        let herdr_id = "6a4d6f77-88be-4704-adcc-a51401ad7c03";
-        assert_eq!(
-            snapshot
-                .windows_for_session(Some(herdr_id))
-                .first()
-                .unwrap()
-                .used_percent,
-            0.14411
-        );
-        assert_eq!(
-            snapshot.model_for_session(Some(herdr_id)),
-            Some("Gemini 3.8 Flash (High)")
-        );
-        assert_eq!(
-            snapshot
-                .context_for_session(Some(herdr_id))
-                .map(|context| context.used_percent),
-            Some(3.427886962890625)
-        );
-    }
-
-    #[test]
-    fn agy_unknown_subagent_does_not_borrow_when_two_conversations_exist() {
-        let mut snapshot = ProviderSnapshot::new(
-            Provider::Agy,
-            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
-            1,
-        )
-        .session_local()
-        .with_model(Some("Claude Sonnet".to_string()))
-        .with_context(Some(ContextUsage::new(70.0).unwrap()));
-        snapshot.session_windows.insert(
-            "parent-gemini".to_string(),
-            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
-        );
-        snapshot.session_windows.insert(
-            "parent-claude".to_string(),
-            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
-        );
-        snapshot
-            .session_models
-            .insert("parent-gemini".to_string(), "Gemini Flash".to_string());
-        snapshot
-            .session_models
-            .insert("parent-claude".to_string(), "Claude Sonnet".to_string());
-        snapshot.session_contexts.insert(
-            "parent-gemini".to_string(),
-            ContextUsage::new(20.0).unwrap(),
-        );
-        snapshot.session_contexts.insert(
-            "parent-claude".to_string(),
-            ContextUsage::new(70.0).unwrap(),
-        );
-
-        assert_eq!(
-            snapshot
-                .windows_for_session(Some("parent-gemini"))
-                .first()
-                .unwrap()
-                .used_percent,
-            10.0
-        );
-        assert_eq!(
-            snapshot.model_for_session(Some("parent-gemini")),
-            Some("Gemini Flash")
-        );
-        assert_eq!(
-            snapshot
-                .context_for_session(Some("parent-gemini"))
-                .map(|context| context.used_percent),
-            Some(20.0)
-        );
-
-        assert!(snapshot
-            .windows_for_session(Some("unknown-subagent"))
-            .is_empty());
-        assert_eq!(snapshot.model_for_session(Some("unknown-subagent")), None);
-        assert!(snapshot
-            .context_for_session(Some("unknown-subagent"))
-            .is_none());
-    }
-
-    #[test]
-    fn agy_windows_hit_does_not_borrow_another_panes_model_or_context() {
-        let mut snapshot = ProviderSnapshot::new(
-            Provider::Agy,
-            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
-            1,
-        )
-        .session_local()
-        .with_model(Some("Claude Sonnet".to_string()))
-        .with_context(Some(ContextUsage::new(70.0).unwrap()));
-        snapshot.session_windows.insert(
-            "w1:p1".to_string(),
-            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
-        );
-        snapshot.session_windows.insert(
-            "w1:p2".to_string(),
-            vec![quota_window(WindowKind::FiveHour, 80.0, 10_000)],
-        );
-        snapshot
-            .session_models
-            .insert("w1:p2".to_string(), "Claude Sonnet".to_string());
-        snapshot
-            .session_contexts
-            .insert("w1:p2".to_string(), ContextUsage::new(70.0).unwrap());
-
-        assert_eq!(
-            snapshot
-                .windows_for_session(Some("w1:p1"))
-                .first()
-                .unwrap()
-                .used_percent,
-            10.0
-        );
-        assert_eq!(snapshot.model_for_session(Some("w1:p1")), None);
-        assert!(snapshot.context_for_session(Some("w1:p1")).is_none());
-
-        assert_eq!(
-            snapshot.model_for_session(Some("w1:p2")),
-            Some("Claude Sonnet")
-        );
-        assert_eq!(
-            snapshot
-                .context_for_session(Some("w1:p2"))
-                .map(|context| context.used_percent),
-            Some(70.0)
-        );
-    }
-
-    #[test]
-    fn agy_single_observation_may_use_latest_model_when_session_maps_miss() {
-        let mut snapshot = ProviderSnapshot::new(
-            Provider::Agy,
-            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
-            1,
-        )
-        .session_local()
-        .with_model(Some("Gemini Flash".to_string()))
-        .with_context(Some(ContextUsage::new(20.0).unwrap()));
-        snapshot.session_windows.insert(
-            "w1:p7".to_string(),
-            vec![quota_window(WindowKind::FiveHour, 10.0, 10_000)],
-        );
-
-        assert_eq!(
-            snapshot.model_for_session(Some("w1:p7")),
-            Some("Gemini Flash")
-        );
-        assert_eq!(
-            snapshot
-                .context_for_session(Some("w1:p7"))
-                .map(|context| context.used_percent),
-            Some(20.0)
-        );
-        assert_eq!(
-            snapshot.model_for_session(Some("unknown-subagent")),
-            Some("Gemini Flash")
-        );
-        assert_eq!(
-            snapshot
-                .context_for_session(Some("unknown-subagent"))
-                .map(|context| context.used_percent),
-            Some(20.0)
         );
     }
 
@@ -2090,11 +1643,6 @@ mod tests {
             .session_models
             .insert("sess-a".to_string(), "claude-opus-5".to_string());
         assert_eq!(keyed.model_for_session(Some("sess-a")), Some("claude-opus-5"));
-        // Agy keeps its documented latest-observation rule for session-less panes.
-        let agy = ProviderSnapshot::new(Provider::Agy, vec![], 900)
-            .session_local()
-            .with_model(Some("gemini".to_string()));
-        assert_eq!(agy.model_for_session(None), Some("gemini"));
     }
 
 }

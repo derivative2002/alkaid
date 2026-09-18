@@ -1,8 +1,5 @@
-pub mod agy;
 pub mod claude;
-pub mod cursor;
 pub mod font;
-pub mod grok;
 pub mod herdr;
 mod integration;
 mod statusline;
@@ -52,17 +49,8 @@ pub fn run(
         if full {
             cache.stop_turn_watchers()?;
         }
-        if agents.contains(&Harness::Grok) {
-            grok::uninstall()?;
-        }
-        if agents.contains(&Harness::Agy) {
-            agy::uninstall()?;
-        }
         if agents.contains(&Harness::Claude) {
             claude::uninstall()?;
-        }
-        if agents.contains(&Harness::Cursor) {
-            cursor::uninstall()?;
         }
         // The rows on disk were written from these settings, so uninstall
         // needs them to recognise its own work and restore the backup.
@@ -89,7 +77,6 @@ pub fn run(
             }
         }
     } else if apply {
-        integration::ensure_omp(agents, full)?;
         let cache = CacheStore::from_env()?;
         cache.clear_turn_watcher_stop()?;
         let interval = options
@@ -149,15 +136,6 @@ pub fn run(
         if agents.contains(&Harness::Claude) {
             claude::apply_with_refresh_interval(interval)?;
         }
-        if agents.contains(&Harness::Agy) {
-            agy::apply()?;
-        }
-        if agents.contains(&Harness::Grok) {
-            grok::apply()?;
-        }
-        if agents.contains(&Harness::Cursor) {
-            cursor::apply()?;
-        }
         integration::report_missing(agents);
     } else {
         let cache = CacheStore::from_env().ok();
@@ -174,15 +152,6 @@ pub fn run(
         println!("Low quota alert: {alert}.");
         if agents.contains(&Harness::Claude) {
             claude::check()?;
-        }
-        if agents.contains(&Harness::Agy) {
-            agy::check()?;
-        }
-        if agents.contains(&Harness::Grok) {
-            grok::check()?;
-        }
-        if agents.contains(&Harness::Cursor) {
-            cursor::check()?;
         }
         integration::report_missing(agents);
     }
@@ -283,13 +252,8 @@ mod tests {
     #[test]
     fn only_the_complete_selection_may_touch_shared_state() {
         assert!(is_full(&AgentSelection::SUPPORTED));
-        assert!(!is_full(&[Harness::Grok]));
-        assert!(!is_full(&[
-            Harness::Claude,
-            Harness::Codex,
-            Harness::Grok,
-            Harness::Agy
-        ]));
+        assert!(!is_full(&[Harness::Claude]));
+        assert!(!is_full(&[Harness::Codex]));
         assert!(!is_full(&[]));
     }
 }

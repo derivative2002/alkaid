@@ -290,9 +290,7 @@ impl Adapter {
             .and_then(|value| value.get("command"))
             .and_then(Value::as_str)
             .is_some_and(|command| {
-                command.contains(self.subcommand)
-                    && (command.contains("herdr-agent-quota")
-                        || command.contains("agy-statusline.sh"))
+                command.contains(self.subcommand) && command.contains("herdr-agent-quota")
             })
     }
 

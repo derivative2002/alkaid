@@ -12,8 +12,8 @@
 #   ./install.sh --agent-order default
 #   ./install.sh --low-quota-alert 10
 #
-# --agent installs only the agents you name (all, claude, codex, grok, agy,
-# opencode, pi, omp, devin, muse, cursor). Anything you leave out gets no sidebar row, no
+# --agent installs only the agents you name (all, claude, codex). Anything you
+# leave out gets no sidebar row, no
 # statusLine entry and no hook file. The default is every supported agent.
 #
 # --sidebar-layout gauges (default) draws a meter beside each quota number.

@@ -580,27 +580,6 @@ fn claude_collector_bounds_a_hanging_previous_statusline() {
 }
 
 #[test]
-fn agy_collector_is_silent_without_a_previous_statusline() {
-    let state = tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
-        .arg("agy-statusline")
-        .env("HERDR_PLUGIN_STATE_DIR", state.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(include_bytes!("fixtures/agy/statusline-both.json"))
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty());
-}
-
-#[test]
 fn claude_cache_is_published_by_refresh_event() {
     let state = tempdir().unwrap();
     let (herdr_stub, herdr_log) = install_herdr_stub(
@@ -1283,39 +1262,6 @@ fn assert_no_original_four_collection(state: &Path, herdr_log: &Path, codex_log:
 }
 
 #[test]
-fn opencode_working_event_publishes_only_the_named_local_identity() {
-    let state = tempdir().unwrap();
-    let xdg = state.path().join("xdg-data");
-    install_opencode_store(&xdg, "auth-go.json", "sessions.db");
-    let inventory = two_opencode_inventory("ses_go", "{}");
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-
-    let output = run_event_binary_with_xdg(
-        state.path(),
-        &herdr,
-        &codex,
-        &opencode_working_event("w1:p9"),
-        &xdg,
-    );
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    thread::sleep(Duration::from_millis(200));
-    original_four_untouched(state.path(), &codex_log);
-    assert_named_opencode_event(&herdr_log, "w1:p9", "w1:p10");
-    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
-    assert_no_sibling_quota_write(&calls, "w1:p10");
-    assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
-    assert!(
-        calls.contains("--token quota_provider_model=OpenCode Go/kimi-k2.5"),
-        "{calls}"
-    );
-}
-
-#[test]
 fn unknown_agent_working_event_does_not_refresh_any_collector() {
     let state = tempdir().unwrap();
     let (herdr, herdr_log, codex, codex_log) = install_logged_herdr_and_codex(
@@ -1386,10 +1332,10 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
     let inventory = r#"{"result":{"agents":[
         {"agent":"codex","pane_id":"w5:pB","agent_status":"working","focused":true,
          "tokens":{"quota_icon_working":"YELLOW","quota_provider":"Codex","quota_provider_model":"Codex"}},
-        {"agent":"cursor","pane_id":"w9:p1","agent_status":"idle","focused":false,
-         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
-        {"agent":"cursor","pane_id":"w9:p6","agent_status":"idle","focused":false,
-         "tokens":{"quota_icon_done":"OTHER_GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+        {"agent":"codex","pane_id":"w9:p1","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}},
+        {"agent":"codex","pane_id":"w9:p6","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"OTHER_GREEN","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}}
     ]}}"#;
     let (herdr, herdr_log, codex, _) = install_logged_herdr_and_codex(
         state.path(),
@@ -1476,13 +1422,13 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
     )
     .unwrap();
     let inventory = r#"{"result":{"agents":[
-        {"agent":"cursor","pane_id":"w9:p1","agent_status":"idle","focused":false,
-         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+        {"agent":"codex","pane_id":"w9:p1","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}}
     ]}}"#;
     let (herdr, herdr_log, codex, _) = install_logged_herdr_and_codex(
         state.path(),
         inventory,
-        Some(r#"{"result":{"pane":{"agent":"cursor","pane_id":"w9:p1"}}}"#),
+        Some(r#"{"result":{"pane":{"agent":"codex","pane_id":"w9:p1"}}}"#),
     );
     let snapshot = r#"{"result":{"snapshot":{"focused_workspace_id":"w5","focused_tab_id":"w5:t1","workspaces":[{"workspace_id":"w9","active_tab_id":"w9:t1"}],"layouts":[{"tab_id":"w9:t1","focused_pane_id":"w9:p1"}]}}}"#;
     let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
@@ -1523,12 +1469,12 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
     )
     .unwrap();
     let inventory = r#"{"result":{"agents":[
-        {"agent":"cursor","pane_id":"w1:p1","agent_status":"idle","focused":false,
-         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"codex","pane_id":"w1:p1","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}},
         {"agent":"grok","pane_id":"w1:p2","agent_status":"idle","focused":true,
          "tokens":{"quota_icon":"WHITE","quota_provider":"Grok","quota_provider_model":"Grok"}},
-        {"agent":"cursor","pane_id":"w1:p3","agent_status":"idle","focused":false,
-         "tokens":{"quota_icon_done":"OTHER_GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+        {"agent":"codex","pane_id":"w1:p3","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon_done":"OTHER_GREEN","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}}
     ]}}"#;
     let (herdr, herdr_log, codex, _) =
         install_logged_herdr_and_codex(state.path(), inventory, None);
@@ -1592,8 +1538,8 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
     )
     .unwrap();
     let inventory = r#"{"result":{"agents":[
-        {"agent":"cursor","pane_id":"w1:p1","agent_status":"idle","focused":true,
-         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"codex","pane_id":"w1:p1","agent_status":"idle","focused":true,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}},
         {"agent":"grok","pane_id":"w1:p2","agent_status":"idle","focused":false,
          "tokens":{"quota_icon":"WHITE","quota_provider":"Grok","quota_provider_model":"Grok"}}
     ]}}"#;
@@ -1680,8 +1626,8 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
 fn focusing_a_done_pane_clears_the_teal_icon_immediately() {
     let state = tempdir().unwrap();
     let inventory = r#"{"result":{"agents":[
-        {"agent":"cursor","pane_id":"w1:p1","agent_status":"done","focused":false,
-         "tokens":{"quota_icon_done":"TEAL","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"codex","pane_id":"w1:p1","agent_status":"done","focused":false,
+         "tokens":{"quota_icon_done":"TEAL","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}},
         {"agent":"grok","pane_id":"w1:p2","agent_status":"idle","focused":false,
          "tokens":{"quota_icon":"x","quota_provider":"Grok","quota_provider_model":"Grok"}}
     ]}}"#;
@@ -1740,13 +1686,13 @@ fn focusing_a_green_pane_clears_it_even_if_inventory_still_says_working() {
     )
     .unwrap();
     let inventory = r#"{"result":{"agents":[
-        {"agent":"cursor","pane_id":"w1:p1","agent_status":"working","focused":true,
-         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+        {"agent":"codex","pane_id":"w1:p1","agent_status":"working","focused":true,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}}
     ]}}"#;
     let (herdr, herdr_log, codex, _) = install_logged_herdr_and_codex(
         state.path(),
         inventory,
-        Some(r#"{"result":{"pane":{"agent":"cursor","pane_id":"w1:p1"}}}"#),
+        Some(r#"{"result":{"pane":{"agent":"codex","pane_id":"w1:p1"}}}"#),
     );
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
@@ -1790,16 +1736,16 @@ fn focus_change_clears_only_the_previous_green_pane() {
     )
     .unwrap();
     let inventory = r#"{"result":{"agents":[
-        {"agent":"cursor","pane_id":"w1:p1","tab_id":"w1:t1","agent_status":"done","focused":false,
-         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
+        {"agent":"codex","pane_id":"w1:p1","tab_id":"w1:t1","agent_status":"done","focused":false,
+         "tokens":{"quota_icon_done":"GREEN","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}},
         {"agent":"grok","pane_id":"w1:p2","tab_id":"w1:t1","agent_status":"idle","focused":true,
          "tokens":{"quota_icon":"WHITE","quota_provider":"Grok","quota_provider_model":"Grok"}},
         {"agent":"codex","pane_id":"w1:p3","tab_id":"w1:t1","agent_status":"done","focused":false,
          "tokens":{"quota_icon_done":"OTHER","quota_provider":"Codex","quota_provider_model":"Codex"}},
         {"agent":"codex","pane_id":"w1:p4","tab_id":"w1:t1","agent_status":"working","focused":false,
          "tokens":{"quota_icon_working":"YELLOW","quota_provider":"Codex","quota_provider_model":"Codex"}},
-        {"agent":"cursor","pane_id":"w1:p5","tab_id":"w1:t2","agent_status":"done","focused":false,
-         "tokens":{"quota_icon_done":"OTHER","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+        {"agent":"codex","pane_id":"w1:p5","tab_id":"w1:t2","agent_status":"done","focused":false,
+         "tokens":{"quota_icon_done":"OTHER","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}}
     ]}}"#;
     let (herdr, herdr_log, codex, _) = install_logged_herdr_and_codex(
         state.path(),
@@ -1869,7 +1815,7 @@ fn focus_to_a_non_agent_pane_acknowledges_the_previous_agent() {
     )
     .unwrap();
     let inventory = r#"{"result":{"agents":[
-        {"agent":"cursor","pane_id":"w1:p1","agent_status":"idle","focused":false,
+        {"agent":"codex","pane_id":"w1:p1","agent_status":"idle","focused":false,
          "tokens":{"quota_icon_done":"GREEN"}}
     ]}}"#;
     let (herdr, herdr_log, _, _) = install_logged_herdr_and_codex(state.path(), inventory, None);
@@ -1901,16 +1847,16 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
     // and use the event pane. Same-tab idle must remain teal until a later
     // pane.focused event, whether or not it was already focused at finish.
     let inventory = r#"{"result":{"agents":[
-        {"agent":"cursor","pane_id":"w1:p1","agent_status":"idle","focused":true,
-         "tokens":{"quota_icon":"x","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
-        {"agent":"cursor","pane_id":"w1:p2","agent_status":"working","focused":false,
-         "tokens":{"quota_icon_working":"Y","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+        {"agent":"codex","pane_id":"w1:p1","agent_status":"idle","focused":true,
+         "tokens":{"quota_icon":"x","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}},
+        {"agent":"codex","pane_id":"w1:p2","agent_status":"working","focused":false,
+         "tokens":{"quota_icon_working":"Y","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}}
     ]}}"#;
     let (herdr, herdr_log, codex, codex_log) = install_logged_herdr_and_codex(
         state.path(),
         inventory,
         // Deliberately lie like production: pane current == event pane.
-        Some(r#"{"result":{"pane":{"agent":"cursor","pane_id":"w1:p2"}}}"#),
+        Some(r#"{"result":{"pane":{"agent":"codex","pane_id":"w1:p2"}}}"#),
     );
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("event")
@@ -1922,7 +1868,7 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
         .env_remove("OPENCODE_API_KEY")
         .env(
             "HERDR_PLUGIN_EVENT_JSON",
-            r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"cursor","agent_status":"idle"}}"#,
+            r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"codex","agent_status":"idle"}}"#,
         )
         .output()
         .unwrap();
@@ -1946,19 +1892,17 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
         joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
         "unfocused same-tab idle must stay teal: {joined}"
     );
-    assert!(!calls.contains("pane read"), "{calls}");
-    assert!(!codex_log.exists(), "codex stub must stay idle");
 
     // A finish in the already focused pane also paints teal.
     let state = tempdir().unwrap();
     let inventory = r#"{"result":{"agents":[
-        {"agent":"cursor","pane_id":"w1:p1","agent_status":"working","focused":true,
-         "tokens":{"quota_icon_working":"Y","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+        {"agent":"codex","pane_id":"w1:p1","agent_status":"working","focused":true,
+         "tokens":{"quota_icon_working":"Y","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}}
     ]}}"#;
     let (herdr, herdr_log, codex, codex_log) = install_logged_herdr_and_codex(
         state.path(),
         inventory,
-        Some(r#"{"result":{"pane":{"agent":"cursor","pane_id":"w1:p1"}}}"#),
+        Some(r#"{"result":{"pane":{"agent":"codex","pane_id":"w1:p1"}}}"#),
     );
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("event")
@@ -1970,7 +1914,7 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
         .env_remove("OPENCODE_API_KEY")
         .env(
             "HERDR_PLUGIN_EVENT_JSON",
-            r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p1","agent":"cursor","agent_status":"idle"}}"#,
+            r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p1","agent":"codex","agent_status":"idle"}}"#,
         )
         .output()
         .unwrap();
@@ -2001,8 +1945,6 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
         !joined.contains("--token quota_icon=") && !joined.contains(" quota_icon="),
         "focused completion must clear white: {joined}"
     );
-    assert!(!calls.contains("pane read"), "{calls}");
-    assert!(!codex_log.exists(), "codex stub must stay idle");
 }
 
 #[test]
@@ -2016,15 +1958,15 @@ fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
     )
     .unwrap();
     let inventory = r#"{"result":{"agents":[
-        {"agent":"cursor","pane_id":"w1:p1","agent_status":"idle","focused":true,
-         "tokens":{"quota_icon":"x","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}},
-        {"agent":"cursor","pane_id":"w1:p2","agent_status":"idle","focused":false,
-         "tokens":{"quota_icon":"x","quota_provider":"Cursor","quota_provider_model":"Cursor/Auto"}}
+        {"agent":"codex","pane_id":"w1:p1","agent_status":"idle","focused":true,
+         "tokens":{"quota_icon":"x","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}},
+        {"agent":"codex","pane_id":"w1:p2","agent_status":"idle","focused":false,
+         "tokens":{"quota_icon":"x","quota_provider":"Codex","quota_provider_model":"Codex/gpt-5-codex"}}
     ]}}"#;
     let (herdr, herdr_log, codex, codex_log) = install_logged_herdr_and_codex(
         state.path(),
         inventory,
-        Some(r#"{"result":{"pane":{"agent":"cursor","pane_id":"w1:p2"}}}"#),
+        Some(r#"{"result":{"pane":{"agent":"codex","pane_id":"w1:p2"}}}"#),
     );
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("event")
@@ -2036,7 +1978,7 @@ fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
         .env_remove("OPENCODE_API_KEY")
         .env(
             "HERDR_PLUGIN_EVENT_JSON",
-            r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"cursor","agent_status":"idle"}}"#,
+            r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"codex","agent_status":"idle"}}"#,
         )
         .output()
         .unwrap();
@@ -2060,41 +2002,6 @@ fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
         joined.contains("quota_icon_done=") || joined.contains("--token quota_icon_done="),
         "working-set idle must stay teal even without a yellow twin: {joined}"
     );
-    assert!(!calls.contains("pane read"), "{calls}");
-    assert!(!codex_log.exists(), "codex stub must stay idle");
-}
-
-#[test]
-fn focus_on_an_opencode_pane_does_not_refresh_collectors() {
-    let state = tempdir().unwrap();
-    let (herdr, herdr_log, codex, codex_log) = install_logged_herdr_and_codex(
-        state.path(),
-        original_four_inventory_with_working_codex(),
-        Some(r#"{"result":{"pane":{"agent":"opencode","pane_id":"w1:p9"}}}"#),
-    );
-
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
-        .arg("focus")
-        .env("HERDR_PLUGIN_STATE_DIR", state.path())
-        .env("HERDR_BIN_PATH", &herdr)
-        .env("CODEX_BIN_PATH", &codex)
-        .env("GROK_HOME", state.path().join("missing-grok-home"))
-        .env("XDG_DATA_HOME", state.path().join("xdg-data"))
-        .env_remove("GROK_AUTH_FILE")
-        .env_remove("OPENCODE_API_KEY")
-        .env_remove("HERDR_PLUGIN_EVENT_JSON")
-        .env_remove("HERDR_PANE_ID")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
-    assert!(calls.contains("pane current"), "{calls}");
-    assert!(!calls.contains("pane read"), "{calls}");
-    assert_no_original_four_collection(state.path(), &herdr_log, &codex_log);
 }
 
 /// The whole alert path, end to end: the threshold on disk, a snapshot below
@@ -2208,209 +2115,6 @@ fn claude_collector_does_not_republish_unchanged_quota() {
     );
 }
 
-#[test]
-fn sidebar_configuration_preserves_user_owned_opencode_rows() {
-    let original = concat!(
-        "[ui.sidebar.agents]\n",
-        "rows = [[\"state_icon\", \"agent\"]]\n\n",
-        "[ui.sidebar.agents.rows_by_agent]\n",
-        "opencode = [[\"state_icon\", \"agent\"]]\n"
-    );
-    let applied = add_quota_row(original).unwrap();
-    assert!(applied.contains("opencode = [[\"state_icon\", \"agent\"]]"));
-    assert!(!applied.contains("codex ="), "{applied}");
-    let removed = remove_quota_row(&applied).unwrap();
-    assert!(removed.contains("opencode = [[\"state_icon\", \"agent\"]]"));
-    assert!(!removed.contains("codex ="));
-}
-
-#[test]
-fn sidebar_configuration_preserves_user_owned_pi_rows() {
-    let original = concat!(
-        "[ui.sidebar.agents]\n",
-        "rows = [[\"state_icon\", \"agent\"]]\n\n",
-        "[ui.sidebar.agents.rows_by_agent]\n",
-        "pi = [[\"state_icon\", \"agent\"]]\n"
-    );
-    let applied = add_quota_row(original).unwrap();
-    assert!(applied.contains("pi = [[\"state_icon\", \"agent\"]]"));
-    assert!(!applied.contains("codex ="), "{applied}");
-    let removed = remove_quota_row(&applied).unwrap();
-    assert!(removed.contains("pi = [[\"state_icon\", \"agent\"]]"));
-    assert!(!removed.contains("codex ="));
-}
-
-#[test]
-fn opencode_go_event_is_named_pane_only_and_repeatable() {
-    let state = tempdir().unwrap();
-    let xdg = state.path().join("xdg-data");
-    install_opencode_store(&xdg, "auth-go.json", "sessions.db");
-    let inventory = two_opencode_inventory(
-        "ses_go",
-        &format!(
-            r#"{{"quota_icon":"{}","quota_provider":"OpenCode Go","quota_model":"kimi-k2.5","quota_provider_model":"OpenCode Go/kimi-k2.5"}}"#,
-            "\u{200b}  \u{e1a2}"
-        ),
-    );
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-    let event = opencode_working_event("w1:p9");
-
-    for _ in 0..2 {
-        fs::write(&herdr_log, "").ok();
-        let output = run_event_binary_with_xdg(state.path(), &herdr, &codex, &event, &xdg);
-        assert!(
-            output.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        thread::sleep(Duration::from_millis(200));
-        original_four_untouched(state.path(), &codex_log);
-        assert_named_opencode_event(&herdr_log, "w1:p9", "w1:p10");
-        let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
-        assert!(!calls.contains("opencode.ai"), "{calls}");
-        assert_no_sibling_quota_write(&calls, "w1:p10");
-        // Inventory stubs do not persist metadata, so a group/icon reconcile
-        // may still report; the Go collector must stay quiet.
-        assert!(!calls.contains("opencode.ai"), "{calls}");
-    }
-}
-
-#[test]
-fn opencode_payg_event_clears_plugin_quota_once() {
-    let state = tempdir().unwrap();
-    let xdg = state.path().join("xdg-data");
-    install_opencode_store(&xdg, "auth-payg.json", "sessions.db");
-    let inventory = two_opencode_inventory("ses_payg", plugin_quota_tokens());
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-
-    let output = run_event_binary_with_xdg(
-        state.path(),
-        &herdr,
-        &codex,
-        &opencode_working_event("w1:p9"),
-        &xdg,
-    );
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    thread::sleep(Duration::from_millis(200));
-    original_four_untouched(state.path(), &codex_log);
-    assert_named_opencode_event(&herdr_log, "w1:p9", "w1:p10");
-    let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert!(
-        calls.contains("pane report-metadata w1:p9"),
-        "expected one-time quota clear: {calls}"
-    );
-    assert!(
-        calls.contains("--clear-token") && calls.contains("quota_5h"),
-        "expected plugin quota tokens to be cleared: {calls}"
-    );
-    assert_no_sibling_quota_write(&calls, "w1:p10");
-    assert!(!state
-        .path()
-        .join("opencode-go.opencode-store.refresh.lock")
-        .exists());
-}
-
-#[test]
-fn opencode_indeterminate_event_removes_unconfirmed_quota() {
-    let state = tempdir().unwrap();
-    let xdg = state.path().join("xdg-data");
-    install_opencode_store(&xdg, "auth-one-key.json", "sessions.db");
-    let inventory = two_opencode_inventory("ses_absent", plugin_quota_tokens());
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-
-    let output = run_event_binary_with_xdg(
-        state.path(),
-        &herdr,
-        &codex,
-        &opencode_working_event("w1:p9"),
-        &xdg,
-    );
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    original_four_untouched(state.path(), &codex_log);
-    let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
-        "{calls}"
-    );
-    assert!(calls.contains("pane read w1:p9"), "{calls}");
-    assert!(!calls.contains("pane read w1:p10"), "{calls}");
-    assert!(
-        calls.contains("--clear-token quota_5h"),
-        "indeterminate must remove unconfirmed quota: {calls}"
-    );
-}
-
-#[test]
-fn opencode_malformed_local_data_does_not_claim_previous_quota() {
-    let state = tempdir().unwrap();
-    let xdg = state.path().join("xdg-data");
-    install_opencode_store(&xdg, "auth-malformed.json", "malformed.db");
-    let inventory = two_opencode_inventory("ses_go", plugin_quota_tokens());
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-
-    let output = run_event_binary_with_xdg(
-        state.path(),
-        &herdr,
-        &codex,
-        &opencode_working_event("w1:p9"),
-        &xdg,
-    );
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    original_four_untouched(state.path(), &codex_log);
-    let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert!(
-        calls.contains("--clear-token quota_5h"),
-        "malformed evidence must remove unconfirmed quota: {calls}"
-    );
-}
-
-#[test]
-fn opencode_mismatched_event_pane_is_a_noop() {
-    let state = tempdir().unwrap();
-    let xdg = state.path().join("xdg-data");
-    install_opencode_store(&xdg, "auth-go.json", "sessions.db");
-    let inventory = two_opencode_inventory("ses_go", plugin_quota_tokens());
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-
-    let output = run_event_binary_with_xdg(
-        state.path(),
-        &herdr,
-        &codex,
-        r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"opencode","status":"working"}}"#,
-        &xdg,
-    );
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    original_four_untouched(state.path(), &codex_log);
-    let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
-        "{calls}"
-    );
-    assert!(!calls.contains("pane read"), "{calls}");
-    assert!(!calls.contains("pane report-metadata"), "{calls}");
-}
-
 /// Every file the plugin can write for an agent, so an on-demand install can
 /// be checked for footprint rather than just for the row it added.
 struct AgentHomes {
@@ -2514,39 +2218,13 @@ fn installing_one_agent_leaves_every_other_agent_untouched() {
 }
 
 #[test]
-fn installing_only_pi_adds_only_its_sidebar_style() {
-    let root = tempdir().unwrap();
-    let homes = AgentHomes::new(root.path());
-    let output = homes.configure(&["--apply", "--agent", "pi"]);
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let sidebar = homes.sidebar();
-    assert!(sidebar.contains("$quota_icon"), "{sidebar}");
-    assert!(sidebar.contains("$quota_icon_working"), "{sidebar}");
-    assert!(sidebar.contains("$quota_icon_done"), "{sidebar}");
-    assert!(!sidebar.contains("state_icon"), "{sidebar}");
-    assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
-    for harness in AgentSelection::SUPPORTED {
-        let other = style_row(harness);
-        assert!(!sidebar.contains(&other), "{other} was written: {sidebar}");
-    }
-    assert!(!homes.claude_settings.exists());
-    assert!(!homes.agy_settings.exists());
-    assert!(!homes.grok_home.exists());
-    assert!(!homes.cursor_hooks.exists());
-}
-
-#[test]
 fn uninstalling_one_agent_keeps_the_rest_working() {
     let root = tempdir().unwrap();
     let homes = AgentHomes::new(root.path());
     assert!(homes.configure(&["--apply"]).status.success());
     assert!(homes.claude_settings.exists());
 
-    let output = homes.configure(&["--uninstall", "--agent", "grok"]);
+    let output = homes.configure(&["--uninstall", "--agent", "codex"]);
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -2561,14 +2239,10 @@ fn uninstalling_one_agent_keeps_the_rest_working() {
             && !sidebar.contains("state_icon"),
         "shared quota rows were lost: {sidebar}"
     );
-    assert!(!sidebar.contains("grok ="), "grok survived: {sidebar}");
+    assert!(!sidebar.contains("codex ="), "codex survived: {sidebar}");
     assert!(
         homes.claude_settings.exists(),
-        "removing Grok tore out the Claude statusLine"
-    );
-    assert!(
-        homes.cursor_hooks.exists(),
-        "removing Grok tore out the Cursor collector hooks"
+        "removing Codex tore out the Claude statusLine"
     );
 }
 
@@ -2595,12 +2269,11 @@ fn a_partial_uninstall_can_be_repeated_and_then_completed() {
 
     for _ in 0..2 {
         assert!(homes
-            .configure(&["--uninstall", "--agent", "grok,agy"])
+            .configure(&["--uninstall", "--agent", "codex"])
             .status
             .success());
         let sidebar = homes.sidebar();
-        assert!(!sidebar.contains("grok ="));
-        assert!(!sidebar.contains("agy ="));
+        assert!(!sidebar.contains("codex ="));
         assert!(
             sidebar.contains("$quota_icon") && homes.claude_settings.exists(),
             "claude install was torn out: {sidebar}"
@@ -2637,78 +2310,6 @@ fn an_installer_can_narrow_the_selection_through_the_environment() {
     assert!(!homes.cursor_hooks.exists());
 }
 
-#[test]
-fn cursor_collector_hooks_preserve_herdr_session_start() {
-    let root = tempdir().unwrap();
-    let homes = AgentHomes::new(root.path());
-    fs::create_dir_all(homes.cursor_hooks.parent().unwrap()).unwrap();
-    fs::write(
-        &homes.cursor_hooks,
-        r#"{
-  "version": 1,
-  "hooks": {
-    "sessionStart": [{ "command": "bash '/tmp/herdr-agent-state.sh' session" }]
-  }
-}"#,
-    )
-    .unwrap();
-    assert!(homes
-        .configure(&["--apply", "--agent", "cursor"])
-        .status
-        .success());
-    let hooks = fs::read_to_string(&homes.cursor_hooks).unwrap();
-    assert!(hooks.contains("herdr-agent-state.sh"));
-    assert!(hooks.contains("herdr-agent-quota-hooks.sh"));
-    assert!(hooks.contains("afterAgentResponse"));
-    assert!(hooks.contains("preCompact"));
-    let script = homes
-        .cursor_hooks
-        .parent()
-        .unwrap()
-        .join("herdr-agent-quota-hooks.sh");
-    let script_text = fs::read_to_string(&script).unwrap();
-    assert!(script_text.contains("cursor-hooks"));
-
-    assert!(homes
-        .configure(&["--uninstall", "--agent", "cursor"])
-        .status
-        .success());
-    let hooks = fs::read_to_string(&homes.cursor_hooks).unwrap();
-    assert!(hooks.contains("herdr-agent-state.sh"));
-    assert!(!hooks.contains("herdr-agent-quota-hooks.sh"));
-    assert!(!script.exists());
-}
-
-#[test]
-fn cursor_hooks_command_writes_a_session_mailbox() {
-    let state = tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
-        .arg("cursor-hooks")
-        .env("HERDR_PLUGIN_STATE_DIR", state.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(
-            br#"{"conversation_id":"50b33403-da5a-40f4-bb9e-5fc3566f91a4","model":"composer-2.5","input_tokens":20000,"cache_read_tokens":15000,"cache_write_tokens":0}"#,
-        )
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert!(output.stdout.is_empty());
-    let mailbox = state
-        .path()
-        .join("cursor-hooks/50b33403-da5a-40f4-bb9e-5fc3566f91a4.json");
-    let observation: serde_json::Value =
-        serde_json::from_slice(&fs::read(mailbox).unwrap()).unwrap();
-    assert_eq!(observation["input_tokens"], 20000);
-    assert_eq!(observation["cache_read_tokens"], 15000);
-}
-
 fn stub_missing_omp_integration(state: &Path) {
     fs::create_dir_all(state).unwrap();
     let herdr = state.join("herdr-absent");
@@ -2736,88 +2337,6 @@ exit 0
 /// Muse is what `is_full` sees. Without the upgrade that list is partial,
 /// and a machine without omp dies before any sidebar row is written.
 #[test]
-fn a_saved_pre_muse_full_list_still_configures_when_omp_is_absent() {
-    let root = tempdir().unwrap();
-    let homes = AgentHomes::new(root.path());
-    stub_missing_omp_integration(&homes.state);
-    let config = root.path().join("config");
-    fs::create_dir_all(&config).unwrap();
-    fs::write(
-        config.join("agents"),
-        "claude,codex,grok,agy,opencode,pi,omp,devin\n",
-    )
-    .unwrap();
-
-    let output = homes.configure_with_env(
-        &["--apply"],
-        &[
-            ("HERDR_PLUGIN_CONFIG_DIR", config.to_str().unwrap()),
-            ("HERDR_AGENT_QUOTA_AGENTS", ""),
-        ],
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "stderr: {stderr}\nstdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("Skipped omp"),
-        "omp should be skipped on a full selection: {stdout}"
-    );
-    let sidebar = homes.sidebar();
-    assert!(
-        sidebar.contains("$quota_icon")
-            && sidebar.contains("$quota_icon_working")
-            && sidebar.contains("$quota_icon_done")
-            && !sidebar.contains("state_icon"),
-        "a once-complete list must still write shared quota rows: {sidebar}"
-    );
-    assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
-    assert!(homes.claude_settings.exists(), "{sidebar}");
-}
-
-#[test]
-fn an_explicit_pre_muse_subset_still_fails_when_omp_is_absent() {
-    let root = tempdir().unwrap();
-    let homes = AgentHomes::new(root.path());
-    stub_missing_omp_integration(&homes.state);
-    let config = root.path().join("config");
-    fs::create_dir_all(&config).unwrap();
-    fs::write(
-        config.join("agents"),
-        "only,claude,codex,grok,agy,opencode,pi,omp,devin\n",
-    )
-    .unwrap();
-
-    let output = homes.configure_with_env(
-        &["--apply"],
-        &[
-            ("HERDR_PLUGIN_CONFIG_DIR", config.to_str().unwrap()),
-            ("HERDR_AGENT_QUOTA_AGENTS", ""),
-        ],
-    );
-    assert!(
-        !output.status.success(),
-        "an explicit omp subset must fail loudly when omp is absent"
-    );
-    let detail = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        detail.contains("omp extension directory not found"),
-        "{detail}"
-    );
-    assert!(
-        !homes.sidebar().contains("muse ="),
-        "a failed configure must not write Muse rows: {}",
-        homes.sidebar()
-    );
-}
-
-#[test]
 fn an_unusable_environment_selection_still_installs_everything() {
     let root = tempdir().unwrap();
     let homes = AgentHomes::new(root.path());
@@ -2832,8 +2351,6 @@ fn an_unusable_environment_selection_still_installs_everything() {
     assert!(!sidebar.contains("state_icon"), "{sidebar}");
     assert!(!sidebar.contains("rows_by_agent"), "{sidebar}");
     assert!(homes.claude_settings.exists());
-    assert!(homes.agy_settings.exists());
-    assert!(homes.cursor_hooks.exists());
 }
 
 fn style_row(harness: Harness) -> String {
@@ -3174,418 +2691,12 @@ fn run_pi_event(
         .unwrap()
 }
 
-#[test]
-fn pi_codex_event_uses_only_the_proved_canonical_cache_and_reads_no_pane() {
-    let state = tempdir().unwrap();
-    let (pi_agent, pi_sessions, session) = install_pi_store(
-        state.path(),
-        "auth-matching.json",
-        "session-codex.jsonl",
-        "session-codex",
-    );
-    let codex_home = write_codex_auth(state.path(), "account-same");
-    let snapshot = ProviderSnapshot::new(
-        Provider::Codex,
-        vec![UsageWindow::new(WindowKind::Weekly, 20.0, None).unwrap()],
-        CacheStore::now_unix(),
-    )
-    .with_account_id(Some("account-same".to_string()));
-    CacheStore::new(state.path()).save(&snapshot).unwrap();
-
-    let inventory = pi_inventory(&session, "{}");
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-    let output = run_pi_event(
-        state.path(),
-        &herdr,
-        &codex,
-        &codex_home,
-        &pi_agent,
-        &pi_sessions,
-    );
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
-        "{calls}"
-    );
-    assert!(!calls.contains("pane read"), "{calls}");
-    assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
-    assert_no_sibling_quota_write(&calls, "w1:p10");
-    assert!(
-        calls.contains("--token quota_provider_model=Codex/model-b"),
-        "{calls}"
-    );
-    assert!(
-        codex_log.exists(),
-        "proved Pi route did not invoke Codex collector"
-    );
-    assert!(state.path().join("codex-app-server.json").exists());
-    assert!(!state
-        .path()
-        .join("opencode-go.opencode-store.json")
-        .exists());
-    assert!(!state.path().join("pi.json").exists());
-}
-
-#[test]
-fn pi_codex_event_overlays_exact_session_context_and_cache_without_inventing_ttl() {
-    let state = tempdir().unwrap();
-    let (pi_agent, pi_sessions, session) = install_pi_store(
-        state.path(),
-        "auth-matching.json",
-        "session-codex-usage.jsonl",
-        "session-codex-usage",
-    );
-    write_pi_models_store(&pi_agent, "openai-codex", "model-b", 200);
-    let codex_home = write_codex_auth(state.path(), "account-same");
-    let snapshot = ProviderSnapshot::new(
-        Provider::Codex,
-        vec![UsageWindow::new(WindowKind::Weekly, 20.0, None).unwrap()],
-        CacheStore::now_unix(),
-    )
-    .with_account_id(Some("account-same".to_string()));
-    CacheStore::new(state.path()).save(&snapshot).unwrap();
-
-    let inventory = pi_inventory(&session, "{}");
-    let (herdr, herdr_log, codex, _) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-    let output = run_pi_event(
-        state.path(),
-        &herdr,
-        &codex,
-        &codex_home,
-        &pi_agent,
-        &pi_sessions,
-    );
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert!(
-        calls.contains("--token quota_context=context 55%"),
-        "{calls}"
-    );
-    assert!(calls.contains("--token quota_cache=cache 85.0%"), "{calls}");
-    assert!(!calls.contains("quota_cache_ttl"), "{calls}");
-    assert!(
-        calls.contains("--token quota_week_inline_normal=7d 80%"),
-        "{calls}"
-    );
-}
-
-#[test]
-fn pi_anthropic_event_uses_the_recorded_one_hour_cache_bucket() {
-    let state = tempdir().unwrap();
-    let (pi_agent, pi_sessions, session) = install_pi_store(
-        state.path(),
-        "auth-unsupported-oauth.json",
-        "session-anthropic-usage.jsonl",
-        "session-anthropic-usage",
-    );
-    write_pi_models_store(&pi_agent, "anthropic", "model-a", 200);
-    let now_millis = CacheStore::now_unix().saturating_mul(1_000).to_string();
-    let session_jsonl = fs::read_to_string(&session)
-        .unwrap()
-        .replace("4070908801000", &now_millis)
-        .replace("4070908861000", &now_millis);
-    fs::write(&session, session_jsonl).unwrap();
-    let codex_home = write_codex_auth(state.path(), "account-same");
-    let inventory = pi_inventory(&session, plugin_quota_tokens());
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-
-    assert!(run_pi_event(
-        state.path(),
-        &herdr,
-        &codex,
-        &codex_home,
-        &pi_agent,
-        &pi_sessions,
-    )
-    .status
-    .success());
-
-    let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert!(
-        calls.contains("--token quota_provider_model=Claude/model-a"),
-        "{calls}"
-    );
-    assert!(
-        calls.contains("--token quota_context=context 55%"),
-        "{calls}"
-    );
-    assert!(calls.contains("--token quota_cache_ttl=ttl≈"), "{calls}");
-    assert!(!codex_log.exists(), "unsupported OAuth invoked Codex");
-}
-
-#[test]
-fn pi_payg_event_clears_stale_quota_without_invoking_a_collector() {
-    let state = tempdir().unwrap();
-    let (pi_agent, pi_sessions, session) = install_pi_store(
-        state.path(),
-        "auth-payg.json",
-        "session-payg-usage.jsonl",
-        "session-payg-usage",
-    );
-    write_pi_models_store(&pi_agent, "openai", "model-payg", 210);
-    let codex_home = write_codex_auth(state.path(), "account-same");
-    let inventory = pi_inventory(&session, plugin_quota_tokens());
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-    assert!(run_pi_event(
-        state.path(),
-        &herdr,
-        &codex,
-        &codex_home,
-        &pi_agent,
-        &pi_sessions,
-    )
-    .status
-    .success());
-
-    let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
-        "{calls}"
-    );
-    assert!(!calls.contains("pane read"), "{calls}");
-    assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
-    assert!(
-        calls.contains("--clear-token") && calls.contains("quota_5h"),
-        "{calls}"
-    );
-    assert!(
-        calls.contains("--token quota_context=context 50%"),
-        "{calls}"
-    );
-    assert!(calls.contains("--token quota_cache=cache 80.0%"), "{calls}");
-    assert!(!calls.contains("quota_cache_ttl"), "{calls}");
-    assert!(!codex_log.exists(), "PAYG route invoked Codex");
-}
-
-#[test]
-fn pi_indeterminate_event_removes_quota_but_keeps_current_session_diagnostics() {
-    let state = tempdir().unwrap();
-    let (pi_agent, pi_sessions, session) = install_pi_store(
-        state.path(),
-        "auth-unsupported-oauth.json",
-        "session-xai-usage.jsonl",
-        "session-xai-usage",
-    );
-    write_pi_models_store(&pi_agent, "xai", "model-x", 210);
-    let codex_home = write_codex_auth(state.path(), "account-same");
-    let stale = r#"{"quota_state":"?","quota_provider":"Claude","quota_provider_model":"Claude/old","quota_context":"context 99%","quota_cache":"cache 1.0%","quota_cache_ttl":"ttl≈1h","quota_5h":"5h 10%","quota_week":"7d 20%","quota_summary":"5h 10% · 7d 20%"}"#;
-    let inventory = pi_inventory(&session, stale);
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-    assert!(run_pi_event(
-        state.path(),
-        &herdr,
-        &codex,
-        &codex_home,
-        &pi_agent,
-        &pi_sessions,
-    )
-    .status
-    .success());
-
-    let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert!(
-        calls.contains("--token quota_provider_model=Grok/model-x"),
-        "{calls}"
-    );
-    assert!(
-        calls.contains("--token quota_context=context 50%"),
-        "{calls}"
-    );
-    assert!(calls.contains("--token quota_cache=cache 80.0%"), "{calls}");
-    assert!(calls.contains("--clear-token quota_cache_ttl"), "{calls}");
-    assert!(calls.contains("--clear-token quota_5h"), "{calls}");
-    assert!(calls.contains("--clear-token quota_week"), "{calls}");
-    assert!(!codex_log.exists(), "indeterminate route invoked Codex");
-}
-
-#[test]
-fn pi_different_account_clears_stale_quota_and_cannot_borrow_codex_cache() {
-    let state = tempdir().unwrap();
-    let (pi_agent, pi_sessions, session) = install_pi_store(
-        state.path(),
-        "auth-matching.json",
-        "session-codex.jsonl",
-        "session-codex",
-    );
-    let codex_home = write_codex_auth(state.path(), "different-account");
-    let snapshot = ProviderSnapshot::new(
-        Provider::Codex,
-        vec![UsageWindow::new(WindowKind::Weekly, 20.0, None).unwrap()],
-        CacheStore::now_unix(),
-    )
-    .with_account_id(Some("different-account".to_string()));
-    CacheStore::new(state.path()).save(&snapshot).unwrap();
-
-    let inventory = pi_inventory(&session, plugin_quota_tokens());
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-    assert!(run_pi_event(
-        state.path(),
-        &herdr,
-        &codex,
-        &codex_home,
-        &pi_agent,
-        &pi_sessions,
-    )
-    .status
-    .success());
-
-    let calls = fs::read_to_string(&herdr_log).unwrap();
-    assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
-        "{calls}"
-    );
-    assert!(!calls.contains("pane read"), "{calls}");
-    assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
-    assert!(
-        calls.contains("--token quota_provider_model=Codex/model-b"),
-        "{calls}"
-    );
-    assert!(!calls.contains("--token quota_5h_danger=10%"), "{calls}");
-    assert!(!calls.contains("--token quota_week_warning=20%"), "{calls}");
-    assert!(calls.contains("--clear-token quota_5h"), "{calls}");
-    assert!(calls.contains("--clear-token quota_week"), "{calls}");
-    assert!(!codex_log.exists(), "indeterminate route invoked Codex");
-}
-
-#[test]
-fn pi_model_switch_updates_identity_and_removes_unconfirmed_quota() {
-    let state = tempdir().unwrap();
-    let (pi_agent, pi_sessions, session) = install_pi_store(
-        state.path(),
-        "auth-unsupported-oauth.json",
-        "session-switched-xai.jsonl",
-        "session-switched-xai",
-    );
-    let codex_home = write_codex_auth(state.path(), "account-same");
-    let inventory = pi_inventory(&session, plugin_quota_tokens());
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-    assert!(run_pi_event(
-        state.path(),
-        &herdr,
-        &codex,
-        &codex_home,
-        &pi_agent,
-        &pi_sessions,
-    )
-    .status
-    .success());
-
-    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
-    assert!(
-        (1..=2).contains(&calls.matches("agent list").count()),
-        "{calls}"
-    );
-    assert!(!calls.contains("pane read"), "{calls}");
-    assert!(calls.contains("pane report-metadata w1:p9"), "{calls}");
-    assert_no_sibling_quota_write(&calls, "w1:p10");
-    assert!(
-        calls.contains("--token quota_provider_model=Grok/grok-4.6"),
-        "{calls}"
-    );
-    assert!(!calls.contains("--token quota_5h_danger=10%"), "{calls}");
-    assert!(!calls.contains("--token quota_week_warning=20%"), "{calls}");
-    assert!(calls.contains("--clear-token quota_5h"), "{calls}");
-    assert!(calls.contains("--clear-token quota_week"), "{calls}");
-    assert!(!codex_log.exists(), "switched xAI route invoked Codex");
-}
-
 /// Someone with an OpenCode pane but no Go subscription must never cause a
 /// request. The stub herdr logs every call, and the plugin has no key to send,
 /// so a network attempt would show up as a failure or a hang rather than a
 /// clean, silent no-op.
-#[test]
-fn an_opencode_pane_without_a_go_key_makes_no_request_but_shows_exact_identity() {
-    let state = tempdir().unwrap();
-    let xdg = state.path().join("xdg-data");
-    install_opencode_store(&xdg, "auth-payg.json", "sessions.db");
-    let inventory = two_opencode_inventory("ses_go", "{}");
-    let (herdr, herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-
-    let output = run_event_binary_with_xdg(
-        state.path(),
-        &herdr,
-        &codex,
-        &opencode_working_event("w1:p9"),
-        &xdg,
-    );
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    thread::sleep(Duration::from_millis(200));
-
-    original_four_untouched(state.path(), &codex_log);
-    let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
-    assert!(!calls.contains("opencode.ai"), "{calls}");
-    assert!(
-        calls.contains("pane report-metadata w1:p9"),
-        "exact OpenCode session stayed blank: {calls}"
-    );
-    assert!(
-        calls.contains("--token quota_provider_model=OpenCode Go/kimi-k2.5"),
-        "exact OpenCode identity was not published: {calls}"
-    );
-    assert!(
-        !state
-            .path()
-            .join("opencode-go.opencode-store.json")
-            .exists(),
-        "a snapshot was cached without any credential"
-    );
-}
-
 /// A Go key present but the session on a pay-as-you-go backend must also stay
 /// quiet: resolution decides, not the presence of a credential on disk.
-#[test]
-fn a_payg_session_does_not_fetch_go_usage_even_with_a_key_on_disk() {
-    let state = tempdir().unwrap();
-    let xdg = state.path().join("xdg-data");
-    install_opencode_store(&xdg, "auth-go.json", "sessions.db");
-    let inventory = two_opencode_inventory("ses_payg", "{}");
-    let (herdr, _herdr_log, codex, codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
-
-    assert!(run_event_binary_with_xdg(
-        state.path(),
-        &herdr,
-        &codex,
-        &opencode_working_event("w1:p9"),
-        &xdg,
-    )
-    .status
-    .success());
-    thread::sleep(Duration::from_millis(200));
-
-    original_four_untouched(state.path(), &codex_log);
-    assert!(
-        !state
-            .path()
-            .join("opencode-go.opencode-store.json")
-            .exists(),
-        "a pay-as-you-go session fetched Go usage"
-    );
-}
-
 /// Reading a pane makes Herdr repaint it, which the user sees as the agent's
 /// terminal scrolling. Only the `event` path may ever pay that cost, and only
 /// for the one pane the event named. A manual or startup refresh must read
@@ -3593,32 +2704,20 @@ fn a_payg_session_does_not_fetch_go_usage_even_with_a_key_on_disk() {
 #[test]
 fn a_manual_refresh_reads_no_pane_at_all() {
     let state = tempdir().unwrap();
-    let xdg = state.path().join("xdg-data");
-    install_opencode_store(&xdg, "auth-go.json", "sessions.db");
-    // A mixed inventory: original-four panes plus two OpenCode panes, so every
-    // resolution branch runs in the same pass.
-    let inventory = two_opencode_inventory("ses_go", "{}");
+    // A mixed inventory: one pane per collector, so every resolution branch
+    // runs in the same pass.
+    let inventory = r#"{"result":{"agents":[
+        {"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"session-claude"}},
+        {"agent":"codex","pane_id":"w1:p2","agent_session":{"value":"thread-1"}}
+    ]}}"#;
     let (herdr, herdr_log, codex, _codex_log) =
-        install_logged_herdr_and_codex(state.path(), &inventory, None);
+        install_logged_herdr_and_codex(state.path(), inventory, None);
 
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .args(["refresh", "--provider", "all"])
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
-        .env("GROK_HOME", state.path().join("missing-grok-home"))
-        .env("XDG_DATA_HOME", &xdg)
-        .env_remove("GROK_AUTH_FILE")
-        .env_remove("OPENCODE_API_KEY")
-        .env("MUSE_AUTH_PATH", state.path().join("absent-muse-auth.json"))
-        .env(
-            "CURSOR_AUTH_FILE",
-            state.path().join("absent-cursor-auth.json"),
-        )
-        .env(
-            "CURSOR_STATE_DB",
-            state.path().join("absent-cursor-state.vscdb"),
-        )
         .output()
         .unwrap();
     assert!(

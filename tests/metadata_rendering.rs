@@ -5,7 +5,7 @@ use herdr_agent_quota::model::{Provider, ProviderSnapshot, ResetAt, UsageWindow,
 #[test]
 fn agent_row_renders_compact_reset_eta_without_absolute_timestamp() {
     let snapshot = ProviderSnapshot::new(
-        Provider::Grok,
+        Provider::Codex,
         vec![UsageWindow::new(
             WindowKind::Weekly,
             79.0,
@@ -15,8 +15,8 @@ fn agent_row_renders_compact_reset_eta_without_absolute_timestamp() {
         1,
     );
     assert_eq!(
-        render_provider(Provider::Grok, Some(&snapshot), 0, PercentStyle::Remaining),
-        "Grok WARN\r\n  7d 21% left reset 2d3h"
+        render_provider(Provider::Codex, Some(&snapshot), 0, PercentStyle::Remaining),
+        "Codex WARN\r\n  7d 21% left reset 2d3h"
     );
 }
 
@@ -25,7 +25,7 @@ fn agent_row_renders_compact_reset_eta_without_absolute_timestamp() {
 #[test]
 fn the_used_style_reports_consumed_quota_without_changing_the_severity_band() {
     let snapshot = ProviderSnapshot::new(
-        Provider::Grok,
+        Provider::Codex,
         vec![UsageWindow::new(
             WindowKind::Weekly,
             79.0,
@@ -35,7 +35,7 @@ fn the_used_style_reports_consumed_quota_without_changing_the_severity_band() {
         1,
     );
     assert_eq!(
-        render_provider(Provider::Grok, Some(&snapshot), 0, PercentStyle::Used),
-        "Grok WARN\r\n  7d 79% used reset 2d3h"
+        render_provider(Provider::Codex, Some(&snapshot), 0, PercentStyle::Used),
+        "Codex WARN\r\n  7d 79% used reset 2d3h"
     );
 }

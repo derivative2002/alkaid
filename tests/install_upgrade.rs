@@ -10,7 +10,7 @@ fn normal_upgrade_preserves_preferences_and_runs_recovery_in_the_server_environm
     for path in [&bin, &config, &plugin] {
         fs::create_dir_all(path).unwrap();
     }
-    fs::write(config.join("agents"), "codex,omp\n").unwrap();
+    fs::write(config.join("agents"), "codex,claude\n").unwrap();
     fs::write(config.join("sidebar-layout"), "stacked\n").unwrap();
     fs::write(config.join("watch-interval-seconds"), "300\n").unwrap();
     let log = dir.path().join("calls");
@@ -71,7 +71,7 @@ esac
     );
     assert_eq!(
         fs::read_to_string(config.join("agents")).unwrap(),
-        "codex,omp\n"
+        "codex,claude\n"
     );
     assert_eq!(
         fs::read_to_string(config.join("sidebar-layout")).unwrap(),
@@ -129,7 +129,7 @@ esac
     }
     let output = Command::new("bash")
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"))
-        .args(["--agent", "claude,codex,grok,agy,opencode,pi,omp,devin"])
+        .args(["--agent", "claude"])
         .env(
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -147,6 +147,6 @@ esac
     );
     assert_eq!(
         fs::read_to_string(config.join("agents")).unwrap(),
-        "only,claude,codex,grok,agy,opencode,pi,omp,devin\n"
+        "only,claude\n"
     );
 }

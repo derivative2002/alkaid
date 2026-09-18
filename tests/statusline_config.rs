@@ -1,38 +1,8 @@
-use herdr_agent_quota::configure::{agy, claude};
+use herdr_agent_quota::configure::claude;
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
-
-#[test]
-fn agy_setup_is_idempotent_and_restores_the_previous_statusline() {
-    let directory = tempdir().unwrap();
-    let settings = directory.path().join("settings.json");
-    let state = directory.path().join("state");
-    let executable = directory.path().join("herdr-agent-quota");
-    fs::write(
-        &settings,
-        r#"{"theme":"dark","statusLine":{"type":"command","command":"echo old","refreshInterval":5}}"#,
-    )
-    .unwrap();
-
-    agy::apply_at(&settings, &state, &executable).unwrap();
-    let once = fs::read(&settings).unwrap();
-    agy::apply_at(&settings, &state, &executable).unwrap();
-    assert_eq!(fs::read(&settings).unwrap(), once);
-
-    let installed: Value = serde_json::from_slice(&once).unwrap();
-    assert_eq!(installed["theme"], "dark");
-    assert_eq!(installed["statusLine"]["refreshInterval"], 5);
-    let command = installed["statusLine"]["command"].as_str().unwrap();
-    assert!(command.contains("agy-statusline"));
-    assert!(command.contains(state.to_str().unwrap()));
-
-    agy::uninstall_at(&settings, &state).unwrap();
-    let restored: Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
-    assert_eq!(restored["statusLine"]["command"], "echo old");
-    assert_eq!(restored["statusLine"]["refreshInterval"], 5);
-}
 
 #[test]
 fn old_plugin_wrappers_are_repaired_without_becoming_the_backup() {
