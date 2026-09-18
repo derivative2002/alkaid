@@ -268,7 +268,6 @@ fn non_semantic_text_inherits_the_active_herdr_theme() {
         "$quota_topic",
         "$quota_cache",
         "$quota_cache_ttl",
-        "$quota_context",
         "$quota_5h_unknown",
         "$quota_week_unknown",
         "$quota_week_inline_unknown",
@@ -290,40 +289,25 @@ fn non_semantic_text_inherits_the_active_herdr_theme() {
 }
 
 #[test]
-fn context_is_the_penultimate_row_and_model_shares_provider_style() {
+fn context_precedes_the_window_rows_and_identity_keeps_tab_and_agent() {
     let applied =
         add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
     let document = applied.parse::<toml_edit::DocumentMut>().unwrap();
     let agents = &document["ui"]["sidebar"]["agents"];
     let rows = agents["rows"].as_array().unwrap();
-    let context_index = rows
-        .iter()
-        .position(|row| {
-            row.as_array().is_some_and(|items| {
-                items.iter().any(|item| {
-                    item.as_inline_table()
-                        .and_then(|table| table.get("token"))
-                        .and_then(toml_edit::Value::as_str)
-                        .is_some_and(|token| token == "$quota_context")
-                })
-            })
-        })
-        .unwrap();
-    let limit_index = rows
-        .iter()
-        .position(|row| {
-            row.as_array().is_some_and(|items| {
-                items.iter().any(|item| {
-                    item.as_inline_table()
-                        .and_then(|table| table.get("token"))
-                        .and_then(toml_edit::Value::as_str)
-                        .is_some_and(|token| token == "$quota_5h_normal")
-                })
-            })
-        })
-        .unwrap();
-    assert_eq!(context_index + 1, limit_index);
-    assert_eq!(limit_index + 1, rows.len());
+    let index_of = |token: &str| {
+        rows.iter()
+            .position(|row| row_contains_token(row, token))
+            .unwrap_or_else(|| panic!("missing {token}:\n{applied}"))
+    };
+    let context = index_of("$quota_context_normal");
+    let five = index_of("$quota_5h_normal");
+    let week = index_of("$quota_week_normal");
+    let month = index_of("$quota_month_normal");
+    assert_eq!(context + 1, five, "context precedes 5h");
+    assert_eq!(five + 1, week, "5h precedes 7d");
+    assert_eq!(week + 1, month, "7d precedes 30d");
+    assert_eq!(month + 1, rows.len(), "30d is the last quota row");
 
     let identity = rows
         .iter()
@@ -335,24 +319,29 @@ fn context_is_the_penultimate_row_and_model_shares_provider_style() {
         .any(|item| item.as_str() == Some("state_icon")));
     assert!(identity
         .iter()
+        .any(|item| configured_token(item) == Some("tab")));
+    assert!(identity
+        .iter()
         .any(|item| configured_token(item) == Some("$quota_icon_working")));
     assert!(identity
         .iter()
         .any(|item| configured_token(item) == Some("$quota_icon_done")));
+    assert!(
+        rows.iter().any(agent_only_row),
+        "the native agent row is kept:\n{applied}"
+    );
     for token in ["$quota_icon", "$quota_provider_model"] {
-        let fg = identity
-            .iter()
-            .find(|item| configured_token(item) == Some(token))
-            .and_then(toml_edit::Value::as_inline_table)
-            .and_then(|table| table.get("fg"))
-            .and_then(toml_edit::Value::as_str);
-        assert_eq!(fg, Some("#e9e9f0"), "{token}");
+        assert_eq!(
+            token_fg(&applied, token).as_deref(),
+            Some("#e9e9f0"),
+            "{token}"
+        );
     }
     assert!(agents.get("rows_by_agent").is_none(), "{applied}");
 }
 
 #[test]
-fn provider_model_is_compact_and_every_provider_can_fold_week_without_five_hour() {
+fn provider_model_is_its_own_row_and_week_inline_folds_onto_the_limits_row() {
     let applied =
         add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
     let document = applied.parse::<toml_edit::DocumentMut>().unwrap();
@@ -363,22 +352,8 @@ fn provider_model_is_compact_and_every_provider_can_fold_week_without_five_hour(
         .find(|row| row_contains_token(row, "$quota_provider_model"))
         .unwrap();
     let identity_tokens = identity_row.as_array().unwrap();
-    assert_eq!(
-        configured_token(identity_tokens.get(0).unwrap()),
-        Some("$quota_icon")
-    );
-    assert!(
-        identity_tokens
-            .iter()
-            .any(|item| configured_token(item) == Some("$quota_icon")),
-        "identity row must carry the vendor mark: {identity_row}"
-    );
-    assert!(identity_tokens
-        .iter()
-        .any(|item| configured_token(item) == Some("$quota_icon_working")));
-    assert!(identity_tokens
-        .iter()
-        .any(|item| configured_token(item) == Some("$quota_icon_done")));
+    // Provider/model now stands alone rather than sharing the brand-icon row.
+    assert_eq!(identity_tokens.len(), 1, "{identity_row}");
     assert!(!identity_tokens.iter().any(|item| {
         matches!(
             configured_token(item),
@@ -386,33 +361,47 @@ fn provider_model_is_compact_and_every_provider_can_fold_week_without_five_hour(
         ) || item.as_str() == Some("state_icon")
     }));
 
-    // Week fold lives on the shared packed rows — there are no per-agent copies.
-    assert!(agents.get("rows_by_agent").is_none(), "{applied}");
-    let context_row = rows
+    // Herdr's `tab` rides the brand-icon row.
+    let icon_row = rows
         .iter()
-        .find(|row| row_contains_token(row, "$quota_context"))
-        .unwrap()
-        .as_array()
+        .find(|row| row_contains_token(row, "$quota_icon"))
+        .and_then(toml_edit::Value::as_array)
+        .unwrap();
+    assert!(icon_row
+        .iter()
+        .any(|item| configured_token(item) == Some("tab")));
+    assert!(icon_row
+        .iter()
+        .any(|item| configured_token(item) == Some("$quota_icon_working")));
+    assert!(icon_row
+        .iter()
+        .any(|item| configured_token(item) == Some("$quota_icon_done")));
+
+    // Week fold lives on the shared 7d rows — there are no per-agent copies.
+    assert!(agents.get("rows_by_agent").is_none(), "{applied}");
+    let week_row = rows
+        .iter()
+        .find(|row| row_contains_token(row, "$quota_week_normal"))
+        .and_then(toml_edit::Value::as_array)
         .unwrap();
     assert!(
-        context_row
+        week_row
             .iter()
             .any(|item| configured_token(item) == Some("$quota_week_inline_normal")),
-        "shared rows should fold 7d onto context when 5h is empty"
+        "shared rows should fold 7d onto the 7d limits row"
     );
     assert!(
-        context_row
+        week_row
             .iter()
             .all(|item| configured_token(item) != Some("$quota_5h_normal")),
-        "5h must not sit on the context row"
+        "5h must not sit on the 7d row"
     );
     assert!(
-        rows.iter().any(|row| {
-            row_contains_token(row, "$quota_week_normal")
-                && row_contains_token(row, "$quota_5h_normal")
-                && !row_contains_token(row, "$quota_context")
+        !rows.iter().any(|row| {
+            row_contains_token(row, "$quota_5h_normal")
+                && row_contains_token(row, "$quota_week_normal")
         }),
-        "shared rows should keep 5h/7d on a dedicated limits row"
+        "5h and 7d each own a row now"
     );
 }
 
@@ -461,6 +450,37 @@ fn row_contains_token(row: &toml_edit::Value, token: &str) -> bool {
             .iter()
             .any(|item| configured_token(item) == Some(token))
     })
+}
+
+/// A row that carries only Herdr's native `agent` token.
+fn agent_only_row(row: &toml_edit::Value) -> bool {
+    row.as_array().is_some_and(|items| {
+        items.len() == 1
+            && items
+                .iter()
+                .next()
+                .is_some_and(|item| configured_token(item) == Some("agent"))
+    })
+}
+
+/// The `fg` a named token carries in `ui.sidebar.agents.rows`, if any.
+fn token_fg(sidebar: &str, token: &str) -> Option<String> {
+    let document = sidebar.parse::<toml_edit::DocumentMut>().unwrap();
+    for row in document["ui"]["sidebar"]["agents"]["rows"].as_array()? {
+        let Some(items) = row.as_array() else {
+            continue;
+        };
+        for item in items {
+            if configured_token(item) == Some(token) {
+                return item
+                    .as_inline_table()
+                    .and_then(|table| table.get("fg"))
+                    .and_then(toml_edit::Value::as_str)
+                    .map(str::to_string);
+            }
+        }
+    }
+    None
 }
 
 #[test]
@@ -3035,75 +3055,25 @@ fn a_full_uninstall_of_a_gauges_install_restores_the_original_config() {
     assert!(fs::read_dir(&font_dir).unwrap().next().is_none());
 }
 
+/// Every layout now publishes the same rows in the same order, so a layout can
+/// only be told apart by its severity hues: `gauges` writes the muted set,
+/// `packed` and `stacked` the saturated one. `packed` and `stacked` are
+/// therefore indistinguishable in the config and share one predicate.
 fn sidebar_is_gauges(sidebar: &str) -> bool {
-    // Default fields omit cache/TTL; gauges is identified by severity-split
-    // context tokens and windows that do not share a packed row.
-    !quota_tokens_share_a_row(sidebar, "$quota_context", "$quota_week_inline_normal")
-        && !quota_tokens_share_a_row(sidebar, "$quota_5h_normal", "$quota_week_normal")
-        && !tab_shares_row_with_provider_model(sidebar)
-        && sidebar_has_token(sidebar, "$quota_provider_model")
-        && !sidebar_has_token(sidebar, "$quota_provider")
-        && !sidebar_has_token(sidebar, "$quota_model")
-        && sidebar.contains("$quota_context_normal")
-        && sidebar.contains("$quota_week_normal")
+    sidebar.contains("\"#98b17d\"")
+        && sidebar.contains("\"#dec27f\"")
+        && sidebar.contains("\"#df919b\"")
 }
 
 fn sidebar_is_packed(sidebar: &str) -> bool {
-    quota_tokens_share_a_row(sidebar, "$quota_5h_normal", "$quota_week_normal")
-        && sidebar_has_token(sidebar, "$quota_provider_model")
-        && !tab_shares_row_with_provider_model(sidebar)
-        && !sidebar.contains("$quota_context_normal")
+    sidebar.contains("\"#82d978\"")
+        && sidebar.contains("\"#e4b957\"")
+        && sidebar.contains("\"#f16f7e\"")
+        && !sidebar.contains("\"#98b17d\"")
 }
 
 fn sidebar_is_stacked(sidebar: &str) -> bool {
-    !quota_tokens_share_a_row(sidebar, "$quota_context", "$quota_week_inline_normal")
-        && !quota_tokens_share_a_row(sidebar, "$quota_5h_normal", "$quota_week_normal")
-        && !quota_tokens_share_a_row(sidebar, "$quota_provider", "$quota_model")
-        && !tab_shares_row_with_provider_model(sidebar)
-        && sidebar_has_token(sidebar, "$quota_provider")
-        && sidebar_has_token(sidebar, "$quota_model")
-        && !sidebar_has_token(sidebar, "$quota_provider_model")
-        && !sidebar.contains("$quota_context_normal")
-        && sidebar.contains("$quota_week_normal")
-}
-
-fn sidebar_has_token(sidebar: &str, token: &str) -> bool {
-    let document = sidebar.parse::<toml_edit::DocumentMut>().unwrap();
-    let Some(rows) = document["ui"]["sidebar"]["agents"]["rows"].as_array() else {
-        return false;
-    };
-    let present = rows.iter().any(|row| row_contains_token(row, token));
-    present
-}
-
-fn tab_shares_row_with_provider_model(sidebar: &str) -> bool {
-    let document = sidebar.parse::<toml_edit::DocumentMut>().unwrap();
-    let Some(rows) = document["ui"]["sidebar"]["agents"]["rows"].as_array() else {
-        return false;
-    };
-    let shares = rows.iter().any(|row| {
-        let Some(items) = row.as_array() else {
-            return false;
-        };
-        items
-            .iter()
-            .any(|item| configured_token(item) == Some("tab"))
-            && items
-                .iter()
-                .any(|item| configured_token(item) == Some("$quota_provider_model"))
-    });
-    shares
-}
-
-fn quota_tokens_share_a_row(sidebar: &str, left: &str, right: &str) -> bool {
-    let document = sidebar.parse::<toml_edit::DocumentMut>().unwrap();
-    let Some(rows) = document["ui"]["sidebar"]["agents"]["rows"].as_array() else {
-        return false;
-    };
-    let shares = rows
-        .iter()
-        .any(|row| row_contains_token(row, left) && row_contains_token(row, right));
-    shares
+    sidebar_is_packed(sidebar)
 }
 
 fn pi_fixture(name: &str) -> PathBuf {
