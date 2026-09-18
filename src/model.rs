@@ -718,6 +718,13 @@ impl ProviderSnapshot {
     /// is not permission to borrow another pane's label.
     pub fn model_for_session(&self, session_id: Option<&str>) -> Option<&str> {
         let Some(session_id) = session_id else {
+            // A session-local snapshot (Claude statusLine) holds the latest
+            // pane's observation at the provider level. A pane with no
+            // session id must not borrow it: that label belongs to whichever
+            // pane reported last. Agy keeps its documented latest-window rule.
+            if self.session_quota_only && self.provider != Provider::Agy {
+                return None;
+            }
             return self.model.as_deref();
         };
         let session_id = self.session_for_lookup(session_id)?;
@@ -742,6 +749,9 @@ impl ProviderSnapshot {
     /// every retained observation points at this same conversation.
     pub fn context_for_session(&self, session_id: Option<&str>) -> Option<&ContextUsage> {
         let Some(session_id) = session_id else {
+            if self.session_quota_only && self.provider != Provider::Agy {
+                return None;
+            }
             return self.context.as_ref();
         };
         let session_id = self.session_for_lookup(session_id)?;
@@ -2064,4 +2074,27 @@ mod tests {
         assert!(session.displayed_quota_has_expired(Some("s1"), 1_001));
         assert!(!session.displayed_quota_has_expired(Some("other"), 1_001));
     }
+
+    #[test]
+    fn session_less_pane_never_borrows_session_local_model_or_context() {
+        // F1: a Claude pane with agent_session=None used to show whichever
+        // pane's statusLine arrived last (quota_model flipped globally).
+        let snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 900)
+            .session_local()
+            .with_model(Some("claude-fable-5-1".to_string()));
+        assert_eq!(snapshot.model_for_session(None), None);
+        assert!(snapshot.context_for_session(None).is_none());
+        // A known session still resolves through the session maps.
+        let mut keyed = ProviderSnapshot::new(Provider::Claude, vec![], 900).session_local();
+        keyed
+            .session_models
+            .insert("sess-a".to_string(), "claude-opus-5".to_string());
+        assert_eq!(keyed.model_for_session(Some("sess-a")), Some("claude-opus-5"));
+        // Agy keeps its documented latest-observation rule for session-less panes.
+        let agy = ProviderSnapshot::new(Provider::Agy, vec![], 900)
+            .session_local()
+            .with_model(Some("gemini".to_string()));
+        assert_eq!(agy.model_for_session(None), Some("gemini"));
+    }
+
 }
