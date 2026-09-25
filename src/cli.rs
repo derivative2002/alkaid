@@ -111,10 +111,12 @@ pub enum Command {
         /// run a fixed command line.
         #[arg(long, value_parser = parse_row_gap)]
         row_gap: Option<SidebarRowGap>,
-        /// How Herdr's Agent panel is ordered: default (Herdr's own policy)
-        /// or quota (least quota left first). `quota` installs a Herdr agent
-        /// view owned by this plugin and replaces the user's panel sort until
-        /// it is set back to default.
+        /// How Herdr's Agent panel is ordered: default (Herdr's own policy),
+        /// quota (by Space, least quota left first), or attention (across
+        /// Spaces: blocked and unseen completions first, then working, then
+        /// idle; least quota left first in each band). `quota` and `attention`
+        /// install a Herdr agent view owned by this plugin and replace the
+        /// user's panel sort until it is set back to default.
         #[arg(long, value_enum)]
         agent_order: Option<AgentOrder>,
         /// Notify once when a provider's remaining quota falls to this
@@ -599,6 +601,13 @@ fn parse_row_gap(value: &str) -> Result<SidebarRowGap, String> {
 /// and an active one replaces the user's own `ui.agent_panel_sort` policy
 /// until it is cleared.
 ///
+/// `attention` is the flat, cross-Space variant: Herdr's own `attention`
+/// rank first (blocked, then unseen completion, then working, then idle),
+/// headroom second. Spaces are deliberately not kept contiguous — the point
+/// is to find the agent that needs the user wherever it lives — so the
+/// `$quota_group` header is not published under it and the identity row
+/// names the Space itself.
+///
 /// Default is `quota`: Space grouping is what most installs want with the
 /// `$quota_group` headers, and ranking by headroom is a free extra on top.
 /// Choose `default` to hand the panel back to Herdr's own policy (also
@@ -610,28 +619,49 @@ pub enum AgentOrder {
     /// By space, then least quota left first.
     #[default]
     Quota,
+    /// Across spaces: needs-you first, then working, then idle; least quota
+    /// left first inside each band.
+    Attention,
 }
 
 impl AgentOrder {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_AGENT_ORDER";
-    /// Herdr's label for the view, shown where it names the active sort.
-    pub const LABEL: &'static str = "Quota by space";
+    /// The order the settings pane cycles through.
+    pub const CHOICES: [Self; 3] = [Self::Default, Self::Quota, Self::Attention];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::Quota => "quota",
+            Self::Attention => "attention",
         }
     }
 
-    pub fn is_quota(self) -> bool {
-        self == Self::Quota
+    /// Herdr's label for the view, shown in the Agent panel header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            Self::Quota => "Quota by space",
+            Self::Attention => "attention",
+        }
+    }
+
+    /// Does this order install an Agent view owned by this plugin?
+    pub fn owns_view(self) -> bool {
+        self != Self::Default
+    }
+
+    /// Are a Space's panes contiguous in the panel? Only then does the
+    /// `$quota_group` header on the tightest pane read as a Space header.
+    pub fn groups_by_space(self) -> bool {
+        self != Self::Attention
     }
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "default" | "herdr" | "off" => Some(Self::Default),
             "quota" | "headroom" | "grouped" | "on" => Some(Self::Quota),
+            "attention" | "action" | "needs-you" => Some(Self::Attention),
             _ => None,
         }
     }
@@ -884,12 +914,27 @@ mod tests {
 
     #[test]
     fn an_agent_order_round_trips_through_its_stored_form() {
-        for order in [AgentOrder::Default, AgentOrder::Quota] {
+        for order in [
+            AgentOrder::Default,
+            AgentOrder::Quota,
+            AgentOrder::Attention,
+        ] {
             assert_eq!(AgentOrder::parse(order.as_str()), Some(order));
         }
         assert_eq!(AgentOrder::parse(" QUOTA "), Some(AgentOrder::Quota));
+        assert_eq!(AgentOrder::parse("Attention"), Some(AgentOrder::Attention));
         assert_eq!(AgentOrder::parse("sideways"), None);
         assert_eq!(AgentOrder::default(), AgentOrder::Quota);
+    }
+
+    #[test]
+    fn only_the_attention_order_scatters_spaces() {
+        assert!(AgentOrder::Default.groups_by_space());
+        assert!(AgentOrder::Quota.groups_by_space());
+        assert!(!AgentOrder::Attention.groups_by_space());
+        assert!(!AgentOrder::Default.owns_view());
+        assert!(AgentOrder::Quota.owns_view());
+        assert!(AgentOrder::Attention.owns_view());
     }
 
     #[test]

@@ -85,7 +85,7 @@ pub fn run(providers: &[Provider], force: bool, json: bool) -> Result<()> {
 pub fn startup(providers: &[Provider]) -> Result<()> {
     if let Ok(cache) = CacheStore::from_env() {
         let order = crate::configure::resolved_agent_order(None, Some(&cache));
-        if order.is_quota() {
+        if order.owns_view() {
             crate::configure::apply_agent_order(order);
         }
     }
@@ -1329,6 +1329,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         }
     }
 

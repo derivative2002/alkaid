@@ -223,6 +223,9 @@ pub struct AgentPane {
     /// Herdr `focused` describes the current pane, not whether a completion
     /// was acknowledged by a later focus event.
     pub focused: bool,
+    /// Herdr `state_labels`: the text its built-in `state_text` token prints
+    /// for each status. Read back so an unchanged label set is never re-sent.
+    pub state_labels: BTreeMap<String, String>,
 }
 
 impl AgentPane {
@@ -309,31 +312,43 @@ const AGENT_VIEW_SOURCE: &str = "plugin:herdr-agent-quota";
 /// sidebar sort is never worth blocking a turn for.
 const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Ask Herdr to order its Agent panel by space, then least quota left.
+/// Ask Herdr to order its Agent panel the way `order` names.
 ///
 /// Herdr keeps one Agent view and this replaces it. The default agent order
 /// is `quota`, so configure and startup both call this unless the user
 /// chose `default`. The view does not survive a server restart, which is
 /// why the startup hook re-applies it.
 ///
-/// `workspace_order` keeps each Space contiguous — the same grouping Herdr's
-/// own spaces sort uses — so quota ranking never scatters one project's
-/// agents across the panel. Inside a space, `quota_headroom` ranks tightest
-/// first.
-pub fn set_quota_agent_view() -> Result<()> {
-    socket_request(&serde_json::json!({
+/// `quota`: `workspace_order` keeps each Space contiguous — the same grouping
+/// Herdr's own spaces sort uses — so quota ranking never scatters one
+/// project's agents across the panel. Inside a space, `quota_headroom` ranks
+/// tightest first.
+///
+/// `attention`: flat on purpose. Herdr's built-in `attention` rank ascends
+/// idle < working < done < blocked (unknown below idle), so it is sorted
+/// descending; `quota_headroom` breaks ties, and a pane without that token
+/// sorts after the ones that have it. Both keys are Herdr-side values, so the
+/// order follows a status change without a metadata write.
+pub fn set_agent_view(order: crate::cli::AgentOrder) -> Result<()> {
+    socket_request(&agent_view_request(order)).map(|_| ())
+}
+
+fn agent_view_request(order: crate::cli::AgentOrder) -> Value {
+    let headroom = serde_json::json!({"field": {"token": HEADROOM_TOKEN}, "order": "asc"});
+    let first = if order.groups_by_space() {
+        serde_json::json!({"field": "workspace_order", "order": "asc"})
+    } else {
+        serde_json::json!({"field": "attention", "order": "desc"})
+    };
+    serde_json::json!({
         "id": "agent-quota:view-set",
         "method": "agent.view.set",
         "params": {
             "source": AGENT_VIEW_SOURCE,
-            "label": crate::cli::AgentOrder::LABEL,
-            "sort": [
-                {"field": "workspace_order", "order": "asc"},
-                {"field": {"token": HEADROOM_TOKEN}, "order": "asc"},
-            ],
+            "label": order.label(),
+            "sort": [first, headroom],
         },
-    }))
-    .map(|_| ())
+    })
 }
 
 /// Give the Agent panel back to Herdr's own ordering.
@@ -601,6 +616,15 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         .map(AgentStatus::parse)
                         .unwrap_or_default();
                     let focused = map.get("focused").and_then(Value::as_bool).unwrap_or(false);
+                    let state_labels: BTreeMap<String, String> = map
+                        .get("state_labels")
+                        .and_then(Value::as_object)
+                        .into_iter()
+                        .flat_map(|labels| labels.iter())
+                        .filter_map(|(status, text)| {
+                            text.as_str().map(|text| (status.clone(), text.to_string()))
+                        })
+                        .collect();
                     panes.push(AgentPane {
                         pane_id: pane_id.to_string(),
                         workspace_id,
@@ -613,6 +637,7 @@ fn collect_agent_panes(value: &Value, panes: &mut Vec<AgentPane>) {
                         tokens,
                         status,
                         focused,
+                        state_labels,
                     });
                 }
             }
@@ -737,7 +762,7 @@ pub fn publish_icon_tokens(panes: &[AgentPane], sequence: u64) -> Result<()> {
         Ok(all) if !all.is_empty() => all,
         _ => panes.to_vec(),
     };
-    let group_heads = group_head_pane_ids(&inventory, panes, &[]);
+    let group_heads = space_group_heads(installed_agent_order(), &inventory, panes, &[]);
     let mut reported = 0;
     let mut failed = Vec::new();
     for pane in panes {
@@ -777,7 +802,8 @@ fn publish_pane_tokens_inner(
         Ok(all) if !all.is_empty() => all,
         _ => panes.to_vec(),
     };
-    let group_heads = group_head_pane_ids(&inventory, panes, tokens);
+    let order = installed_agent_order();
+    let group_heads = space_group_heads(order, &inventory, panes, tokens);
     let mut reported = 0usize;
     let mut failed = Vec::new();
     for pane in panes {
@@ -798,7 +824,8 @@ fn publish_pane_tokens_inner(
         }
         fold_cache_row(&mut desired, row);
         apply_group_and_icon(&mut desired, pane, &group_heads, &workspace_labels);
-        if metadata_matches(&pane.tokens, &desired) {
+        let labels = label_change(pane, order);
+        if metadata_matches(&pane.tokens, &desired) && labels == LabelChange::Keep {
             continue;
         }
         // Herdr versions that repaint metadata can snap a terminal viewport
@@ -816,7 +843,7 @@ fn publish_pane_tokens_inner(
             continue;
         }
         reported += 1;
-        if !report_pane_metadata(&executable, pane, &desired, sequence)? {
+        if !report_pane_metadata(&executable, pane, &desired, sequence, labels)? {
             failed.push(pane.pane_id.clone());
         }
     }
@@ -882,6 +909,7 @@ fn report_pane_metadata(
     pane: &AgentPane,
     desired: &BTreeMap<String, String>,
     sequence: u64,
+    labels: LabelChange,
 ) -> Result<bool> {
     let mut command = Command::new(executable);
     command
@@ -901,8 +929,23 @@ fn report_pane_metadata(
             command.args(["--clear-token", name]);
         }
     }
+    command.args(state_label_args(labels));
     let output = command.output().context("report quota metadata to Herdr")?;
     Ok(output.status.success())
+}
+
+/// Arguments that carry a [`LabelChange`]. Labels ride on the quota report
+/// they accompany and never cost a separate write; they are not tokens, so
+/// they do not compete for Herdr's sixteen-token budget either.
+fn state_label_args(labels: LabelChange) -> Vec<String> {
+    match labels {
+        LabelChange::Keep => Vec::new(),
+        LabelChange::Clear => vec!["--clear-state-labels".to_string()],
+        LabelChange::Write => ATTENTION_STATE_LABELS
+            .into_iter()
+            .flat_map(|(status, text)| ["--state-label".to_string(), format!("{status}={text}")])
+            .collect(),
+    }
 }
 
 /// Clear or set `$quota_group` on siblings in the same Space that this pass
@@ -1144,6 +1187,84 @@ const GROUP_MEMBER_INDENT: &str = "\u{200b}  ";
 /// Always reported together so a lagging inventory cannot leave a stale
 /// colour twin on screen after working→done or done→idle.
 const ICON_TOKEN_NAMES: [&str; 3] = ["quota_icon", "quota_icon_working", "quota_icon_done"];
+
+/// What Herdr's built-in `state_text` prints under the attention order: the
+/// DESIGN-r3 head row's action state, first thing on the identity row.
+///
+/// Labels, not tokens, on purpose. Herdr resolves the label from the pane's
+/// live status when it renders, so a status change repaints the right text in
+/// Herdr's own per-status colour without any metadata write — the label set
+/// is written once per pane and read back from `agent list` afterwards. A
+/// report that names any label replaces the whole set, so all five are always
+/// sent together. `unknown` gets an explicit "not reported" rather than being
+/// left to Herdr's default, which prints `idle` for it.
+///
+/// There is no `[待拍N]`: no per-pane source for pending owner decisions
+/// exists, and a count that cannot be read is not shown.
+pub(crate) const ATTENTION_STATE_LABELS: [(&str, &str); 5] = [
+    ("blocked", "[卡住]"),
+    ("done", "[已回]"),
+    ("working", "[工作]"),
+    ("idle", "[空闲]"),
+    ("unknown", "[未报]"),
+];
+
+/// Does the pane already carry exactly the label set this plugin writes?
+fn state_labels_current(labels: &BTreeMap<String, String>) -> bool {
+    labels.len() == ATTENTION_STATE_LABELS.len()
+        && ATTENTION_STATE_LABELS
+            .into_iter()
+            .all(|(status, text)| labels.get(status).map(String::as_str) == Some(text))
+}
+
+/// The label change a publish owes this pane, if any.
+///
+/// Under the attention order the labels are wanted; otherwise only a set that
+/// is exactly ours is cleared, so labels another source wrote survive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelChange {
+    Keep,
+    Write,
+    Clear,
+}
+
+fn label_change(pane: &AgentPane, order: crate::cli::AgentOrder) -> LabelChange {
+    let ours = state_labels_current(&pane.state_labels);
+    match (order.groups_by_space(), ours) {
+        (false, false) => LabelChange::Write,
+        (true, true) => LabelChange::Clear,
+        _ => LabelChange::Keep,
+    }
+}
+
+/// The installed Agent order, read the way configure stored it.
+///
+/// Only a Herdr-launched process has a plugin state directory; anything else
+/// (a unit test, a bare CLI run) gets the default rather than whatever an
+/// unrelated installation left in the user's data directory.
+fn installed_agent_order() -> crate::cli::AgentOrder {
+    let cache = std::env::var_os("HERDR_PLUGIN_STATE_DIR").map(crate::cache::CacheStore::new);
+    crate::configure::resolved_agent_order(None, cache.as_ref())
+}
+
+/// Space-head selection, or none when the panel is not grouped by Space.
+///
+/// Under the attention order a Space's panes are scattered, so a header on
+/// its tightest pane would sit mid-list and name the wrong neighbours. An
+/// empty map makes every pane a non-head: the header token is cleared and no
+/// member indent is added.
+fn space_group_heads(
+    order: crate::cli::AgentOrder,
+    inventory: &[AgentPane],
+    publishing: &[AgentPane],
+    tokens: &[PaneTokens],
+) -> BTreeMap<String, String> {
+    if order.groups_by_space() {
+        group_head_pane_ids(inventory, publishing, tokens)
+    } else {
+        BTreeMap::new()
+    }
+}
 
 /// Vendor mark always; group header only on the Space head pane.
 ///
@@ -1611,6 +1732,202 @@ fn is_status_line(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attention_pane(pane_id: &str, headroom: &str, status: AgentStatus) -> AgentPane {
+        AgentPane {
+            pane_id: pane_id.to_string(),
+            workspace_id: pane_id.split(':').next().unwrap().to_string(),
+            harness: Harness::Claude,
+            session: None,
+            session_summary: String::new(),
+            topic: String::new(),
+            tokens: BTreeMap::from([
+                (HEADROOM_TOKEN.to_string(), headroom.to_string()),
+                ("quota_5h_normal".to_string(), "5h 60%".to_string()),
+            ]),
+            status,
+            focused: false,
+            state_labels: BTreeMap::new(),
+        }
+    }
+
+    fn our_labels() -> BTreeMap<String, String> {
+        ATTENTION_STATE_LABELS
+            .into_iter()
+            .map(|(status, text)| (status.to_string(), text.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_attention_view_is_flat_and_ranks_needs_you_first() {
+        use crate::cli::AgentOrder;
+        let request = agent_view_request(AgentOrder::Attention);
+        assert_eq!(request["method"], "agent.view.set");
+        assert_eq!(request["params"]["source"], "plugin:herdr-agent-quota");
+        assert_eq!(request["params"]["label"], "attention");
+        // Measured on Herdr 0.9.1: `attention` ascends idle < working < done
+        // < blocked, so descending puts the panes that need the user first.
+        assert_eq!(
+            request["params"]["sort"],
+            serde_json::json!([
+                {"field": "attention", "order": "desc"},
+                {"field": {"token": "quota_headroom"}, "order": "asc"},
+            ])
+        );
+        assert!(!request.to_string().contains("workspace_order"));
+    }
+
+    #[test]
+    fn the_quota_view_is_unchanged_by_the_attention_order() {
+        use crate::cli::AgentOrder;
+        let request = agent_view_request(AgentOrder::Quota);
+        assert_eq!(request["params"]["label"], "Quota by space");
+        assert_eq!(
+            request["params"]["sort"],
+            serde_json::json!([
+                {"field": "workspace_order", "order": "asc"},
+                {"field": {"token": "quota_headroom"}, "order": "asc"},
+            ])
+        );
+    }
+
+    #[test]
+    fn state_labels_are_current_only_as_the_exact_full_set() {
+        assert!(state_labels_current(&our_labels()));
+        assert!(!state_labels_current(&BTreeMap::new()));
+        let mut missing = our_labels();
+        missing.remove("unknown");
+        assert!(!state_labels_current(&missing));
+        let mut edited = our_labels();
+        edited.insert("done".to_string(), "done".to_string());
+        assert!(!state_labels_current(&edited));
+        let mut extra = our_labels();
+        extra.insert("later".to_string(), "x".to_string());
+        assert!(!state_labels_current(&extra));
+    }
+
+    #[test]
+    fn labels_are_written_once_under_attention_and_cleared_only_if_ours() {
+        use crate::cli::AgentOrder;
+        let mut pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
+        assert_eq!(
+            label_change(&pane, AgentOrder::Attention),
+            LabelChange::Write
+        );
+        assert_eq!(label_change(&pane, AgentOrder::Quota), LabelChange::Keep);
+        pane.state_labels = our_labels();
+        // Read back unchanged: no write, which is what keeps a refresh silent.
+        assert_eq!(
+            label_change(&pane, AgentOrder::Attention),
+            LabelChange::Keep
+        );
+        assert_eq!(label_change(&pane, AgentOrder::Quota), LabelChange::Clear);
+        assert_eq!(label_change(&pane, AgentOrder::Default), LabelChange::Clear);
+        pane.state_labels = BTreeMap::from([("done".to_string(), "fin".to_string())]);
+        assert_eq!(label_change(&pane, AgentOrder::Quota), LabelChange::Keep);
+    }
+
+    #[test]
+    fn a_label_write_names_all_five_statuses_because_herdr_replaces_the_set() {
+        let args = state_label_args(LabelChange::Write);
+        let pairs = args
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "--state-label");
+                pair[1].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            [
+                "blocked=[卡住]",
+                "done=[已回]",
+                "working=[工作]",
+                "idle=[空闲]",
+                "unknown=[未报]",
+            ]
+        );
+        assert_eq!(
+            state_label_args(LabelChange::Clear),
+            ["--clear-state-labels"]
+        );
+        assert!(state_label_args(LabelChange::Keep).is_empty());
+    }
+
+    #[test]
+    fn no_pending_decision_count_is_invented() {
+        // `[待拍N]` has no per-pane source; nothing may print it.
+        assert!(ATTENTION_STATE_LABELS
+            .into_iter()
+            .all(|(_, text)| !text.contains('拍')));
+    }
+
+    #[test]
+    fn the_attention_order_publishes_no_space_header_and_no_indent() {
+        use crate::cli::AgentOrder;
+        let tight = attention_pane("w1:p1", "010", AgentStatus::Done);
+        let loose = attention_pane("w1:p2", "090", AgentStatus::Working);
+        let inventory = vec![tight.clone(), loose.clone()];
+        let labels = BTreeMap::from([("w1".to_string(), "玉衡".to_string())]);
+
+        let grouped = space_group_heads(AgentOrder::Quota, &inventory, &inventory, &[]);
+        assert_eq!(grouped.get("w1").map(String::as_str), Some("w1:p1"));
+        let flat = space_group_heads(AgentOrder::Attention, &inventory, &inventory, &[]);
+        assert!(flat.is_empty());
+
+        for pane in [&tight, &loose] {
+            let mut desired = pane.tokens.clone();
+            desired.insert("quota_group".to_string(), "玉衡".to_string());
+            apply_group_and_icon(&mut desired, pane, &flat, &labels);
+            assert!(!desired.contains_key("quota_group"));
+            let icon = desired.get(pane.icon_status().icon_token()).unwrap();
+            assert!(!icon.starts_with(GROUP_MEMBER_INDENT));
+        }
+    }
+
+    #[test]
+    fn switching_order_changes_no_quota_token() {
+        // 0923 rollback lesson: a build change must not move a quota row. The
+        // order may only move the Space header and the member indent.
+        use crate::cli::AgentOrder;
+        let pane = attention_pane("w1:p2", "090", AgentStatus::Idle);
+        let other = attention_pane("w1:p1", "010", AgentStatus::Idle);
+        let inventory = vec![other, pane.clone()];
+        let labels = BTreeMap::from([("w1".to_string(), "玉衡".to_string())]);
+        let render = |order| {
+            let heads = space_group_heads(order, &inventory, &inventory, &[]);
+            let mut desired = pane.tokens.clone();
+            apply_group_and_icon(&mut desired, &pane, &heads, &labels);
+            desired
+        };
+        let grouped = render(AgentOrder::Quota);
+        let flat = render(AgentOrder::Attention);
+        for name in METADATA_TOKEN_NAMES {
+            if ICON_TOKEN_NAMES.contains(&name) || name == "quota_group" {
+                continue;
+            }
+            assert_eq!(grouped.get(name), flat.get(name), "{name} moved");
+        }
+    }
+
+    #[test]
+    fn the_inventory_reads_back_state_labels() {
+        let value = serde_json::json!({"result": {"agents": [{
+            "agent": "claude",
+            "pane_id": "w2:p1",
+            "agent_status": "blocked",
+            "state_labels": {
+                "blocked": "[卡住]", "done": "[已回]", "working": "[工作]",
+                "idle": "[空闲]", "unknown": "[未报]"
+            },
+            "tokens": {"quota_headroom": "090"}
+        }]}});
+        let mut panes = Vec::new();
+        collect_agent_panes(&value, &mut panes);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].status, AgentStatus::Blocked);
+        assert!(state_labels_current(&panes[0].state_labels));
+    }
     use crate::cli::{FieldSet, PercentStyle, SidebarLayout};
     use crate::model::{
         CacheUsage, ContextUsage, ProviderSnapshot, ResetAt, UsageWindow, WindowKind,
@@ -1664,6 +1981,7 @@ mod tests {
             ]),
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         };
         let sibling = AgentPane {
             pane_id: "w1:p2".to_string(),
@@ -1678,6 +1996,7 @@ mod tests {
             ]),
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         };
         let inventory = vec![head.clone(), sibling.clone()];
         let heads = group_head_pane_ids(&inventory, std::slice::from_ref(&sibling), &[]);
@@ -1816,6 +2135,7 @@ mod tests {
                     tokens: BTreeMap::new(),
                     status: AgentStatus::Idle,
                     focused: false,
+                    state_labels: BTreeMap::new(),
                 },
                 AgentPane {
                     pane_id: "w1:p2".to_string(),
@@ -1827,6 +2147,7 @@ mod tests {
                     tokens: BTreeMap::new(),
                     status: AgentStatus::Idle,
                     focused: false,
+                    state_labels: BTreeMap::new(),
                 },
             ]
         );
@@ -2012,6 +2333,7 @@ mod tests {
             tokens: BTreeMap::from([(String::from("quota_badge"), String::from("[A]"))]),
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         };
         let desired = BTreeMap::from([(String::from("quota_state"), String::from("?"))]);
         assert!(!metadata_matches(&pane.tokens, &desired));
@@ -2061,6 +2383,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -2110,6 +2433,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -2374,6 +2698,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS, "{names:?}");
@@ -2446,6 +2771,7 @@ mod tests {
             tokens,
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         };
         let names = metadata_report_names(&pane, &desired);
         assert!(names.len() <= MAX_METADATA_TOKENS);
@@ -2623,6 +2949,7 @@ mod tests {
             tokens,
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
         let names = metadata_report_names(&pane, &desired);
@@ -2669,6 +2996,7 @@ mod tests {
             tokens,
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
         let names = metadata_report_names(&pane, &desired);

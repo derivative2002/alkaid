@@ -157,6 +157,7 @@ impl Settings {
             Choice::Order => match self.order {
                 AgentOrder::Default => "Herdr's own policy",
                 AgentOrder::Quota => "by Space, least quota left first",
+                AgentOrder::Attention => "needs-you first across Spaces",
             },
             Choice::Alert => match self.alert.is_off() {
                 true => "no notification",
@@ -212,10 +213,13 @@ impl Settings {
                 }
             }
             Row::Choice(Choice::Order) => {
-                self.order = match self.order {
-                    AgentOrder::Default => AgentOrder::Quota,
-                    AgentOrder::Quota => AgentOrder::Default,
-                }
+                let current = AgentOrder::CHOICES
+                    .iter()
+                    .position(|value| *value == self.order)
+                    .unwrap_or(0);
+                let count = AgentOrder::CHOICES.len() as i8;
+                let next = (current as i8 + step).rem_euclid(count);
+                self.order = AgentOrder::CHOICES[next as usize];
             }
             Row::Choice(Choice::Alert) => {
                 let current = LowQuotaAlert::CHOICES

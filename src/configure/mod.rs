@@ -120,7 +120,10 @@ pub fn run(
         }
         cache.set_low_quota_alert(alert)?;
         prefs::write(prefs::LOW_QUOTA_ALERT, &alert.to_string())?;
-        herdr::apply(agents, layout, gap, fields, brand)?;
+        // Resolved before the rows: the attention order writes its own
+        // identity row, so the rows and the Agent view must agree.
+        let order = resolved_agent_order(options.agent_order, Some(&cache));
+        herdr::apply(agents, layout, gap, fields, brand, order)?;
         for note in font::install(cache.root())? {
             println!("{note}");
         }
@@ -129,7 +132,6 @@ pub fn run(
         // sends it alongside whatever agent selection the user happens to
         // have. Gating it would silently drop the setting for anyone not
         // running every supported agent.
-        let order = resolved_agent_order(options.agent_order, Some(&cache));
         cache.set_agent_order(order)?;
         prefs::write(prefs::AGENT_ORDER, order.as_str())?;
         apply_agent_order(order);
@@ -146,7 +148,7 @@ pub fn run(
         let brand = resolved_brand_colors(options.brand_colors, cache.as_ref());
         let order = resolved_agent_order(options.agent_order, cache.as_ref());
         let alert = resolved_low_quota_alert(options.low_quota_alert, cache.as_ref());
-        herdr::check(agents, layout, gap, fields, brand)?;
+        herdr::check(agents, layout, gap, fields, brand, order)?;
         println!("Quota percentages show {} quota.", percent.suffix());
         println!("Agent panel order: {}.", order.as_str());
         println!("Low quota alert: {alert}.");
@@ -225,8 +227,8 @@ pub(crate) fn resolved_low_quota_alert(
 /// runs, and a panel that kept its old ordering is a cosmetic disagreement —
 /// failing the whole `--apply` over it would be worse than reporting it.
 pub(crate) fn apply_agent_order(order: AgentOrder) {
-    let result = if order.is_quota() {
-        crate::herdr::set_quota_agent_view()
+    let result = if order.owns_view() {
+        crate::herdr::set_agent_view(order)
     } else {
         crate::herdr::clear_quota_agent_view()
     };

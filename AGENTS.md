@@ -259,6 +259,20 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    switch may not emit `pane.focused`; resolve its pane from that location's
    layout in `herdr api snapshot`. Ignore a delayed event whose workspace or
    Tab is no longer focused.
+5. **Attention order is flat on purpose, and only it.** `--agent-order
+   attention` sorts Herdr's built-in `attention` descending (measured on
+   0.9.1: blocked, unseen done, working, idle, then unknown), then
+   `quota_headroom` ascending; a pane without the token sorts last in its
+   band. The Space header cannot work there, so under this order
+   `$quota_group` is not published (siblings get it cleared), no member
+   indent is added, and the identity row names the Space with Herdr's
+   `workspace`. Its first cell is Herdr's `state_text`; the plugin writes the
+   five Chinese labels in `herdr::ATTENTION_STATE_LABELS` once per pane,
+   riding on a quota report, and compares them against `state_labels` from
+   `agent list` so a refresh never re-sends them. Herdr replaces the whole
+   label set on every write, so always send all five. Leaving the order
+   clears the label set only when it is exactly ours. There is no `[待拍N]`:
+   no per-pane source exists, so nothing prints a count.
 
 **`quota_headroom`** is the token that view sorts on: the remaining percent of
 the tightest of the pane's 5h, 7d, and 30d windows, zero-padded to three digits

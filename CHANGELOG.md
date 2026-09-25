@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `--agent-order attention` lists agents across Spaces instead of by Space:
+  blocked and unseen completions first, then working, then idle, and least
+  quota left first inside each band. It is a plugin-owned Herdr agent view
+  sorted on Herdr's built-in `attention` rank and the existing
+  `quota_headroom` token, so the order follows a status change without a
+  metadata write. Under it the identity row leads with the action state —
+  Herdr's `state_text`, labelled `[卡住]` / `[已回]` / `[工作]` / `[空闲]` /
+  `[未报]` in Herdr's own per-status colours — then the brand icon, the Space
+  and the Tab. The `$quota_group` header is not published, since a Space is no
+  longer contiguous. Every quota row below the identity rows is unchanged. The
+  labels are written once per pane with a quota report and read back from
+  `agent list`, so a refresh does not re-send them. The settings pane cycles
+  default → quota → attention.
+
+### Fixed
+
+- A refresh unit test no longer fails intermittently when a sidebar-width test
+  swaps the environment between its two width reads.
+- The configure round-trip tests no longer inherit `HERDR_SOCKET_PATH`, so
+  running the suite inside a Herdr pane cannot replace the live server's
+  Agent view.
+
 ## [1.6.0] - 2026-09-17
 
 ### Changed

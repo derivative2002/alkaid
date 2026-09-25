@@ -53,6 +53,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         }
     }
 

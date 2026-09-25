@@ -2758,3 +2758,226 @@ fn a_quota_less_pane_still_gets_its_brand_icon_on_refresh() {
     assert!(calls.contains("--token quota_icon="), "{calls}");
     assert!(!calls.contains("pane read"), "{calls}");
 }
+
+fn managed_rows(sidebar: &str) -> Vec<Vec<String>> {
+    let document = sidebar.parse::<toml_edit::DocumentMut>().unwrap();
+    document["ui"]["sidebar"]["agents"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(configured_token)
+                .map(str::to_string)
+                .collect()
+        })
+        .collect()
+}
+
+fn attention_rows(input: &str) -> String {
+    herdr_agent_quota::configure::herdr::add_quota_row_ordered(
+        input,
+        &AgentSelection::SUPPORTED,
+        herdr_agent_quota::cli::SidebarLayout::Gauges,
+        herdr_agent_quota::cli::SidebarRowGap::default(),
+        herdr_agent_quota::cli::FieldSet::all(),
+        herdr_agent_quota::cli::BrandColors::On,
+        herdr_agent_quota::cli::AgentOrder::Attention,
+    )
+    .unwrap()
+}
+
+fn grouped_rows(input: &str) -> String {
+    herdr_agent_quota::configure::herdr::add_quota_row_with(
+        input,
+        &AgentSelection::SUPPORTED,
+        herdr_agent_quota::cli::SidebarLayout::Gauges,
+        herdr_agent_quota::cli::SidebarRowGap::default(),
+        herdr_agent_quota::cli::FieldSet::all(),
+        herdr_agent_quota::cli::BrandColors::On,
+    )
+    .unwrap()
+}
+
+#[test]
+fn the_attention_rows_lead_with_the_action_state_and_keep_every_quota_row() {
+    let attention = managed_rows(&attention_rows(""));
+    let grouped = managed_rows(&grouped_rows(""));
+    // DESIGN-r3 head row: action state first, then the brand icon, the Space
+    // and the Tab — the Space name has no `$quota_group` header to live in.
+    assert_eq!(
+        attention[0],
+        [
+            "state_text",
+            "$quota_icon",
+            "$quota_icon_working",
+            "$quota_icon_done",
+            "workspace",
+            "tab"
+        ]
+    );
+    assert_eq!(attention[1], ["agent"]);
+    assert!(attention
+        .iter()
+        .flatten()
+        .all(|token| token != "$quota_group"));
+    // Everything below the identity rows is the grouped layout, row for row:
+    // switching order must not drop or reorder a quota row.
+    assert_eq!(grouped[0], ["$quota_group"]);
+    assert_eq!(attention[1..], grouped[2..]);
+}
+
+#[test]
+fn attention_rows_are_idempotent_and_switch_cleanly_both_ways() {
+    let attention = attention_rows("");
+    assert_eq!(attention_rows(&attention), attention);
+    assert_eq!(grouped_rows(&attention), grouped_rows(""));
+    assert_eq!(attention_rows(&grouped_rows("")), attention);
+}
+
+#[test]
+fn attention_rows_uninstall_to_herdr_stock_rows() {
+    let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
+    let applied = attention_rows(original);
+    assert!(applied.contains("state_text"), "{applied}");
+    let removed = remove_quota_row(&applied).unwrap();
+    assert!(!removed.contains("state_text"), "{removed}");
+    assert!(!removed.contains("$quota"), "{removed}");
+    assert_eq!(
+        removed,
+        "[ui]\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
+    );
+}
+
+#[test]
+fn attention_rows_keep_a_user_row_through_install_switch_and_uninstall() {
+    // A customised base layout is never taken over: the plugin's rows go to
+    // `rows_by_agent` and the user's rows stay exactly as written.
+    let original =
+        "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"], [\"terminal_title\"]]\n";
+    let applied = attention_rows(original);
+    assert_eq!(
+        managed_rows(&applied),
+        [vec!["state_icon", "agent"], vec!["terminal_title"]]
+    );
+    let document = applied.parse::<toml_edit::DocumentMut>().unwrap();
+    let claude = document["ui"]["sidebar"]["agents"]["rows_by_agent"]["claude"]
+        .as_array()
+        .unwrap();
+    let first = claude.get(0).unwrap().as_array().unwrap();
+    assert_eq!(first.iter().find_map(configured_token), Some("state_text"));
+    assert_eq!(attention_rows(&applied), applied);
+    let switched = grouped_rows(&applied);
+    assert!(!switched.contains("state_text"), "{switched}");
+    assert!(switched.contains("terminal_title"), "{switched}");
+    let removed = remove_quota_row(&applied).unwrap();
+    assert!(removed.contains("terminal_title"), "{removed}");
+    assert!(!removed.contains("state_text"), "{removed}");
+}
+
+#[test]
+fn configure_with_the_attention_order_writes_flat_rows_and_uninstalls_cleanly() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+    let output = homes.configure(&["--apply", "--agent-order", "attention"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sidebar = homes.sidebar();
+    assert_eq!(managed_rows(&sidebar)[0][0], "state_text", "{sidebar}");
+    assert!(!sidebar.contains("$quota_group"), "{sidebar}");
+    assert_eq!(
+        CacheStore::new(&homes.state).agent_order(),
+        Some(herdr_agent_quota::cli::AgentOrder::Attention)
+    );
+
+    assert!(homes
+        .configure(&["--apply", "--agent-order", "quota"])
+        .status
+        .success());
+    let sidebar = homes.sidebar();
+    assert!(sidebar.contains("$quota_group"), "{sidebar}");
+    assert!(!sidebar.contains("state_text"), "{sidebar}");
+
+    assert!(homes
+        .configure(&["--apply", "--agent-order", "attention"])
+        .status
+        .success());
+    assert!(homes.configure(&["--uninstall"]).status.success());
+    let sidebar = homes.sidebar();
+    assert!(!sidebar.contains("state_text"), "{sidebar}");
+    assert!(!sidebar.contains("$quota"), "{sidebar}");
+}
+
+fn run_claude_refresh_logged(state: &Path, agent_list: &str) -> String {
+    let (herdr_stub, herdr_log) = install_herdr_stub(state, agent_list);
+    let _ = fs::remove_file(&herdr_log);
+    run_claude_refresh(state, &herdr_stub);
+    fs::read_to_string(herdr_log).unwrap_or_default()
+}
+
+#[test]
+fn the_attention_order_publishes_state_labels_once_and_no_space_header() {
+    let state = tempdir().unwrap();
+    let (herdr_stub, _) = install_herdr_stub(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"}}]}}"#,
+    );
+    let reset = future_reset_unix();
+    run_claude_collector(
+        state.path(),
+        &herdr_stub,
+        claude_statusline_windows("s1", 58.0, Some(27.0), reset).as_bytes(),
+    );
+    CacheStore::new(state.path())
+        .set_agent_order(herdr_agent_quota::cli::AgentOrder::Attention)
+        .unwrap();
+
+    let report = run_claude_refresh_logged(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"}}]}}"#,
+    );
+    for label in [
+        "--state-label blocked=[卡住]",
+        "--state-label done=[已回]",
+        "--state-label working=[工作]",
+        "--state-label idle=[空闲]",
+        "--state-label unknown=[未报]",
+    ] {
+        assert!(report.contains(label), "missing {label}: {report}");
+    }
+    assert!(!report.contains("quota_group="), "{report}");
+    assert!(report.contains("quota_5h_warning=5h 42%"), "{report}");
+
+    // Labels read back unchanged: nothing about them is sent again.
+    let report = run_claude_refresh_logged(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"},"state_labels":{"blocked":"[卡住]","done":"[已回]","working":"[工作]","idle":"[空闲]","unknown":"[未报]"}}]}}"#,
+    );
+    assert!(!report.contains("--state-label"), "{report}");
+}
+
+#[test]
+fn the_quota_order_sends_no_state_labels() {
+    let state = tempdir().unwrap();
+    let (herdr_stub, _) = install_herdr_stub(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"}}]}}"#,
+    );
+    let reset = future_reset_unix();
+    run_claude_collector(
+        state.path(),
+        &herdr_stub,
+        claude_statusline_windows("s1", 58.0, Some(27.0), reset).as_bytes(),
+    );
+    let report = run_claude_refresh_logged(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"}}]}}"#,
+    );
+    assert!(report.contains("quota_5h_warning=5h 42%"), "{report}");
+    assert!(!report.contains("state-label"), "{report}");
+}

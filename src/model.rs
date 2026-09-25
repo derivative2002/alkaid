@@ -1642,7 +1642,9 @@ mod tests {
         keyed
             .session_models
             .insert("sess-a".to_string(), "claude-opus-5".to_string());
-        assert_eq!(keyed.model_for_session(Some("sess-a")), Some("claude-opus-5"));
+        assert_eq!(
+            keyed.model_for_session(Some("sess-a")),
+            Some("claude-opus-5")
+        );
     }
-
 }
