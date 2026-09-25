@@ -2167,6 +2167,10 @@ impl AgentHomes {
             .env("GROK_HOME", &self.grok_home)
             .env("CURSOR_HOOKS_FILE", &self.cursor_hooks)
             .env("HERDR_BIN_PATH", self.state.join("herdr-absent"))
+            // `configure --apply` sets the Agent view over this socket. Run
+            // from inside a Herdr pane, an inherited path would point the test
+            // at the live server and replace its view.
+            .env_remove("HERDR_SOCKET_PATH")
             .output()
             .unwrap()
     }

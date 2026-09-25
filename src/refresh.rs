@@ -1623,57 +1623,62 @@ mod tests {
 
     #[test]
     fn an_idle_pane_already_showing_the_cached_windows_stays_out_of_the_pass() {
-        let directory = tempdir().unwrap();
-        let cache = CacheStore::new(directory.path());
-        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 900).session_local();
-        snapshot.session_windows.insert(
-            "s1".to_string(),
-            vec![
-                window(WindowKind::FiveHour, 40.0, 9_000),
-                window(WindowKind::Weekly, 20.0, 90_000),
-            ],
-        );
-        cache.save(&snapshot).unwrap();
+        // The row style is read twice — here and inside the watch pass — and
+        // both read the sidebar width from the environment. Hold the one env
+        // lock so a width test cannot swap it between the two reads.
+        crate::prefs::testing::with_env(&[], || {
+            let directory = tempdir().unwrap();
+            let cache = CacheStore::new(directory.path());
+            let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 900).session_local();
+            snapshot.session_windows.insert(
+                "s1".to_string(),
+                vec![
+                    window(WindowKind::FiveHour, 40.0, 9_000),
+                    window(WindowKind::Weekly, 20.0, 90_000),
+                ],
+            );
+            cache.save(&snapshot).unwrap();
 
-        let row = publish_row(&cache);
-        let values = MetadataTokens::from_snapshot_for_pane(
-            &snapshot,
-            1_001,
-            Some("s1"),
-            row.percent,
-            row.shape,
-        );
-        assert_eq!(
-            values.quota_5h_severity,
-            Some(crate::model::Severity::Normal)
-        );
-        assert_eq!(
-            values.quota_week_severity,
-            Some(crate::model::Severity::Normal)
-        );
-        let mut idle = test_pane_with_session("claude-idle", Harness::Claude, "s1");
-        idle.tokens
-            .insert("quota_5h_normal".to_string(), values.quota_5h.clone());
-        idle.tokens
-            .insert("quota_week_normal".to_string(), values.quota_week.clone());
-        idle.tokens.insert(
-            "quota_headroom".to_string(),
-            format!("{:03}", values.quota_headroom.unwrap()),
-        );
-        let panes = [idle, test_pane("other-working", Harness::Claude)];
-        let other = "other-working".to_string();
-        let mut settling = BTreeMap::new();
+            let row = publish_row(&cache);
+            let values = MetadataTokens::from_snapshot_for_pane(
+                &snapshot,
+                1_001,
+                Some("s1"),
+                row.percent,
+                row.shape,
+            );
+            assert_eq!(
+                values.quota_5h_severity,
+                Some(crate::model::Severity::Normal)
+            );
+            assert_eq!(
+                values.quota_week_severity,
+                Some(crate::model::Severity::Normal)
+            );
+            let mut idle = test_pane_with_session("claude-idle", Harness::Claude, "s1");
+            idle.tokens
+                .insert("quota_5h_normal".to_string(), values.quota_5h.clone());
+            idle.tokens
+                .insert("quota_week_normal".to_string(), values.quota_week.clone());
+            idle.tokens.insert(
+                "quota_headroom".to_string(),
+                format!("{:03}", values.quota_headroom.unwrap()),
+            );
+            let panes = [idle, test_pane("other-working", Harness::Claude)];
+            let other = "other-working".to_string();
+            let mut settling = BTreeMap::new();
 
-        let affected = watch_pass_ids(
-            &cache,
-            &panes,
-            &Provider::ALL,
-            std::slice::from_ref(&other),
-            std::slice::from_ref(&other),
-            &mut settling,
-            1_001,
-        );
-        assert_eq!(affected, vec![other]);
+            let affected = watch_pass_ids(
+                &cache,
+                &panes,
+                &Provider::ALL,
+                std::slice::from_ref(&other),
+                std::slice::from_ref(&other),
+                &mut settling,
+                1_001,
+            );
+            assert_eq!(affected, vec![other]);
+        });
     }
 
     #[test]
