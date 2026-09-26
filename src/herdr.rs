@@ -73,6 +73,9 @@ pub(crate) struct Look {
     pub group: crate::look::GroupStyle,
     pub logos: crate::look::LogoLayout,
     pub ds_mark: crate::look::DsMark,
+    /// Which rows the installed template shows; decides what a report over
+    /// Herdr's token budget may defer.
+    pub rows: crate::cli::SidebarRows,
     /// Per workspace, from the same inventory the pass publishes against.
     pub counts: BTreeMap<String, crate::look::SpaceCounts>,
     /// The last pane of each Space (largest sort key), when gapped.
@@ -108,6 +111,7 @@ impl Look {
             group,
             logos: crate::look::LogoLayout::installed(),
             ds_mark: crate::look::DsMark::installed(),
+            rows: crate::configure::resolved_sidebar_rows(None),
             counts: space_counts(&folded),
             tails,
         }
@@ -120,6 +124,7 @@ impl Look {
             group: crate::look::GroupStyle::Plain,
             logos: crate::look::LogoLayout::None,
             ds_mark: crate::look::DsMark::Launcher,
+            rows: crate::cli::SidebarRows::Identity,
             counts: BTreeMap::new(),
             tails: BTreeSet::new(),
         }
@@ -266,6 +271,19 @@ const ROWS_THAT_MUST_NOT_LAG: [&str; 17] = [
     "quota_week_inline_warning",
     "quota_week_inline_danger",
     "quota_week_inline_unknown",
+];
+
+/// [`ROWS_THAT_MUST_NOT_LAG`] for the identity rows (round two onward).
+const IDENTITY_ROWS_THAT_MUST_NOT_LAG: [&str; 9] = [
+    "quota_group",
+    "quota_icon",
+    SORT_TOKEN,
+    GAP_TOKEN,
+    CHANNEL_TOKEN,
+    MODEL_MARK_TOKEN,
+    ROLE_TOKEN,
+    MODEL_TOKEN,
+    SPACE_TOKEN,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1037,7 +1055,7 @@ fn publish_pane_tokens_inner(
             continue;
         }
         reported += 1;
-        if !report_pane_metadata(&executable, pane, &desired, sequence, labels)? {
+        if !report_pane_metadata(&executable, pane, &desired, sequence, labels, look.rows)? {
             failed.push(pane.pane_id.clone());
         }
     }
@@ -1106,6 +1124,7 @@ fn report_pane_metadata(
     desired: &BTreeMap<String, String>,
     sequence: u64,
     labels: LabelChange,
+    rows: crate::cli::SidebarRows,
 ) -> Result<bool> {
     let mut command = Command::new(executable);
     command
@@ -1118,7 +1137,7 @@ fn report_pane_metadata(
         ])
         .args(["--seq", &sequence.to_string()])
         .args(["--ttl-ms", METADATA_TTL_MS]);
-    for name in metadata_report_names(pane, desired) {
+    for name in metadata_report_names(pane, desired, rows) {
         if let Some(value) = desired.get(name) {
             command.args(["--token", &format!("{name}={value}")]);
         } else {
@@ -1397,6 +1416,9 @@ fn space_tails(
         .collect()
 }
 
+/// Sorts after every [`sort_key`]: Herdr lists a pane without the token last.
+const UNSORTED: char = '\u{10ffff}';
+
 /// Per workspace, the first and last pane by [`sort_key`] — the order the
 /// grouped view lists them in. `inventory` is the full agent list;
 /// `publishing` / `tokens` overlay headroom for panes this pass is about to
@@ -1412,11 +1434,10 @@ fn space_ends(
         .map(|pane| pane.pane_id.as_str())
         .collect::<BTreeSet<_>>();
     let mut ends: BTreeMap<String, (String, String, String, String)> = BTreeMap::new();
-    let mut consider = |pane: &AgentPane, headroom: u8| {
+    let mut consider = |pane: &AgentPane, key: String| {
         if pane.workspace_id.is_empty() {
             return;
         }
-        let key = sort_key(headroom, &pane.pane_id);
         let id = pane.pane_id.clone();
         match ends.get_mut(&pane.workspace_id) {
             Some((first_key, first, last_key, last)) => {
@@ -1438,21 +1459,27 @@ fn space_ends(
         }
     };
     for pane in inventory {
-        let headroom = if publishing_ids.contains(pane.pane_id.as_str()) {
-            published_headroom(pane, tokens)
+        let key = if publishing_ids.contains(pane.pane_id.as_str()) {
+            sort_key(published_headroom(pane, tokens), &pane.pane_id)
         } else {
+            // A pane this pass does not write sits where its own `al_sort`
+            // puts it — even if its headroom token lagged a report — and
+            // Herdr lists a pane without the token last.
             pane.tokens
-                .get(HEADROOM_TOKEN)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(u8::MAX)
+                .get(SORT_TOKEN)
+                .cloned()
+                .unwrap_or_else(|| format!("{UNSORTED}{}", pane.pane_id))
         };
-        consider(pane, headroom);
+        consider(pane, key);
     }
     // A pane present only in this pass (inventory read failed) still counts,
     // so its Space is not left without a label.
     for pane in publishing {
         if !inventory.iter().any(|known| known.pane_id == pane.pane_id) {
-            consider(pane, published_headroom(pane, tokens));
+            consider(
+                pane,
+                sort_key(published_headroom(pane, tokens), &pane.pane_id),
+            );
         }
     }
     ends.into_iter()
@@ -1931,6 +1958,7 @@ fn metadata_matches(
 fn metadata_report_names(
     pane: &AgentPane,
     desired: &BTreeMap<String, String>,
+    rows: crate::cli::SidebarRows,
 ) -> Vec<&'static str> {
     let mut names = METADATA_TOKEN_NAMES
         .into_iter()
@@ -1962,22 +1990,43 @@ fn metadata_report_names(
     // value is re-sent on the next bounded report instead.
     let active_capacity = MAX_METADATA_TOKENS.saturating_sub(cleanup_names.len());
     while names.len() > active_capacity {
-        let Some(index) = names.iter().position(|name| {
-            // Dropping a name the pane still carries but no longer wants would
-            // leave that row on screen forever, so those are never given up.
-            // Icon twins are never dropped either — a stale colour is worse
-            // than a briefly lagged quota digit.
-            let must_clear = pane.tokens.contains_key(*name) && !desired.contains_key(*name);
-            let is_icon = ICON_TOKEN_NAMES.contains(name);
-            !must_clear && !is_icon && !ROWS_THAT_MUST_NOT_LAG.contains(name)
-        }) else {
+        let Some(index) = names
+            .iter()
+            .position(|name| !must_not_lag(pane, desired, rows, name))
+        else {
             break;
         };
         names.remove(index);
     }
+    // Still over: keep the protected names, whatever their list position.
+    names.sort_by_key(|name| !must_not_lag(pane, desired, rows, name));
     names.truncate(active_capacity);
     names.extend(cleanup_names);
     names
+}
+
+/// Names a report over budget never defers. Dropping a name the pane still
+/// carries but no longer wants would leave that row on screen forever, and a
+/// stale icon colour is worse than a briefly lagged quota digit. Beyond
+/// those, protect what the installed rows show: with identity rows the usage
+/// values are hidden and may lag, but the header, the sort key the view and
+/// its heads agree on, the Space-closing gap, the logo marks and the
+/// identity fields may not.
+fn must_not_lag(
+    pane: &AgentPane,
+    desired: &BTreeMap<String, String>,
+    rows: crate::cli::SidebarRows,
+    name: &str,
+) -> bool {
+    let must_clear = pane.tokens.contains_key(name) && !desired.contains_key(name);
+    // The view sorts on `al_sort` under either row set.
+    must_clear
+        || ICON_TOKEN_NAMES.contains(&name)
+        || name == SORT_TOKEN
+        || match rows {
+            crate::cli::SidebarRows::Quota => ROWS_THAT_MUST_NOT_LAG.contains(&name),
+            crate::cli::SidebarRows::Identity => IDENTITY_ROWS_THAT_MUST_NOT_LAG.contains(&name),
+        }
 }
 
 fn week_style_base(quota_5h: &str) -> &'static str {
@@ -2576,6 +2625,7 @@ mod tests {
                 group: self.look.group,
                 logos: self.look.logos,
                 ds_mark: self.look.ds_mark,
+                rows: self.look.rows,
                 counts: BTreeMap::new(),
                 tails: BTreeSet::new(),
             }
@@ -3190,6 +3240,7 @@ mod tests {
             topic: String::new(),
             tokens: BTreeMap::from([
                 (HEADROOM_TOKEN.to_string(), "000".to_string()),
+                (SORT_TOKEN.to_string(), "000w1:p1".to_string()),
                 ("quota_group".to_string(), "ifs".to_string()),
             ]),
             status: AgentStatus::Idle,
@@ -3455,6 +3506,97 @@ mod tests {
         }
     }
 
+    /// 0927 (Codex review): with identity rows, logos, a counted header and
+    /// a gap, a fully populated pane has more names than one report may
+    /// carry. The ones that keep the view and its heads consistent, and the
+    /// rows the identity sidebar actually shows, must never be the ones
+    /// deferred; hidden quota values may lag a pass instead.
+    #[test]
+    fn a_full_pane_never_defers_the_sort_key_header_or_logo_marks() {
+        let snapshot = ProviderSnapshot::new(
+            Provider::Claude,
+            vec![
+                UsageWindow::new(
+                    WindowKind::FiveHour,
+                    85.0,
+                    Some(ResetAt::from_unix_seconds(9_000)),
+                )
+                .unwrap(),
+                UsageWindow::new(
+                    WindowKind::Weekly,
+                    42.0,
+                    Some(ResetAt::from_unix_seconds(600_000)),
+                )
+                .unwrap(),
+            ],
+            0,
+        )
+        .with_model(Some("Opus 5.5".to_string()))
+        .with_context(Some(ContextUsage {
+            used_percent: 61.0,
+            cache: Some(CacheUsage {
+                fresh_input_tokens: 1_000,
+                read_tokens: 50_000,
+                creation_tokens: 2_000,
+                hit_percent: 96.4,
+                ttl_seconds: Some(3_540),
+                last_activity_unix: None,
+                expires_at_unix: None,
+                session_totals: None,
+                session_id: None,
+                transcript_offset: 0,
+            }),
+        }));
+        let mut desired = desired_tokens(
+            &MetadataTokens::from_snapshot(&snapshot, 0),
+            "a topic that is present",
+            SidebarShape::default(),
+        );
+        for name in [
+            "quota_group",
+            "quota_icon",
+            ROLE_TOKEN,
+            MODEL_TOKEN,
+            SPACE_TOKEN,
+            SORT_TOKEN,
+            GAP_TOKEN,
+            CHANNEL_TOKEN,
+            MODEL_MARK_TOKEN,
+        ] {
+            desired.insert(name.to_string(), "x".to_string());
+        }
+        let mut pane = attention_pane("w1:p1", "010", AgentStatus::Idle);
+        // Last pass the pane was working: the working twin must be cleared.
+        pane.tokens = desired.clone();
+        pane.tokens.remove("quota_icon");
+        pane.tokens
+            .insert("quota_icon_working".to_string(), "x".to_string());
+        pane.tokens
+            .insert(SORT_TOKEN.to_string(), "old".to_string());
+        let quota_rows = metadata_report_names(&pane, &desired, crate::cli::SidebarRows::Quota);
+        assert!(quota_rows.len() <= MAX_METADATA_TOKENS, "{quota_rows:?}");
+        for name in ["quota_group", SORT_TOKEN, "quota_icon_working"] {
+            assert!(quota_rows.contains(&name), "quota rows deferred {name}");
+        }
+        let names = metadata_report_names(&pane, &desired, crate::cli::SidebarRows::Identity);
+        assert!(names.len() <= MAX_METADATA_TOKENS, "{names:?}");
+        for name in [
+            "quota_group",
+            "quota_icon",
+            "quota_icon_working",
+            "quota_icon_done",
+            SORT_TOKEN,
+            GAP_TOKEN,
+            CHANNEL_TOKEN,
+            MODEL_MARK_TOKEN,
+            ROLE_TOKEN,
+            MODEL_TOKEN,
+            SPACE_TOKEN,
+        ] {
+            assert!(names.contains(&name), "{name} deferred: {names:?}");
+        }
+    }
+
     #[test]
     fn plugin_quota_presence_ignores_topic_only_tokens() {
         let mut tokens = BTreeMap::new();
@@ -3568,7 +3710,7 @@ mod tests {
         };
         let desired = BTreeMap::from([(String::from("quota_state"), String::from("?"))]);
         assert!(!metadata_matches(&pane.tokens, &desired));
-        let names = metadata_report_names(&pane, &desired);
+        let names = metadata_report_names(&pane, &desired, crate::cli::SidebarRows::Quota);
         assert!(names.contains(&"quota_badge"));
         assert!(names.len() <= MAX_METADATA_TOKENS);
     }
@@ -3616,7 +3758,7 @@ mod tests {
             focused: false,
             state_labels: BTreeMap::new(),
         };
-        let names = metadata_report_names(&pane, &desired);
+        let names = metadata_report_names(&pane, &desired, crate::cli::SidebarRows::Quota);
         assert!(names.len() <= MAX_METADATA_TOKENS);
         assert!(names.contains(&"quota_week_inline_normal"));
         assert!(!names.contains(&"quota_week_normal"));
@@ -3666,7 +3808,7 @@ mod tests {
             focused: false,
             state_labels: BTreeMap::new(),
         };
-        let names = metadata_report_names(&pane, &desired);
+        let names = metadata_report_names(&pane, &desired, crate::cli::SidebarRows::Quota);
         assert!(names.len() <= MAX_METADATA_TOKENS);
         assert!(names.contains(&"quota_cache"));
         assert!(names.contains(&"quota_cache_ttl"));
@@ -3931,7 +4073,7 @@ mod tests {
             focused: false,
             state_labels: BTreeMap::new(),
         };
-        let names = metadata_report_names(&pane, &desired);
+        let names = metadata_report_names(&pane, &desired, crate::cli::SidebarRows::Quota);
         assert!(names.len() <= MAX_METADATA_TOKENS, "{names:?}");
     }
 
@@ -4004,7 +4146,7 @@ mod tests {
             focused: false,
             state_labels: BTreeMap::new(),
         };
-        let names = metadata_report_names(&pane, &desired);
+        let names = metadata_report_names(&pane, &desired, crate::cli::SidebarRows::Quota);
         assert!(names.len() <= MAX_METADATA_TOKENS);
         assert!(names.contains(&"quota_cache"));
         assert!(names.contains(&"quota_cache_ttl"));
@@ -4183,7 +4325,7 @@ mod tests {
             state_labels: BTreeMap::new(),
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
-        let names = metadata_report_names(&pane, &desired);
+        let names = metadata_report_names(&pane, &desired, crate::cli::SidebarRows::Quota);
         assert!(names.contains(&"quota_week_normal"));
         assert!(names.contains(&"quota_week_inline_normal"));
         assert!(!desired.contains_key("quota_week_normal"));
@@ -4230,7 +4372,7 @@ mod tests {
             state_labels: BTreeMap::new(),
         };
         assert!(!metadata_matches(&pane.tokens, &desired));
-        let names = metadata_report_names(&pane, &desired);
+        let names = metadata_report_names(&pane, &desired, crate::cli::SidebarRows::Quota);
         assert!(names.contains(&"quota_week_inline_normal"));
         assert!(names.contains(&"quota_week_normal"));
         assert!(names.len() <= MAX_METADATA_TOKENS);
