@@ -2,13 +2,14 @@ use crate::cli::{
     AgentOrder, AgentSelection, BrandColors, FieldSet, SidebarField, SidebarLayout, SidebarRowGap,
     SidebarRows,
 };
+use crate::look::{GroupStyle, LogoLayout};
 use crate::model::Harness;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 54] = [
+const QUOTA_ROW_MARKERS: [&str; 57] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
@@ -63,6 +64,9 @@ const QUOTA_ROW_MARKERS: [&str; 54] = [
     "$al_role",
     "$al_model",
     "$al_space",
+    "$al_gap",
+    "$al_channel",
+    "$al_model_mark",
 ];
 const ROW_GAP_MARKER: &str = "herdr-agent-quota";
 const MANAGED_ROW_MARKER: &str = "herdr-agent-quota-row";
@@ -75,6 +79,32 @@ const SETTINGS_KEY: &str = "prefix+shift+q";
 const SETTINGS_ACTION: &str = "herdr-agent-quota.open-settings";
 const TOGGLE_ORDER_KEY: &str = "prefix+shift+o";
 const TOGGLE_ORDER_ACTION: &str = "herdr-agent-quota.toggle-order";
+
+/// The identity rows' look: Space header style and where logos sit. Both
+/// change the configured rows, so both are part of what uninstall must
+/// recognise as this plugin's own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowLook {
+    pub group: GroupStyle,
+    pub logos: LogoLayout,
+}
+
+impl RowLook {
+    fn every() -> Vec<Self> {
+        let mut looks = Vec::new();
+        for group in [
+            GroupStyle::Plain,
+            GroupStyle::Rule,
+            GroupStyle::Count,
+            GroupStyle::Bar,
+        ] {
+            for logos in [LogoLayout::None, LogoLayout::Inline, LogoLayout::SecondRow] {
+                looks.push(Self { group, logos });
+            }
+        }
+        looks
+    }
+}
 const CONFIG_PRESENCE_FILE: &str = "herdr-config.original.present";
 // Brand answers "who"; status answers "how much is left". All other text
 // inherits Herdr's active theme. Selected state may change background only —
@@ -86,6 +116,8 @@ const QUOTA_WARNING_COLOR: &str = "#e4b957";
 /// `state_icon` palette so the brand glyph replaces the ring without a second
 /// circle on the row.
 const IDLE_ICON_COLOR: &str = "#e9e9f0";
+/// Space headers and channel marks in the rule / bar candidates (0927).
+const ACCENT_COLOR: &str = "#89b4fa";
 /// Secondary ink for Herdr's native `agent` name row. A step dimmer than the
 /// provider/model identity so the harness name reads as a subtitle, not a
 /// second heading.
@@ -131,6 +163,7 @@ fn selected_providers(agents: &[Harness]) -> impl Iterator<Item = &'static str> 
         .map(|(_, provider)| provider)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn check(
     agents: &[Harness],
     layout: SidebarLayout,
@@ -139,11 +172,12 @@ pub fn check(
     brand: BrandColors,
     order: AgentOrder,
     rows: SidebarRows,
+    look: RowLook,
 ) -> Result<()> {
     let path = config_path()?;
     let original = fs::read_to_string(&path).unwrap_or_default();
     let (updated, skipped) = rewrite_quota_sidebar(
-        &original, agents, layout, row_gap, fields, brand, order, rows,
+        &original, agents, layout, row_gap, fields, brand, order, rows, look,
     )?;
     if updated == original {
         println!(
@@ -164,6 +198,7 @@ pub fn check(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply(
     agents: &[Harness],
     layout: SidebarLayout,
@@ -172,12 +207,13 @@ pub fn apply(
     brand: BrandColors,
     order: AgentOrder,
     rows: SidebarRows,
+    look: RowLook,
 ) -> Result<()> {
     let path = config_path()?;
     let existed = path.exists();
     let original = fs::read_to_string(&path).unwrap_or_default();
     let (updated, skipped) = rewrite_quota_sidebar(
-        &original, agents, layout, row_gap, fields, brand, order, rows,
+        &original, agents, layout, row_gap, fields, brand, order, rows, look,
     )?;
     if let Some(line) = skipped_provider_notice(&skipped) {
         println!("{line}");
@@ -414,8 +450,14 @@ fn matches_installed_quota_rows(
         for layout in SidebarLayout::CHOICES {
             for gap in [SidebarRowGap::FLUSH, SidebarRowGap::SEPARATED] {
                 for order in [AgentOrder::Quota, AgentOrder::Attention] {
-                    for rows in [SidebarRows::Identity, SidebarRows::Quota] {
-                        if add_sidebar_rows(
+                    let candidates = std::iter::once((SidebarRows::Quota, RowLook::default()))
+                        .chain(
+                            RowLook::every()
+                                .into_iter()
+                                .map(|look| (SidebarRows::Identity, look)),
+                        );
+                    for (rows, look) in candidates {
+                        if add_sidebar_rows_look(
                             original,
                             &AgentSelection::SUPPORTED,
                             layout,
@@ -424,6 +466,7 @@ fn matches_installed_quota_rows(
                             brand,
                             order,
                             rows,
+                            look,
                         )? == current
                         {
                             return Ok(true);
@@ -515,7 +558,36 @@ pub fn add_sidebar_rows(
     order: AgentOrder,
     rows: SidebarRows,
 ) -> Result<String> {
-    Ok(rewrite_quota_sidebar(input, agents, layout, row_gap, fields, brand, order, rows)?.0)
+    add_sidebar_rows_look(
+        input,
+        agents,
+        layout,
+        row_gap,
+        fields,
+        brand,
+        order,
+        rows,
+        RowLook::default(),
+    )
+}
+
+/// Full form with the identity rows' look.
+#[allow(clippy::too_many_arguments)]
+pub fn add_sidebar_rows_look(
+    input: &str,
+    agents: &[Harness],
+    layout: SidebarLayout,
+    row_gap: SidebarRowGap,
+    fields: FieldSet,
+    brand: BrandColors,
+    order: AgentOrder,
+    rows: SidebarRows,
+    look: RowLook,
+) -> Result<String> {
+    Ok(rewrite_quota_sidebar(
+        input, agents, layout, row_gap, fields, brand, order, rows, look,
+    )?
+    .0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -528,6 +600,7 @@ fn rewrite_quota_sidebar(
     _brand: BrandColors,
     order: AgentOrder,
     rows: SidebarRows,
+    look: RowLook,
 ) -> Result<(String, Vec<&'static str>)> {
     let mut document = if input.trim().is_empty() {
         DocumentMut::new()
@@ -579,6 +652,7 @@ fn rewrite_quota_sidebar(
         fields,
         order,
         rows,
+        look,
         if rows_safe {
             RowRewrite::Takeover
         } else {
@@ -616,6 +690,7 @@ fn build_managed_rows(
     fields: FieldSet,
     order: AgentOrder,
     rows: SidebarRows,
+    look: RowLook,
     rewrite: RowRewrite,
 ) -> Result<Array> {
     let preserved = match rewrite {
@@ -652,23 +727,26 @@ fn build_managed_rows(
     let user_count = preserved.len();
     let mut updated_rows = preserved;
     match rows {
-        SidebarRows::Identity => append_identity_rows(&mut updated_rows),
+        SidebarRows::Identity => append_identity_rows(&mut updated_rows, look),
         SidebarRows::Quota => append_quota_rows(&mut updated_rows, layout, order),
     }
-    // Keep the head row (`$quota_group`, or the attention identity row) first;
-    // user-owned extras (pane/git/other plugins) sit directly under it.
+    // Keep the head row (`$quota_group`, or the attention identity row)
+    // first; user-owned extras (pane/git/other plugins) sit directly under it.
+    let head_rows = 1;
     if user_count > 0 {
         let mut reordered = Array::new();
-        reordered.push(
-            updated_rows
-                .get(user_count)
-                .expect("head row follows preserved rows")
-                .clone(),
-        );
+        for index in user_count..user_count + head_rows {
+            reordered.push(
+                updated_rows
+                    .get(index)
+                    .expect("head rows follow preserved rows")
+                    .clone(),
+            );
+        }
         for index in 0..user_count {
             reordered.push(updated_rows.get(index).expect("preserved row").clone());
         }
-        for index in (user_count + 1)..updated_rows.len() {
+        for index in (user_count + head_rows)..updated_rows.len() {
             reordered.push(updated_rows.get(index).expect("quota row").clone());
         }
         updated_rows = reordered;
@@ -1128,16 +1206,38 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout, order: AgentOrder)
 ///    (the header label)
 /// 3. `$al_role` and `$al_model` from the pane label (naming-spec §5)
 /// 4. `pane` — the pane label itself, i.e. the session name
-fn append_identity_rows(rows: &mut Array) {
+fn append_identity_rows(rows: &mut Array, look: RowLook) {
+    let (group_fg, group_bold) = match look.group {
+        GroupStyle::Plain | GroupStyle::Count => (None, true),
+        GroupStyle::Rule | GroupStyle::Bar => (Some(ACCENT_COLOR), true),
+    };
     rows.push(Value::Array(styled_row(
         "$quota_group",
-        None,
-        Some(true),
+        group_fg,
+        Some(group_bold),
         Some(false),
     )));
+    // Only the harness mark carries status colour; channel and model marks
+    // are the neutral secondary grey so they never read as a status.
+    let channel = styled_token(
+        "$al_channel",
+        Some(AGENT_SECONDARY_COLOR),
+        Some(false),
+        Some(false),
+    );
+    let mark = styled_token(
+        "$al_model_mark",
+        Some(AGENT_SECONDARY_COLOR),
+        Some(false),
+        Some(false),
+    );
     // Icons first: a Space member's indent rides on the icon value
     // (`GROUP_MEMBER_INDENT`), which only indents the row from its first cell.
     let mut identity = brand_icon_cells();
+    if look.logos == LogoLayout::Inline {
+        identity.push(channel.clone());
+        identity.push(mark.clone());
+    }
     identity.push(styled_token("state_text", None, Some(true), Some(false)));
     identity.push(styled_token(
         "$al_space",
@@ -1154,6 +1254,10 @@ fn append_identity_rows(rows: &mut Array) {
         Some(true),
         Some(false),
     ));
+    if look.logos == LogoLayout::SecondRow {
+        seat.push(channel);
+        seat.push(mark);
+    }
     seat.push(styled_token(
         "$al_model",
         Some(AGENT_SECONDARY_COLOR),
@@ -1167,6 +1271,17 @@ fn append_identity_rows(rows: &mut Array) {
         Some(false),
         Some(true),
     )));
+    // A gapped style's blank line: last row, published only on the last
+    // pane of each Space, so it separates Spaces without indenting a header
+    // (Herdr hang-indents every row after a pane's first).
+    if look.group.gaps() {
+        rows.push(Value::Array(styled_row(
+            "$al_gap",
+            None,
+            Some(false),
+            Some(false),
+        )));
+    }
 }
 
 /// The attention order's rows: the Space-grouped rows minus `$quota_group`,
@@ -2570,6 +2685,7 @@ claude = [["state_icon", "agent"]]
             BrandColors::On,
             AgentOrder::Quota,
             SidebarRows::Quota,
+            RowLook::default(),
         )
         .unwrap()
         .1;

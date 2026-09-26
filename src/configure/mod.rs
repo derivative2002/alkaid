@@ -132,12 +132,23 @@ pub fn run(
             })
             .unwrap_or_default();
         prefs::write(prefs::ICON_STYLE, style.as_str())?;
+        let look = resolved_row_look(&options);
+        prefs::write(prefs::GROUP_STYLE, look.group.as_str())?;
+        prefs::write(prefs::LOGO_LAYOUT, look.logos.as_str())?;
+        // Token values only, not rows: stored for the publish pass to read.
+        let ds_mark = options
+            .ds_mark
+            .unwrap_or_else(crate::look::DsMark::installed);
+        prefs::write(prefs::DS_MARK, ds_mark.as_str())?;
         println!(
-            "Sidebar rows: {}; vendor marks: {}.",
+            "Sidebar rows: {}; vendor marks: {}; Space headers: {}; logos: {}; DS-base mark: {}.",
             rows.as_str(),
-            style.as_str()
+            style.as_str(),
+            look.group.as_str(),
+            look.logos.as_str(),
+            ds_mark.as_str()
         );
-        herdr::apply(agents, layout, gap, fields, brand, order, rows)?;
+        herdr::apply(agents, layout, gap, fields, brand, order, rows, look)?;
         for note in font::install(cache.root())? {
             println!("{note}");
         }
@@ -163,7 +174,16 @@ pub fn run(
         let order = resolved_agent_order(options.agent_order, cache.as_ref());
         let alert = resolved_low_quota_alert(options.low_quota_alert, cache.as_ref());
         let rows = resolved_sidebar_rows(options.sidebar_rows);
-        herdr::check(agents, layout, gap, fields, brand, order, rows)?;
+        herdr::check(
+            agents,
+            layout,
+            gap,
+            fields,
+            brand,
+            order,
+            rows,
+            resolved_row_look(&options),
+        )?;
         println!("Sidebar rows: {}.", rows.as_str());
         println!("Quota percentages show {} quota.", percent.suffix());
         println!("Agent panel order: {}.", order.as_str());
@@ -223,6 +243,34 @@ pub(crate) fn resolved_agent_order(
         .or_else(|| prefs::read(prefs::AGENT_ORDER).and_then(|value| AgentOrder::parse(&value)))
         .or_else(|| cache.and_then(CacheStore::agent_order))
         .unwrap_or_default()
+}
+
+/// Header style and logo layout: flag, then environment, then the stored
+/// preference, then round two's look.
+pub(crate) fn resolved_row_look(options: &ConfigureOptions) -> herdr::RowLook {
+    use crate::look::{GroupStyle, LogoLayout};
+    herdr::RowLook {
+        group: options
+            .group_style
+            .or_else(|| {
+                std::env::var(GroupStyle::ENV)
+                    .ok()
+                    .as_deref()
+                    .and_then(GroupStyle::parse)
+            })
+            .or_else(|| prefs::read(prefs::GROUP_STYLE).and_then(|v| GroupStyle::parse(&v)))
+            .unwrap_or_default(),
+        logos: options
+            .logo_layout
+            .or_else(|| {
+                std::env::var(LogoLayout::ENV)
+                    .ok()
+                    .as_deref()
+                    .and_then(LogoLayout::parse)
+            })
+            .or_else(|| prefs::read(prefs::LOGO_LAYOUT).and_then(|v| LogoLayout::parse(&v)))
+            .unwrap_or_default(),
+    }
 }
 
 pub(crate) fn resolved_sidebar_rows(explicit: Option<SidebarRows>) -> SidebarRows {

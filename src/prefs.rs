@@ -29,9 +29,17 @@ pub const LOW_QUOTA_ALERT: &str = "low-quota-alert";
 pub const SIDEBAR_ROWS: &str = "sidebar-rows";
 /// Vendor mark style: `glyph` (default) or `letter`.
 pub const ICON_STYLE: &str = "icon-style";
+/// Space header style: `plain` (default), `rule`, `count` or `bar`.
+pub const GROUP_STYLE: &str = "group-style";
+/// Where harness / channel / model marks sit: `none` (default), `inline`,
+/// `second-row`.
+pub const LOGO_LAYOUT: &str = "logo-layout";
+/// First-row mark of a DeepSeek-base Claude Code seat under a logo layout:
+/// `launcher` (default) or `base`.
+pub const DS_MARK: &str = "ds-mark";
 
 /// Every preference a full uninstall must forget.
-pub const ALL: [&str; 11] = [
+pub const ALL: [&str; 14] = [
     AGENTS,
     WATCH_INTERVAL_SECONDS,
     SIDEBAR_LAYOUT,
@@ -43,6 +51,9 @@ pub const ALL: [&str; 11] = [
     LOW_QUOTA_ALERT,
     SIDEBAR_ROWS,
     ICON_STYLE,
+    GROUP_STYLE,
+    LOGO_LAYOUT,
+    DS_MARK,
 ];
 
 fn directory() -> Option<PathBuf> {

@@ -11,10 +11,50 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
+/// Tests in this binary run as threads, write shell stubs and then run the
+/// plugin, which executes them. A thread that forks while another thread
+/// still has a stub open for writing hands the child that write handle until
+/// the child execs; executing the stub in that window fails with ETXTBSY
+/// ("Text file busy", seen 0927 about one run in five). Writes take this lock
+/// exclusively, spawns take it shared, so no fork overlaps an open write.
+static EXEC_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn exec_write_guard() -> std::sync::RwLockWriteGuard<'static, ()> {
+    EXEC_LOCK.write().unwrap_or_else(|error| error.into_inner())
+}
+
+fn locked_write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let _guard = exec_write_guard();
+    fs::write(path, contents)
+}
+
+trait LockedCommand {
+    fn locked_output(&mut self) -> std::io::Result<std::process::Output>;
+    fn locked_status(&mut self) -> std::io::Result<std::process::ExitStatus>;
+    fn locked_spawn(&mut self) -> std::io::Result<std::process::Child>;
+}
+
+impl LockedCommand for Command {
+    fn locked_output(&mut self) -> std::io::Result<std::process::Output> {
+        let _guard = EXEC_LOCK.read().unwrap_or_else(|error| error.into_inner());
+        self.output()
+    }
+
+    fn locked_status(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let _guard = EXEC_LOCK.read().unwrap_or_else(|error| error.into_inner());
+        self.status()
+    }
+
+    fn locked_spawn(&mut self) -> std::io::Result<std::process::Child> {
+        let _guard = EXEC_LOCK.read().unwrap_or_else(|error| error.into_inner());
+        self.spawn()
+    }
+}
+
 fn install_herdr_stub(state: &Path, agent_list: &str) -> (PathBuf, PathBuf) {
     let log = state.join("herdr.log");
     let executable = state.join("herdr");
-    fs::write(
+    locked_write(
         &executable,
         format!(
             "#!/bin/sh\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane read\" ]; then\n  printf '%s\\n' \"$*\" >> '{}'\nelif [ \"$1 $2\" = \"pane report-metadata\" ]; then\n  printf '%s\\n' \"$*\" >> '{}'\nelif [ \"$1 $2\" = \"notification show\" ]; then\n  printf '%s\\n' \"$*\" >> '{}'\nfi\n",
@@ -75,7 +115,7 @@ fn run_claude_collector_with_config_dir(
     if let Some(config_dir) = config_dir {
         command.env("CLAUDE_CONFIG_DIR", config_dir);
     }
-    let mut child = command.spawn().unwrap();
+    let mut child = command.locked_spawn().unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     assert!(child.wait_with_output().unwrap().status.success());
 }
@@ -87,7 +127,7 @@ fn run_claude_collector_with_timeout(state: &Path, input: &[u8], timeout: Durati
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .locked_spawn()
         .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     let deadline = Instant::now() + timeout;
@@ -116,7 +156,7 @@ fn hold_refresh_lock_in_child(state: &Path) -> std::process::Child {
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .locked_spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while !ready_path.exists() {
@@ -141,7 +181,7 @@ fn run_claude_refresh(state: &Path, herdr: &Path) {
         .args(["refresh", "--provider", "claude", "--force"])
         .env("HERDR_PLUGIN_STATE_DIR", state)
         .env("HERDR_BIN_PATH", herdr)
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
 }
@@ -530,7 +570,7 @@ fn claude_collector_is_silent_without_a_previous_statusline() {
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
+        .locked_spawn()
         .unwrap();
     child
         .stdin
@@ -564,7 +604,7 @@ fn claude_collector_does_not_wait_for_a_refresh_lock() {
 #[test]
 fn claude_collector_bounds_a_hanging_previous_statusline() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("claude-statusline.original.json"),
         r#"{"type":"command","command":"sleep 20"}"#,
     )
@@ -884,7 +924,7 @@ fn quota_refresh_does_not_report_metadata_to_a_scrolled_pane() {
     let state = tempdir().unwrap();
     let log = state.path().join("herdr.log");
     let herdr = state.path().join("herdr");
-    fs::write(
+    locked_write(
         &herdr,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
@@ -914,7 +954,7 @@ fn a_scrolled_pane_completion_reports_only_icon_tokens() {
     let state = tempdir().unwrap();
     let log = state.path().join("herdr.log");
     let herdr = state.path().join("herdr");
-    fs::write(
+    locked_write(
         &herdr,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
@@ -933,7 +973,7 @@ fn a_scrolled_pane_completion_reports_only_icon_tokens() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p1","agent":"claude","status":"idle"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(log).unwrap();
@@ -951,7 +991,7 @@ fn focus_paints_icons_without_reading_the_pane_or_collectors() {
     let state = tempdir().unwrap();
     let log = state.path().join("herdr.log");
     let herdr = state.path().join("herdr");
-    fs::write(
+    locked_write(
         &herdr,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"pane current\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
@@ -971,7 +1011,7 @@ fn focus_paints_icons_without_reading_the_pane_or_collectors() {
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .env("HERDR_BIN_PATH", &herdr)
         .env_remove("HERDR_PLUGIN_EVENT_JSON")
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(log).unwrap();
@@ -1003,7 +1043,7 @@ fn agent_event_refreshes_and_reads_topics_only_for_its_provider() {
     let codex_log = state.path().join("codex.log");
     let herdr = state.path().join("herdr");
     let codex = state.path().join("codex");
-    fs::write(
+    locked_write(
         &herdr,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
@@ -1013,7 +1053,7 @@ fn agent_event_refreshes_and_reads_topics_only_for_its_provider() {
         ),
     )
     .unwrap();
-    fs::write(
+    locked_write(
         &codex,
         format!("#!/bin/sh\nprintf called > '{}'\n", codex_log.display()),
     )
@@ -1039,7 +1079,7 @@ fn agent_event_refreshes_and_reads_topics_only_for_its_provider() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":{"pane":{"agent":"claude","pane_id":"w1:p1"}}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     assert!(!codex_log.exists());
@@ -1072,7 +1112,7 @@ fn install_logged_herdr_and_codex(
             format!("elif [ \"$1 $2\" = \"pane current\" ]; then\n  printf '%s\\n' '{json}'\n")
         })
         .unwrap_or_default();
-    fs::write(
+    locked_write(
         &herdr,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{agents}'\n{pane_current}elif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{scroll}'\nfi\n",
@@ -1083,7 +1123,7 @@ fn install_logged_herdr_and_codex(
         ),
     )
     .unwrap();
-    fs::write(
+    locked_write(
         &codex,
         format!("#!/bin/sh\nprintf called > '{}'\n", codex_log.display()),
     )
@@ -1127,7 +1167,7 @@ fn run_event_binary_with_xdg(
         .env_remove("GROK_AUTH_FILE")
         .env_remove("OPENCODE_API_KEY")
         .env("HERDR_PLUGIN_EVENT_JSON", event_json)
-        .output()
+        .locked_output()
         .unwrap()
 }
 
@@ -1304,7 +1344,7 @@ fn focus_event_uses_its_pane_even_when_the_current_focus_differs() {
             .env("HERDR_PLUGIN_EVENT_JSON", format!(
                 r#"{{"event":"pane_focused","data":{{"type":"pane_focused","pane_id":"{pane_id}","workspace_id":"w1"}}}}"#
             ))
-            .output()
+            .locked_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -1328,7 +1368,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
     let state = tempdir().unwrap();
     let initial_attention =
         r#"{"working":["w5:pB"],"unseen":["w9:p1","w9:p6"],"last_focused":"w5:pB"}"#;
-    fs::write(state.path().join("icon-attention.json"), initial_attention).unwrap();
+    locked_write(state.path().join("icon-attention.json"), initial_attention).unwrap();
     let inventory = r#"{"result":{"agents":[
         {"agent":"codex","pane_id":"w5:pB","agent_status":"working","focused":true,
          "tokens":{"quota_icon_working":"YELLOW","quota_provider":"Codex","quota_provider_model":"Codex"}},
@@ -1343,6 +1383,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
         Some(r#"{"result":{"pane":{"agent":"codex","pane_id":"w5:pB"}}}"#),
     );
     let snapshot = r#"{"result":{"snapshot":{"focused_workspace_id":"w9","focused_tab_id":"w9:t1","focused_pane_id":"w9:p1","workspaces":[{"workspace_id":"w9","active_tab_id":"w9:t1"}],"layouts":[{"workspace_id":"w9","tab_id":"w9:t1","focused_pane_id":"w9:p1"}]}}}"#;
+    let exec_guard = exec_write_guard();
     let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
     writeln!(
         script,
@@ -1350,6 +1391,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
     )
     .unwrap();
     drop(script);
+    drop(exec_guard);
 
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
@@ -1361,7 +1403,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"workspace_focused","data":{"type":"workspace_focused","workspace_id":"w9"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1386,7 +1428,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
         "w9:p1"
     );
 
-    fs::write(state.path().join("icon-attention.json"), initial_attention).unwrap();
+    locked_write(state.path().join("icon-attention.json"), initial_attention).unwrap();
     fs::remove_file(&herdr_log).unwrap();
     let tab_output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
@@ -1398,7 +1440,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"tab_focused","data":{"type":"tab_focused","tab_id":"w9:t1","workspace_id":"w9"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         tab_output.status.success(),
@@ -1416,7 +1458,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
 #[test]
 fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"unseen":["w9:p1"],"last_focused":"w5:pB"}"#,
     )
@@ -1431,6 +1473,7 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
         Some(r#"{"result":{"pane":{"agent":"codex","pane_id":"w9:p1"}}}"#),
     );
     let snapshot = r#"{"result":{"snapshot":{"focused_workspace_id":"w5","focused_tab_id":"w5:t1","workspaces":[{"workspace_id":"w9","active_tab_id":"w9:t1"}],"layouts":[{"tab_id":"w9:t1","focused_pane_id":"w9:p1"}]}}}"#;
+    let exec_guard = exec_write_guard();
     let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
     writeln!(
         script,
@@ -1438,6 +1481,7 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
     )
     .unwrap();
     drop(script);
+    drop(exec_guard);
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
@@ -1448,7 +1492,7 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"workspace_focused","data":{"workspace_id":"w9"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
@@ -1463,7 +1507,7 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
 #[test]
 fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"unseen":["w1:p1","w1:p3"],"last_focused":"w1:p1"}"#,
     )
@@ -1479,6 +1523,7 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
     let (herdr, herdr_log, codex, _) =
         install_logged_herdr_and_codex(state.path(), inventory, None);
     let snapshot = r#"{"result":{"snapshot":{"focused_workspace_id":"w1","focused_tab_id":"w1:t1","focused_pane_id":"w1:p2"}}}"#;
+    let exec_guard = exec_write_guard();
     let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
     writeln!(
         script,
@@ -1486,6 +1531,7 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
     )
     .unwrap();
     drop(script);
+    drop(exec_guard);
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .args([
             "watch",
@@ -1501,7 +1547,7 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
+        .locked_spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut calls = String::new();
@@ -1532,7 +1578,7 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
 #[test]
 fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"unseen":["w1:p1"],"last_focused":"w1:p1"}"#,
     )
@@ -1546,11 +1592,12 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
     let (herdr, herdr_log, codex, _) =
         install_logged_herdr_and_codex(state.path(), inventory, None);
     let snapshot_path = state.path().join("snapshot.json");
-    fs::write(
+    locked_write(
         &snapshot_path,
         r#"{"result":{"snapshot":{"focused_pane_id":"w1:p1"}}}"#,
     )
     .unwrap();
+    let exec_guard = exec_write_guard();
     let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
     writeln!(
         script,
@@ -1559,6 +1606,7 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
     )
     .unwrap();
     drop(script);
+    drop(exec_guard);
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .args([
             "watch",
@@ -1574,7 +1622,7 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
+        .locked_spawn()
         .unwrap();
     let first_poll_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < first_poll_deadline {
@@ -1591,7 +1639,7 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
     }
     thread::sleep(Duration::from_millis(1100));
     let before = fs::read_to_string(&herdr_log).unwrap_or_default();
-    fs::write(
+    locked_write(
         &snapshot_path,
         r#"{"result":{"snapshot":{"focused_pane_id":"w1:p2"}}}"#,
     )
@@ -1647,7 +1695,7 @@ fn focusing_a_done_pane_clears_the_teal_icon_immediately() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p1","workspace_id":"w1"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1680,7 +1728,7 @@ fn focusing_a_done_pane_clears_the_teal_icon_immediately() {
 #[test]
 fn focusing_a_green_pane_clears_it_even_if_inventory_still_says_working() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"unseen":["w1:p1"]}"#,
     )
@@ -1704,7 +1752,7 @@ fn focusing_a_green_pane_clears_it_even_if_inventory_still_says_working() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p1","workspace_id":"w1"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1730,7 +1778,7 @@ fn focusing_a_green_pane_clears_it_even_if_inventory_still_says_working() {
 #[test]
 fn focus_change_clears_only_the_previous_green_pane() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"last_focused":"w1:p1"}"#,
     )
@@ -1762,7 +1810,7 @@ fn focus_change_clears_only_the_previous_green_pane() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p2","workspace_id":"w1"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1809,7 +1857,7 @@ fn focus_change_clears_only_the_previous_green_pane() {
 #[test]
 fn focus_to_a_non_agent_pane_acknowledges_the_previous_agent() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"unseen":["w1:p1"],"last_focused":"w1:p1"}"#,
     )
@@ -1827,7 +1875,7 @@ fn focus_to_a_non_agent_pane_acknowledges_the_previous_agent() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_focused","data":{"pane_id":"w1:p9","workspace_id":"w1"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(herdr_log).unwrap_or_default();
@@ -1870,7 +1918,7 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"codex","agent_status":"idle"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1916,7 +1964,7 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p1","agent":"codex","agent_status":"idle"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1952,7 +2000,7 @@ fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
     let state = tempdir().unwrap();
     // Watch often paints idle-white and clears `$quota_icon_working` before
     // the completion event runs. The working set must still force teal.
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"working":["w1:p2"]}"#,
     )
@@ -1980,7 +2028,7 @@ fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"codex","agent_status":"idle"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -2014,7 +2062,7 @@ fn a_low_quota_notifies_once_and_re_arms_only_after_recovering() {
         r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"test-session"},"tokens":{}}]}}"#,
     );
     fs::create_dir_all(state.path()).unwrap();
-    fs::write(state.path().join("low-quota-alert"), "20%").unwrap();
+    locked_write(state.path().join("low-quota-alert"), "20%").unwrap();
 
     let notifications = || {
         fs::read_to_string(&herdr_log)
@@ -2174,7 +2222,7 @@ impl AgentHomes {
             // from inside a Herdr pane, an inherited path would point the test
             // at the live server and replace its view.
             .env_remove("HERDR_SOCKET_PATH")
-            .output()
+            .locked_output()
             .unwrap()
     }
 
@@ -2320,7 +2368,7 @@ fn an_installer_can_narrow_the_selection_through_the_environment() {
 fn stub_missing_omp_integration(state: &Path) {
     fs::create_dir_all(state).unwrap();
     let herdr = state.join("herdr-absent");
-    fs::write(
+    locked_write(
         &herdr,
         r#"#!/bin/sh
 if [ "$1 $2" = "integration status" ]; then
@@ -2447,8 +2495,8 @@ fn an_installer_can_select_flush_gap_through_the_plugin_config_dir() {
     let homes = AgentHomes::new(root.path());
     let config_dir = root.path().join("plugin-config");
     fs::create_dir_all(&config_dir).unwrap();
-    fs::write(config_dir.join("row-gap"), "0\n").unwrap();
-    fs::write(config_dir.join("sidebar-layout"), "stacked\n").unwrap();
+    locked_write(config_dir.join("row-gap"), "0\n").unwrap();
+    locked_write(config_dir.join("sidebar-layout"), "stacked\n").unwrap();
     let output = homes.configure_with_env(
         &["--apply"],
         &[("HERDR_PLUGIN_CONFIG_DIR", config_dir.to_str().unwrap())],
@@ -2522,7 +2570,7 @@ fn an_installer_can_select_gauges_layout_through_the_plugin_config_dir() {
     let homes = AgentHomes::new(root.path());
     let config_dir = root.path().join("plugin-config");
     fs::create_dir_all(&config_dir).unwrap();
-    fs::write(config_dir.join("sidebar-layout"), "gauges\n").unwrap();
+    locked_write(config_dir.join("sidebar-layout"), "gauges\n").unwrap();
     let output = homes.configure_with_env(
         &["--apply"],
         &[("HERDR_PLUGIN_CONFIG_DIR", config_dir.to_str().unwrap())],
@@ -2544,7 +2592,7 @@ fn a_full_uninstall_of_a_gauges_install_restores_the_original_config() {
     let homes = AgentHomes::new(root.path());
     let terminal_config = root.path().join(".config/ghostty/config");
     fs::create_dir_all(terminal_config.parent().unwrap()).unwrap();
-    fs::write(&terminal_config, "# my terminal\n").unwrap();
+    locked_write(&terminal_config, "# my terminal\n").unwrap();
     let font_dir = if cfg!(target_os = "macos") {
         root.path().join("Library/Fonts")
     } else {
@@ -2558,7 +2606,7 @@ fn a_full_uninstall_of_a_gauges_install_restores_the_original_config() {
         "rows = [\n    [\"state_icon\", \"machine\"],\n    [\"agent\"],\n]\n",
     );
     fs::create_dir_all(homes.herdr_config.parent().unwrap()).unwrap();
-    fs::write(&homes.herdr_config, original).unwrap();
+    locked_write(&homes.herdr_config, original).unwrap();
 
     assert!(homes
         .configure(&["--apply", "--sidebar-layout", "gauges"])
@@ -2624,7 +2672,7 @@ fn install_pi_store(
 }
 
 fn write_pi_models_store(agent: &Path, provider: &str, model: &str, context_window: u64) {
-    fs::write(
+    locked_write(
         agent.join("models-store.json"),
         serde_json::json!({
             provider: {
@@ -2639,7 +2687,7 @@ fn write_pi_models_store(agent: &Path, provider: &str, model: &str, context_wind
 fn write_codex_auth(state: &Path, account_id: &str) -> PathBuf {
     let home = state.join("codex-home");
     fs::create_dir_all(&home).unwrap();
-    fs::write(
+    locked_write(
         home.join("auth.json"),
         serde_json::json!({"tokens": {"account_id": account_id}}).to_string(),
     )
@@ -2694,7 +2742,7 @@ fn run_pi_event(
         .env_remove("GROK_AUTH_FILE")
         .env_remove("OPENCODE_API_KEY")
         .env("HERDR_PLUGIN_EVENT_JSON", pi_working_event())
-        .output()
+        .locked_output()
         .unwrap()
 }
 
@@ -2725,7 +2773,7 @@ fn a_manual_refresh_reads_no_pane_at_all() {
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -2753,7 +2801,7 @@ fn a_quota_less_pane_still_gets_its_brand_icon_on_refresh() {
         .args(["refresh", "--provider", "claude"])
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .env("HERDR_BIN_PATH", &herdr)
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(herdr_log).unwrap_or_default();
@@ -3135,4 +3183,173 @@ fn configure_defaults_to_identity_rows_and_can_restore_the_usage_rows() {
     let sidebar = homes.sidebar();
     assert!(!sidebar.contains("toggle-order"), "{sidebar}");
     assert!(!sidebar.contains("$al_"), "{sidebar}");
+}
+
+fn looked_rows(
+    input: &str,
+    group: herdr_agent_quota::look::GroupStyle,
+    logos: herdr_agent_quota::look::LogoLayout,
+) -> String {
+    herdr_agent_quota::configure::herdr::add_sidebar_rows_look(
+        input,
+        &AgentSelection::SUPPORTED,
+        herdr_agent_quota::cli::SidebarLayout::Gauges,
+        herdr_agent_quota::cli::SidebarRowGap::default(),
+        herdr_agent_quota::cli::FieldSet::all(),
+        herdr_agent_quota::cli::BrandColors::On,
+        herdr_agent_quota::cli::AgentOrder::Quota,
+        herdr_agent_quota::cli::SidebarRows::Identity,
+        herdr_agent_quota::configure::herdr::RowLook { group, logos },
+    )
+    .unwrap()
+}
+
+const EVERY_GROUP: [herdr_agent_quota::look::GroupStyle; 4] = [
+    herdr_agent_quota::look::GroupStyle::Plain,
+    herdr_agent_quota::look::GroupStyle::Rule,
+    herdr_agent_quota::look::GroupStyle::Count,
+    herdr_agent_quota::look::GroupStyle::Bar,
+];
+const EVERY_LOGO: [herdr_agent_quota::look::LogoLayout; 3] = [
+    herdr_agent_quota::look::LogoLayout::None,
+    herdr_agent_quota::look::LogoLayout::Inline,
+    herdr_agent_quota::look::LogoLayout::SecondRow,
+];
+
+#[test]
+fn every_candidate_look_writes_the_rows_it_promises() {
+    use herdr_agent_quota::look::{GroupStyle, LogoLayout};
+    let plain = managed_rows(&looked_rows("", GroupStyle::Plain, LogoLayout::None));
+    assert_eq!(
+        plain,
+        managed_rows(&identity_rows(
+            "",
+            herdr_agent_quota::cli::AgentOrder::Quota
+        ))
+    );
+
+    let rule = managed_rows(&looked_rows("", GroupStyle::Rule, LogoLayout::Inline));
+    assert_eq!(rule[0], ["$quota_group"]);
+    // Codex's two candidates have no gap row; only the count candidate does.
+    assert_ne!(rule.last().unwrap(), &["$al_gap"]);
+    let count = managed_rows(&looked_rows("", GroupStyle::Count, LogoLayout::None));
+    assert_eq!(count.last().unwrap(), &["$al_gap"]);
+    assert_eq!(
+        rule[1],
+        [
+            "$quota_icon",
+            "$quota_icon_working",
+            "$quota_icon_done",
+            "$al_channel",
+            "$al_model_mark",
+            "state_text",
+            "$al_space",
+            "tab"
+        ]
+    );
+    assert!(looked_rows("", GroupStyle::Rule, LogoLayout::None).contains("fg = \"#89b4fa\""));
+    // Only the harness mark carries status colour: channel and model marks
+    // are the neutral grey in every layout.
+    for logos in [LogoLayout::Inline, LogoLayout::SecondRow] {
+        let rendered = looked_rows("", GroupStyle::Plain, logos);
+        for token in ["$al_channel", "$al_model_mark"] {
+            let styled = format!("token = \"{token}\", fg = \"#a6adc8\"");
+            assert!(rendered.contains(&styled), "{logos:?} {token}: {rendered}");
+        }
+    }
+
+    let second = managed_rows(&looked_rows("", GroupStyle::Bar, LogoLayout::SecondRow));
+    assert_eq!(second[0], ["$quota_group"]);
+    assert_eq!(
+        second[2],
+        ["$al_role", "$al_channel", "$al_model_mark", "$al_model"]
+    );
+}
+
+#[test]
+fn every_candidate_look_is_idempotent_and_uninstalls_to_stock_rows() {
+    let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
+    for group in EVERY_GROUP {
+        for logos in EVERY_LOGO {
+            let applied = looked_rows(original, group, logos);
+            assert_eq!(
+                looked_rows(&applied, group, logos),
+                applied,
+                "{group:?}/{logos:?}"
+            );
+            // Switching to another look rewrites cleanly.
+            assert_eq!(
+                looked_rows(
+                    &applied,
+                    herdr_agent_quota::look::GroupStyle::Plain,
+                    herdr_agent_quota::look::LogoLayout::None
+                ),
+                looked_rows(
+                    original,
+                    herdr_agent_quota::look::GroupStyle::Plain,
+                    herdr_agent_quota::look::LogoLayout::None
+                ),
+                "{group:?}/{logos:?}"
+            );
+            let removed = remove_quota_row(&applied).unwrap();
+            assert_eq!(
+                removed,
+                "[ui]\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
+                "{group:?}/{logos:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn configure_stores_the_candidate_look() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+    let prefs = root.path().join("plugin-config");
+    fs::create_dir_all(&prefs).unwrap();
+    let prefs = prefs.to_str().unwrap();
+    let output = homes.configure_with_env(
+        &[
+            "--apply",
+            "--sidebar-rows",
+            "identity",
+            "--group-style",
+            "count",
+            "--logo-layout",
+            "second-row",
+        ],
+        &[("HERDR_PLUGIN_CONFIG_DIR", prefs)],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("plugin-config/group-style"))
+            .unwrap()
+            .trim(),
+        "count"
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("plugin-config/logo-layout"))
+            .unwrap()
+            .trim(),
+        "second-row"
+    );
+    let sidebar = homes.sidebar();
+    assert!(sidebar.contains("$al_gap"), "{sidebar}");
+    assert!(sidebar.contains("$al_model_mark"), "{sidebar}");
+    // A bare repair keeps the stored look.
+    assert!(homes
+        .configure_with_env(
+            &["--apply"],
+            &[
+                ("HERDR_PLUGIN_CONFIG_DIR", prefs),
+                ("HERDR_AGENT_QUOTA_SIDEBAR_ROWS", "")
+            ]
+        )
+        .status
+        .success());
+    assert_eq!(homes.sidebar(), sidebar);
 }

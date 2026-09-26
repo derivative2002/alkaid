@@ -59,6 +59,19 @@ pub fn for_harness(harness: Harness) -> &'static str {
     }
 }
 
+/// The harness mark alone, in a style: with logos on, a DS base still shows
+/// Claude Code here and the whale moves to the model mark.
+pub fn for_harness_styled(harness: Harness, style: IconStyle) -> &'static str {
+    match style {
+        IconStyle::Glyph => for_harness(harness),
+        IconStyle::Letter => match harness {
+            Harness::Claude => "CC",
+            Harness::Codex => "CX",
+            Harness::Cursor => "CU",
+        },
+    }
+}
+
 /// Does this model short name belong to a DeepSeek base?
 ///
 /// The short name comes from the pane label's model segment (naming-spec §5).

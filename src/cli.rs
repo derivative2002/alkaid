@@ -132,6 +132,20 @@ pub enum Command {
         /// letter (two-letter ASCII badges for a terminal without that face).
         #[arg(long, value_parser = parse_icon_style)]
         icon_style: Option<crate::icons::IconStyle>,
+        /// Space header in the identity rows: plain (default), rule, count
+        /// or bar. Candidates for the owner (0927); plain is round two.
+        #[arg(long, value_enum)]
+        group_style: Option<crate::look::GroupStyle>,
+        /// Harness / channel / model marks: none (default), inline (all
+        /// three on the first row) or second-row (channel and model beside
+        /// the role).
+        #[arg(long, value_enum)]
+        logo_layout: Option<crate::look::LogoLayout>,
+        /// First-row mark of a DeepSeek-base Claude Code seat under a logo
+        /// layout: launcher (default, the Claude mark; the whale is the model
+        /// mark) or base (the whale, as in round two).
+        #[arg(long, value_enum)]
+        ds_mark: Option<crate::look::DsMark>,
     },
     /// Switch the Agent panel between Space grouping and the attention order.
     ///
@@ -492,6 +506,9 @@ pub struct ConfigureOptions {
     pub low_quota_alert: Option<LowQuotaAlert>,
     pub sidebar_rows: Option<SidebarRows>,
     pub icon_style: Option<crate::icons::IconStyle>,
+    pub group_style: Option<crate::look::GroupStyle>,
+    pub logo_layout: Option<crate::look::LogoLayout>,
+    pub ds_mark: Option<crate::look::DsMark>,
 }
 
 /// Which side of a quota window a percentage reports.
