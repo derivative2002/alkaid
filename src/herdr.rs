@@ -1691,14 +1691,18 @@ fn apply_logos(
         ),
         None => desired.remove(CHANNEL_TOKEN),
     };
-    // The model the pane's own session reported (`quota_model`: Claude Code
-    // statusLine per session, Codex config for a session-less snapshot),
-    // never the label's model segment — that is a naming snapshot, and a
-    // Codex coordinator writes `codex-home` there. Nothing reported, no mark.
-    let model = desired
-        .get("quota_model")
-        .map(String::as_str)
-        .unwrap_or_default();
+    // The model the pane's own session reported (`quota_model`, per session
+    // from the Claude Code statusLine), never the label's model segment —
+    // that is a naming snapshot, and a Codex coordinator writes `codex-home`
+    // there. Only a pane with its own agent session counts: a session-less
+    // pane can still hold a `quota_model` an older build borrowed (0927: two
+    // such panes showed another seat's "Fable 5.1"). Nothing reported, no
+    // mark.
+    let model = match pane.session {
+        Some(_) => desired.get("quota_model").map(String::as_str),
+        None => None,
+    }
+    .unwrap_or_default();
     match crate::look::model_family(model) {
         Some(family) => desired.insert(
             MODEL_MARK_TOKEN.to_string(),
@@ -2259,7 +2263,12 @@ mod tests {
     #[test]
     fn logos_show_harness_channel_and_model_and_keep_the_star_for_a_ds_base() {
         use crate::look::{GroupStyle, LogoLayout};
-        let pane = attention_pane("w2:p1", "055", AgentStatus::Working);
+        let mut pane = attention_pane("w2:p1", "055", AgentStatus::Working);
+        let sessionless = pane.clone();
+        pane.session = Some(AgentSession {
+            kind: None,
+            value: "s-demo".to_string(),
+        });
         let look = looked(
             GroupStyle::Plain,
             LogoLayout::Inline,
@@ -2320,6 +2329,10 @@ mod tests {
             assert!(!desired.contains_key(CHANNEL_TOKEN), "{label_model}");
             assert!(!desired.contains_key(MODEL_MARK_TOKEN), "{label_model}");
         }
+        // A session-less pane's preserved `quota_model` is not evidence.
+        let mut desired = BTreeMap::from([("quota_model".to_string(), "Fable 5.1".to_string())]);
+        apply_logos(&mut desired, &sessionless, &look, Some(&channels));
+        assert!(!desired.contains_key(MODEL_MARK_TOKEN));
         // An unset base URL outside an official lane is not official.
         let bare = BTreeMap::from([("w2:p1".to_string(), process(None, false))]);
         let mut desired = BTreeMap::new();
