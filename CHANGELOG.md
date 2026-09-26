@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Identity rows are the new default (`--sidebar-rows identity`): per seat the
+  brand icon, the action state, the Tab (header label), then role and model
+  short name parsed from the pane label, then the session name (the pane
+  label itself). No usage rows; `--sidebar-rows quota` brings the earlier
+  rows back, and quota keeps being collected and published either way.
+- `toggle-order` action, bound to prefix+shift+o: switches the Agent panel
+  between Space grouping and the attention order in about 0.1 s and
+  republishes from cache in under a second, without touching config.
+- Cursor Agent panes get their brand icon and identity rows (no quota
+  collector); DeepSeek-based seats show the whale from the bundled icon face;
+  `--icon-style letter` swaps every mark for a two-letter badge.
+
 - `--agent-order attention` lists agents across Spaces instead of by Space:
   blocked and unseen completions first, then working, then idle, and least
   quota left first inside each band. It is a plugin-owned Herdr agent view

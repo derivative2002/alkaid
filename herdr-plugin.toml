@@ -17,6 +17,11 @@ title = "Refresh agent quota"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" refresh --provider all --force"]
 
 [[actions]]
+id = "toggle-order"
+title = "Agent panel: toggle Space grouping / attention order"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" toggle-order"]
+
+[[actions]]
 id = "configure"
 title = "Install / repair agent quota"
 command = ["sh", "-c", "\"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" configure --apply && herdr server reload-config && exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-agent-quota\" startup --provider all"]

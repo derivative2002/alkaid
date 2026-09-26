@@ -14,7 +14,7 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 34] = [
+const METADATA_TOKEN_NAMES: [&str; 37] = [
     "quota_group",
     "quota_pad",
     "quota_icon",
@@ -49,7 +49,19 @@ const METADATA_TOKEN_NAMES: [&str; 34] = [
     "quota_topic",
     "quota_error",
     HEADROOM_TOKEN,
+    ROLE_TOKEN,
+    MODEL_TOKEN,
+    SPACE_TOKEN,
 ];
+/// Seat role parsed from the pane label (naming-spec §5): 统筹 / 秘书 / hub /
+/// spoke / subhub / svc. Changes only when the label does.
+pub(crate) const ROLE_TOKEN: &str = "al_role";
+/// The pane label's model segment, verbatim. Never read from
+/// `quota_provider_model`, which can carry a borrowed provider-level model.
+pub(crate) const MODEL_TOKEN: &str = "al_model";
+/// The Space name on each seat, published only when the panel is not
+/// grouped by Space — grouped, the `$quota_group` header already says it.
+pub(crate) const SPACE_TOKEN: &str = "al_space";
 /// Sort key for Herdr's Agent view: remaining quota as a zero-padded percent
 /// (`007`), so Herdr's ordering of the token values is also their numeric
 /// ordering.
@@ -548,6 +560,9 @@ pub fn focused_pane_in_snapshot(
 // terminal. Only the pane that fired the event is worth that cost; every other
 // pane keeps the topic it last published.
 pub fn refresh_pane_topic(pane: &mut AgentPane) {
+    if !reads_screen_topic(pane.harness) {
+        return;
+    }
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
     if let Some(topic) = read_pane_topic(&executable, pane) {
         pane.topic = topic;
@@ -767,7 +782,13 @@ pub fn publish_icon_tokens(panes: &[AgentPane], sequence: u64) -> Result<()> {
     let mut failed = Vec::new();
     for pane in panes {
         let mut desired = pane.tokens.clone();
-        apply_group_and_icon(&mut desired, pane, &group_heads, &BTreeMap::new());
+        apply_group_and_icon(
+            &mut desired,
+            pane,
+            &group_heads,
+            &BTreeMap::new(),
+            crate::icons::IconStyle::installed(),
+        );
         if icon_tokens_match(&pane.tokens, &desired) {
             continue;
         }
@@ -804,6 +825,14 @@ fn publish_pane_tokens_inner(
     };
     let order = installed_agent_order();
     let group_heads = space_group_heads(order, &inventory, panes, tokens);
+    let style = crate::icons::IconStyle::installed();
+    // One metadata-only read per pass. A failed read preserves whatever
+    // identity the panes already show rather than clearing it.
+    let pane_labels = if panes.is_empty() {
+        None
+    } else {
+        list_pane_labels().ok()
+    };
     let mut reported = 0usize;
     let mut failed = Vec::new();
     for pane in panes {
@@ -823,8 +852,15 @@ fn publish_pane_tokens_inner(
             apply_context(&mut desired, context, sequence / 1_000, row);
         }
         fold_cache_row(&mut desired, row);
-        apply_group_and_icon(&mut desired, pane, &group_heads, &workspace_labels);
-        let labels = label_change(pane, order);
+        apply_seat_identity(
+            &mut desired,
+            pane,
+            pane_labels.as_ref(),
+            order,
+            &workspace_labels,
+        );
+        apply_group_and_icon(&mut desired, pane, &group_heads, &workspace_labels, style);
+        let labels = label_change(pane);
         if metadata_matches(&pane.tokens, &desired) && labels == LabelChange::Keep {
             continue;
         }
@@ -940,7 +976,6 @@ fn report_pane_metadata(
 fn state_label_args(labels: LabelChange) -> Vec<String> {
     match labels {
         LabelChange::Keep => Vec::new(),
-        LabelChange::Clear => vec!["--clear-state-labels".to_string()],
         LabelChange::Write => ATTENTION_STATE_LABELS
             .into_iter()
             .flat_map(|(status, text)| ["--state-label".to_string(), format!("{status}={text}")])
@@ -1041,6 +1076,89 @@ fn workspace_id_from_pane_id(pane_id: &str) -> Option<String> {
 }
 
 /// Workspace id → label from one `herdr workspace list` call.
+/// Role, model short name and (ungrouped) Space for one seat.
+///
+/// `pane_labels` is `None` when the label read failed: then the identity
+/// already on the pane is kept, never cleared. A label that is present but
+/// off-spec clears it — that is "not reported", not a failed read.
+fn apply_seat_identity(
+    desired: &mut BTreeMap<String, String>,
+    pane: &AgentPane,
+    pane_labels: Option<&BTreeMap<String, String>>,
+    order: crate::cli::AgentOrder,
+    workspace_labels: &BTreeMap<String, String>,
+) {
+    match pane_labels {
+        Some(labels) => {
+            let identity = labels
+                .get(&pane.pane_id)
+                .map(|label| crate::identity::from_label(label))
+                .unwrap_or_default();
+            for (name, value) in [(ROLE_TOKEN, identity.role), (MODEL_TOKEN, identity.model)] {
+                if value.is_empty() {
+                    desired.remove(name);
+                } else {
+                    desired.insert(name.to_string(), value);
+                }
+            }
+        }
+        None => {
+            for name in [ROLE_TOKEN, MODEL_TOKEN] {
+                match pane.tokens.get(name) {
+                    Some(value) => desired.insert(name.to_string(), value.clone()),
+                    None => desired.remove(name),
+                };
+            }
+        }
+    }
+    let space = (!order.groups_by_space())
+        .then(|| workspace_labels.get(&pane.workspace_id))
+        .flatten()
+        .filter(|label| !label.is_empty());
+    match space {
+        Some(label) => desired.insert(SPACE_TOKEN.to_string(), label.clone()),
+        None => desired.remove(SPACE_TOKEN),
+    };
+}
+
+/// Pane id → label from one `herdr pane list` call. Metadata only: this
+/// reads no terminal output and repaints nothing.
+fn list_pane_labels() -> Result<BTreeMap<String, String>> {
+    let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
+    let output = Command::new(&executable)
+        .args(["pane", "list"])
+        .output()
+        .context("list Herdr panes")?;
+    if !output.status.success() {
+        anyhow::bail!("Herdr pane list failed with {}", output.status);
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).context("parse pane list")?;
+    let mut labels = BTreeMap::new();
+    collect_pane_labels(&value, &mut labels);
+    Ok(labels)
+}
+
+fn collect_pane_labels(value: &Value, labels: &mut BTreeMap<String, String>) {
+    match value {
+        Value::Object(map) => {
+            let id = map.get("pane_id").and_then(Value::as_str);
+            let label = map.get("label").and_then(Value::as_str);
+            if let (Some(id), Some(label)) = (id, label) {
+                labels.insert(id.to_string(), label.to_string());
+            }
+            for child in map.values() {
+                collect_pane_labels(child, labels);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_pane_labels(child, labels);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn list_workspace_labels() -> Result<BTreeMap<String, String>> {
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
     let output = Command::new(&executable)
@@ -1219,21 +1337,21 @@ fn state_labels_current(labels: &BTreeMap<String, String>) -> bool {
 
 /// The label change a publish owes this pane, if any.
 ///
-/// Under the attention order the labels are wanted; otherwise only a set that
-/// is exactly ours is cleared, so labels another source wrote survive.
+/// The labels are wanted in every order: the identity rows lead with
+/// `state_text` in both, so the rows need no rewrite when the order toggles.
+/// Herdr cannot hide a label cleanly (an empty one is rejected, a zero-width
+/// one leaves a stray ` · ` separator), so grouped panels show it too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LabelChange {
     Keep,
     Write,
-    Clear,
 }
 
-fn label_change(pane: &AgentPane, order: crate::cli::AgentOrder) -> LabelChange {
-    let ours = state_labels_current(&pane.state_labels);
-    match (order.groups_by_space(), ours) {
-        (false, false) => LabelChange::Write,
-        (true, true) => LabelChange::Clear,
-        _ => LabelChange::Keep,
+fn label_change(pane: &AgentPane) -> LabelChange {
+    if state_labels_current(&pane.state_labels) {
+        LabelChange::Keep
+    } else {
+        LabelChange::Write
     }
 }
 
@@ -1278,8 +1396,16 @@ fn apply_group_and_icon(
     pane: &AgentPane,
     group_heads: &BTreeMap<String, String>,
     workspace_labels: &BTreeMap<String, String>,
+    style: crate::icons::IconStyle,
 ) {
-    let glyph = crate::icons::for_harness(pane.harness);
+    // The model segment this pass is about to publish, else the one already
+    // on the pane: an icon-only pass must not swap a whale back to a star.
+    let model = desired
+        .get(MODEL_TOKEN)
+        .or_else(|| pane.tokens.get(MODEL_TOKEN))
+        .map(String::as_str)
+        .unwrap_or_default();
+    let glyph = crate::icons::for_pane(pane.harness, model, style);
     let member = !pane.workspace_id.is_empty()
         && group_heads
             .get(&pane.workspace_id)
@@ -1665,6 +1791,14 @@ fn topic_read_args(pane_id: &str) -> [&str; 7] {
     ]
 }
 
+/// Only harnesses whose prompt line [`prompt_candidate`] recognises are ever
+/// read. Checked before the read, not after: `pane read` itself is the cost
+/// (CLAUDE.md, "reading or writing a pane is not free"), and a Cursor pane's
+/// evidence lives in its own session files, not on screen.
+fn reads_screen_topic(harness: Harness) -> bool {
+    matches!(harness, Harness::Claude | Harness::Codex)
+}
+
 fn read_pane_topic(executable: &std::ffi::OsStr, pane: &AgentPane) -> Option<String> {
     let output = Command::new(executable)
         .args(topic_read_args(&pane.pane_id))
@@ -1807,24 +1941,14 @@ mod tests {
     }
 
     #[test]
-    fn labels_are_written_once_under_attention_and_cleared_only_if_ours() {
-        use crate::cli::AgentOrder;
+    fn labels_are_written_once_whatever_the_order() {
         let mut pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
-        assert_eq!(
-            label_change(&pane, AgentOrder::Attention),
-            LabelChange::Write
-        );
-        assert_eq!(label_change(&pane, AgentOrder::Quota), LabelChange::Keep);
+        assert_eq!(label_change(&pane), LabelChange::Write);
         pane.state_labels = our_labels();
         // Read back unchanged: no write, which is what keeps a refresh silent.
-        assert_eq!(
-            label_change(&pane, AgentOrder::Attention),
-            LabelChange::Keep
-        );
-        assert_eq!(label_change(&pane, AgentOrder::Quota), LabelChange::Clear);
-        assert_eq!(label_change(&pane, AgentOrder::Default), LabelChange::Clear);
+        assert_eq!(label_change(&pane), LabelChange::Keep);
         pane.state_labels = BTreeMap::from([("done".to_string(), "fin".to_string())]);
-        assert_eq!(label_change(&pane, AgentOrder::Quota), LabelChange::Keep);
+        assert_eq!(label_change(&pane), LabelChange::Write);
     }
 
     #[test]
@@ -1846,10 +1970,6 @@ mod tests {
                 "idle=[空闲]",
                 "unknown=[未报]",
             ]
-        );
-        assert_eq!(
-            state_label_args(LabelChange::Clear),
-            ["--clear-state-labels"]
         );
         assert!(state_label_args(LabelChange::Keep).is_empty());
     }
@@ -1878,7 +1998,13 @@ mod tests {
         for pane in [&tight, &loose] {
             let mut desired = pane.tokens.clone();
             desired.insert("quota_group".to_string(), "玉衡".to_string());
-            apply_group_and_icon(&mut desired, pane, &flat, &labels);
+            apply_group_and_icon(
+                &mut desired,
+                pane,
+                &flat,
+                &labels,
+                crate::icons::IconStyle::Glyph,
+            );
             assert!(!desired.contains_key("quota_group"));
             let icon = desired.get(pane.icon_status().icon_token()).unwrap();
             assert!(!icon.starts_with(GROUP_MEMBER_INDENT));
@@ -1897,7 +2023,13 @@ mod tests {
         let render = |order| {
             let heads = space_group_heads(order, &inventory, &inventory, &[]);
             let mut desired = pane.tokens.clone();
-            apply_group_and_icon(&mut desired, &pane, &heads, &labels);
+            apply_group_and_icon(
+                &mut desired,
+                &pane,
+                &heads,
+                &labels,
+                crate::icons::IconStyle::Glyph,
+            );
             desired
         };
         let grouped = render(AgentOrder::Quota);
@@ -1908,6 +2040,182 @@ mod tests {
             }
             assert_eq!(grouped.get(name), flat.get(name), "{name} moved");
         }
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(id, label)| (id.to_string(), label.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn seat_identity_comes_from_the_pane_label() {
+        use crate::cli::AgentOrder;
+        let pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
+        let panes = labels(&[("w1:p1", "hub.alioth.统筹.0925-2307.opus-5-5@cpu-box")]);
+        let mut desired = BTreeMap::new();
+        apply_seat_identity(
+            &mut desired,
+            &pane,
+            Some(&panes),
+            AgentOrder::Quota,
+            &BTreeMap::new(),
+        );
+        assert_eq!(desired.get(ROLE_TOKEN).map(String::as_str), Some("统筹"));
+        assert_eq!(
+            desired.get(MODEL_TOKEN).map(String::as_str),
+            Some("opus-5-5")
+        );
+        assert!(!desired.contains_key(SPACE_TOKEN));
+    }
+
+    #[test]
+    fn the_model_is_never_taken_from_the_provider_model_token() {
+        use crate::cli::AgentOrder;
+        let mut pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
+        pane.tokens.insert(
+            "quota_provider_model".to_string(),
+            "Claude/Fable 5.1".to_string(),
+        );
+        // A label without a model segment reports no model at all.
+        let panes = labels(&[("w1:p1", "spk.lab.起服.0926-0100@cpu-box")]);
+        let mut desired = pane.tokens.clone();
+        apply_seat_identity(
+            &mut desired,
+            &pane,
+            Some(&panes),
+            AgentOrder::Quota,
+            &BTreeMap::new(),
+        );
+        assert_eq!(desired.get(ROLE_TOKEN).map(String::as_str), Some("spoke"));
+        assert!(!desired.contains_key(MODEL_TOKEN));
+    }
+
+    #[test]
+    fn a_failed_label_read_preserves_and_an_off_spec_label_clears() {
+        use crate::cli::AgentOrder;
+        let mut pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
+        pane.tokens
+            .insert(ROLE_TOKEN.to_string(), "hub".to_string());
+        pane.tokens
+            .insert(MODEL_TOKEN.to_string(), "opus-5-5".to_string());
+        let mut kept = BTreeMap::new();
+        apply_seat_identity(&mut kept, &pane, None, AgentOrder::Quota, &BTreeMap::new());
+        assert_eq!(kept.get(ROLE_TOKEN).map(String::as_str), Some("hub"));
+        assert_eq!(kept.get(MODEL_TOKEN).map(String::as_str), Some("opus-5-5"));
+
+        let panes = labels(&[("w1:p1", "1")]);
+        let mut cleared = pane.tokens.clone();
+        apply_seat_identity(
+            &mut cleared,
+            &pane,
+            Some(&panes),
+            AgentOrder::Quota,
+            &BTreeMap::new(),
+        );
+        assert!(!cleared.contains_key(ROLE_TOKEN));
+        assert!(!cleared.contains_key(MODEL_TOKEN));
+    }
+
+    #[test]
+    fn the_space_name_rides_on_each_seat_only_when_not_grouped() {
+        use crate::cli::AgentOrder;
+        let pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
+        let spaces = labels(&[("w1", "玉衡")]);
+        let mut flat = BTreeMap::new();
+        apply_seat_identity(
+            &mut flat,
+            &pane,
+            Some(&BTreeMap::new()),
+            AgentOrder::Attention,
+            &spaces,
+        );
+        assert_eq!(flat.get(SPACE_TOKEN).map(String::as_str), Some("玉衡"));
+        let mut grouped = flat.clone();
+        apply_seat_identity(
+            &mut grouped,
+            &pane,
+            Some(&BTreeMap::new()),
+            AgentOrder::Quota,
+            &spaces,
+        );
+        assert!(!grouped.contains_key(SPACE_TOKEN));
+    }
+
+    #[test]
+    fn a_deepseek_seat_shows_the_whale_and_keeps_it_on_icon_only_passes() {
+        let mut pane = attention_pane("w1:p1", "050", AgentStatus::Working);
+        let mut desired = BTreeMap::from([(MODEL_TOKEN.to_string(), "ds-v4-1-flash".to_string())]);
+        apply_group_and_icon(
+            &mut desired,
+            &pane,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            crate::icons::IconStyle::Glyph,
+        );
+        assert_eq!(
+            desired.get("quota_icon_working").map(String::as_str),
+            Some("\u{e1ad}")
+        );
+        // Focus / watcher passes start from the pane's tokens only.
+        pane.tokens
+            .insert(MODEL_TOKEN.to_string(), "ds-v4-1-flash".to_string());
+        let mut icon_only = BTreeMap::new();
+        apply_group_and_icon(
+            &mut icon_only,
+            &pane,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            crate::icons::IconStyle::Glyph,
+        );
+        assert_eq!(
+            icon_only.get("quota_icon_working").map(String::as_str),
+            Some("\u{e1ad}")
+        );
+        let mut letters = BTreeMap::new();
+        apply_group_and_icon(
+            &mut letters,
+            &pane,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            crate::icons::IconStyle::Letter,
+        );
+        assert_eq!(
+            letters.get("quota_icon_working").map(String::as_str),
+            Some("DS")
+        );
+    }
+
+    #[test]
+    fn pane_labels_are_read_from_the_pane_list() {
+        let value = serde_json::json!({"result": {"panes": [
+            {"pane_id": "w1:p1", "workspace_id": "w1", "label": "hub.alioth.统筹.0925-2307.opus-5-5@cpu-box"},
+            {"pane_id": "w1:p2", "workspace_id": "w1"}
+        ]}});
+        let mut found = BTreeMap::new();
+        collect_pane_labels(&value, &mut found);
+        assert_eq!(found.len(), 1);
+        assert!(found["w1:p1"].starts_with("hub.alioth."));
+    }
+
+    #[test]
+    fn a_cursor_pane_is_never_read_for_a_topic() {
+        assert!(!reads_screen_topic(Harness::Cursor));
+        assert!(reads_screen_topic(Harness::Claude));
+        assert!(reads_screen_topic(Harness::Codex));
+    }
+
+    #[test]
+    fn a_cursor_pane_is_listed_for_its_icon_but_bills_nothing() {
+        let value = serde_json::json!({"result": {"agents": [
+            {"agent": "cursor", "pane_id": "w3:p1", "agent_status": "idle"}
+        ]}});
+        let mut panes = Vec::new();
+        collect_agent_panes(&value, &mut panes);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].harness, Harness::Cursor);
+        assert_eq!(Harness::Cursor.billing(), None);
     }
 
     #[test]
@@ -2004,14 +2312,26 @@ mod tests {
 
         let labels = BTreeMap::from([("w1".to_string(), "ifs".to_string())]);
         let mut head_desired = BTreeMap::new();
-        apply_group_and_icon(&mut head_desired, &head, &heads, &labels);
+        apply_group_and_icon(
+            &mut head_desired,
+            &head,
+            &heads,
+            &labels,
+            crate::icons::IconStyle::Glyph,
+        );
         assert_eq!(
             head_desired.get("quota_group").map(String::as_str),
             Some("ifs")
         );
 
         let mut sibling_desired = sibling.tokens.clone();
-        apply_group_and_icon(&mut sibling_desired, &sibling, &heads, &labels);
+        apply_group_and_icon(
+            &mut sibling_desired,
+            &sibling,
+            &heads,
+            &labels,
+            crate::icons::IconStyle::Glyph,
+        );
         assert!(!sibling_desired.contains_key("quota_group"));
         assert!(
             sibling_desired
@@ -2049,7 +2369,13 @@ mod tests {
             ("quota_icon".to_string(), "stale".to_string()),
             ("quota_icon_done".to_string(), "stale".to_string()),
         ]);
-        apply_group_and_icon(&mut working_desired, &working, &heads, &labels);
+        apply_group_and_icon(
+            &mut working_desired,
+            &working,
+            &heads,
+            &labels,
+            crate::icons::IconStyle::Glyph,
+        );
         assert!(
             working_desired
                 .get("quota_icon_working")
@@ -2062,7 +2388,13 @@ mod tests {
         let mut done = sibling.clone();
         done.status = AgentStatus::Done;
         let mut done_desired = BTreeMap::new();
-        apply_group_and_icon(&mut done_desired, &done, &heads, &labels);
+        apply_group_and_icon(
+            &mut done_desired,
+            &done,
+            &heads,
+            &labels,
+            crate::icons::IconStyle::Glyph,
+        );
         assert!(done_desired.contains_key("quota_icon_done"));
         assert!(!done_desired.contains_key("quota_icon"));
         assert!(!done_desired.contains_key("quota_icon_working"));
@@ -2071,7 +2403,13 @@ mod tests {
         let mut seen = done.clone();
         seen.focused = true;
         let mut seen_desired = BTreeMap::new();
-        apply_group_and_icon(&mut seen_desired, &seen, &heads, &labels);
+        apply_group_and_icon(
+            &mut seen_desired,
+            &seen,
+            &heads,
+            &labels,
+            crate::icons::IconStyle::Glyph,
+        );
         assert!(
             seen_desired.contains_key("quota_icon_done"),
             "focused completion stays teal until the focus hook acknowledges it"
@@ -2085,7 +2423,13 @@ mod tests {
         other.status = AgentStatus::Done;
         other.focused = false;
         let mut other_desired = BTreeMap::new();
-        apply_group_and_icon(&mut other_desired, &other, &heads, &labels);
+        apply_group_and_icon(
+            &mut other_desired,
+            &other,
+            &heads,
+            &labels,
+            crate::icons::IconStyle::Glyph,
+        );
         assert!(
             other_desired.contains_key("quota_icon_done"),
             "unfocused completion keeps teal until that pane is focused"
@@ -2101,7 +2445,13 @@ mod tests {
             .tokens
             .insert("quota_icon_done".to_string(), "teal".to_string());
         let mut stale_desired = BTreeMap::new();
-        apply_group_and_icon(&mut stale_desired, &stale_token, &heads, &labels);
+        apply_group_and_icon(
+            &mut stale_desired,
+            &stale_token,
+            &heads,
+            &labels,
+            crate::icons::IconStyle::Glyph,
+        );
         assert!(
             stale_desired.contains_key("quota_icon"),
             "idle + leftover done token must not restore teal"

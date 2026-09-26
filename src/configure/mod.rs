@@ -7,7 +7,7 @@ mod statusline;
 use crate::cache::CacheStore;
 use crate::cli::{
     AgentOrder, AgentSelection, BrandColors, ConfigureOptions, FieldSet, LowQuotaAlert,
-    PercentStyle, SidebarLayout, SidebarRowGap,
+    PercentStyle, SidebarLayout, SidebarRowGap, SidebarRows,
 };
 use crate::model::Harness;
 use crate::prefs;
@@ -123,7 +123,21 @@ pub fn run(
         // Resolved before the rows: the attention order writes its own
         // identity row, so the rows and the Agent view must agree.
         let order = resolved_agent_order(options.agent_order, Some(&cache));
-        herdr::apply(agents, layout, gap, fields, brand, order)?;
+        let rows = resolved_sidebar_rows(options.sidebar_rows);
+        prefs::write(prefs::SIDEBAR_ROWS, rows.as_str())?;
+        let style = options
+            .icon_style
+            .or_else(|| {
+                prefs::read(prefs::ICON_STYLE).and_then(|v| crate::icons::IconStyle::parse(&v))
+            })
+            .unwrap_or_default();
+        prefs::write(prefs::ICON_STYLE, style.as_str())?;
+        println!(
+            "Sidebar rows: {}; vendor marks: {}.",
+            rows.as_str(),
+            style.as_str()
+        );
+        herdr::apply(agents, layout, gap, fields, brand, order, rows)?;
         for note in font::install(cache.root())? {
             println!("{note}");
         }
@@ -148,7 +162,9 @@ pub fn run(
         let brand = resolved_brand_colors(options.brand_colors, cache.as_ref());
         let order = resolved_agent_order(options.agent_order, cache.as_ref());
         let alert = resolved_low_quota_alert(options.low_quota_alert, cache.as_ref());
-        herdr::check(agents, layout, gap, fields, brand, order)?;
+        let rows = resolved_sidebar_rows(options.sidebar_rows);
+        herdr::check(agents, layout, gap, fields, brand, order, rows)?;
+        println!("Sidebar rows: {}.", rows.as_str());
         println!("Quota percentages show {} quota.", percent.suffix());
         println!("Agent panel order: {}.", order.as_str());
         println!("Low quota alert: {alert}.");
@@ -206,6 +222,12 @@ pub(crate) fn resolved_agent_order(
     AgentOrder::from_arg_or_env(explicit)
         .or_else(|| prefs::read(prefs::AGENT_ORDER).and_then(|value| AgentOrder::parse(&value)))
         .or_else(|| cache.and_then(CacheStore::agent_order))
+        .unwrap_or_default()
+}
+
+pub(crate) fn resolved_sidebar_rows(explicit: Option<SidebarRows>) -> SidebarRows {
+    SidebarRows::from_arg_or_env(explicit)
+        .or_else(|| prefs::read(prefs::SIDEBAR_ROWS).and_then(|value| SidebarRows::parse(&value)))
         .unwrap_or_default()
 }
 

@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod cli;
 pub mod icons;
+pub mod identity;
 pub mod model;
 pub mod prefs;
 pub mod presentation;

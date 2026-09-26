@@ -157,7 +157,7 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
             continue;
         };
         let enabled = AgentSelection::from_args_or_env(&[]);
-        state.panes.retain(|pane| enabled.contains(&pane.harness));
+        state.panes.retain(|pane| shown(&enabled, pane.harness));
         let active = state
             .working_pane_ids
             .iter()
@@ -399,7 +399,7 @@ fn run_internal(
     let panes = list_agent_panes().ok().map(|panes| {
         panes
             .into_iter()
-            .filter(|pane| enabled.contains(&pane.harness))
+            .filter(|pane| shown(&enabled, pane.harness))
             .collect::<Vec<_>>()
     });
     let session_panes = panes.as_deref().unwrap_or_default();
@@ -420,6 +420,41 @@ fn run_internal(
     if json {
         println!("{}", serde_json::to_string_pretty(&outcomes)?);
     }
+    Ok(())
+}
+
+/// Is this harness's pane published at all?
+///
+/// Installed agents are; so is a display-only harness (Cursor): it has no
+/// collector to install or uninstall, only its brand icon and identity rows,
+/// and without this it would never reach a publish pass.
+fn shown(enabled: &[Harness], harness: Harness) -> bool {
+    enabled.contains(&harness) || harness.billing().is_none()
+}
+
+/// Flip the Agent panel between Space grouping and the attention order.
+///
+/// Stores the new order the way configure does, sets the Agent view over the
+/// socket Herdr injects into plugin actions (0.9.1), then republishes every
+/// pane from what is already cached: the Space header, `$al_space` and the
+/// member indent change with the order. No provider is fetched, no Herdr
+/// config is written, so the identity rows need no client-side edit.
+pub fn toggle_order() -> Result<()> {
+    let cache = CacheStore::from_env()?;
+    let next = match crate::configure::resolved_agent_order(None, Some(&cache)) {
+        crate::cli::AgentOrder::Attention => crate::cli::AgentOrder::Quota,
+        _ => crate::cli::AgentOrder::Attention,
+    };
+    cache.set_agent_order(next)?;
+    crate::prefs::write(crate::prefs::AGENT_ORDER, next.as_str())?;
+    crate::configure::apply_agent_order(next);
+    let enabled = AgentSelection::from_args_or_env(&[]);
+    let mut panes = list_agent_panes()?
+        .into_iter()
+        .filter(|pane| shown(&enabled, pane.harness))
+        .collect::<Vec<_>>();
+    publish_resolved(&cache, &mut panes, None, false, false)?;
+    println!("Agent panel order: {}.", next.as_str());
     Ok(())
 }
 
@@ -619,7 +654,7 @@ fn paint_focus_icons(cache: &CacheStore, force_idle_id: Option<&str>) -> Result<
         ids.push(previous);
     }
     let mut panes = find_agent_icon_panes(&ids)?;
-    panes.retain(|pane| enabled.contains(&pane.harness));
+    panes.retain(|pane| shown(&enabled, pane.harness));
     apply_icon_attention(&mut panes, cache, Some(pane_id), false, false)?;
     publish_icon_tokens(&panes, CacheStore::now_millis())
 }
@@ -644,7 +679,7 @@ fn handle_named_pane(
     topic_pane: Option<&str>,
     working_event: bool,
 ) -> Result<()> {
-    if !AgentSelection::from_args_or_env(&[]).contains(&pane.harness) {
+    if !shown(&AgentSelection::from_args_or_env(&[]), pane.harness) {
         return Ok(());
     }
     WatchHerdrEnvironment::current().save(cache)?;
@@ -1620,6 +1655,13 @@ mod tests {
             1_001,
         );
         assert!(affected.contains(&"claude-idle".to_string()));
+    }
+
+    #[test]
+    fn a_display_only_harness_is_published_whatever_the_selection() {
+        assert!(shown(&[Harness::Claude], Harness::Cursor));
+        assert!(shown(&[Harness::Claude], Harness::Claude));
+        assert!(!shown(&[Harness::Claude], Harness::Codex));
     }
 
     #[test]

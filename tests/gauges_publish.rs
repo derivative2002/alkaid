@@ -12,6 +12,8 @@ use std::process::Command;
 struct Sidebar {
     directory: tempfile::TempDir,
     tokens: BTreeMap<String, String>,
+    /// Herdr keeps the last label set; a report naming any label replaces it.
+    state_labels: BTreeMap<String, String>,
 }
 
 impl Sidebar {
@@ -66,6 +68,7 @@ esac
         Self {
             directory,
             tokens: BTreeMap::new(),
+            state_labels: BTreeMap::new(),
         }
     }
 
@@ -80,7 +83,8 @@ esac
             root.join("inventory.json"),
             serde_json::to_vec(&json!({"result":{"agents":[{
                 "agent":"claude", "pane_id":"w1:p1", "agent_status":"idle",
-                "agent_session":{"value":"sample-session"}, "tokens":self.tokens
+                "agent_session":{"value":"sample-session"}, "tokens":self.tokens,
+                "state_labels":self.state_labels
             }]}}))
             .unwrap(),
         )
@@ -115,8 +119,15 @@ esac
                 .count()
                 <= 16
         );
+        if args.contains(&"--state-label") {
+            self.state_labels.clear();
+        }
         for pair in args.windows(2) {
             match pair[0] {
+                "--state-label" => {
+                    let (status, text) = pair[1].split_once('=').unwrap();
+                    self.state_labels.insert(status.into(), text.into());
+                }
                 "--token" => {
                     let (name, value) = pair[1].split_once('=').unwrap();
                     self.tokens.insert(name.into(), value.into());

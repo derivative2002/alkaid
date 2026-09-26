@@ -2083,7 +2083,7 @@ fn claude_collector_does_not_republish_unchanged_quota() {
     let (herdr_stub, herdr_log) = install_herdr_stub(
         state.path(),
         &format!(
-            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042"}}}}]}}}}"#,
+            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042"}}}},"state_labels":{{"blocked":"[卡住]","done":"[已回]","working":"[工作]","idle":"[空闲]","unknown":"[未报]"}}}}]}}}}"#,
             "\u{e1a0}"
         ),
     );
@@ -2145,6 +2145,9 @@ impl AgentHomes {
     fn configure_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
         fs::create_dir_all(&self.state).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"));
+        // These tests pin the usage-row layouts; identity rows are opted into
+        // by the tests about them (an explicit flag or env entry wins).
+        command.env("HERDR_AGENT_QUOTA_SIDEBAR_ROWS", "quota");
         for (key, value) in env {
             command.env(key, value);
         }
@@ -2962,7 +2965,9 @@ fn the_attention_order_publishes_state_labels_once_and_no_space_header() {
 }
 
 #[test]
-fn the_quota_order_sends_no_state_labels() {
+fn the_grouped_order_sends_state_labels_too() {
+    // Identity rows lead with `state_text` in every order, so the labels are
+    // wanted whether or not the panel is grouped.
     let state = tempdir().unwrap();
     let (herdr_stub, _) = install_herdr_stub(
         state.path(),
@@ -2979,5 +2984,155 @@ fn the_quota_order_sends_no_state_labels() {
         r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"}}]}}"#,
     );
     assert!(report.contains("quota_5h_warning=5h 42%"), "{report}");
-    assert!(!report.contains("state-label"), "{report}");
+    assert!(report.contains("--state-label idle=[空闲]"), "{report}");
+    assert!(report.contains("quota_group="), "{report}");
+}
+
+fn identity_rows(input: &str, order: herdr_agent_quota::cli::AgentOrder) -> String {
+    herdr_agent_quota::configure::herdr::add_sidebar_rows(
+        input,
+        &AgentSelection::SUPPORTED,
+        herdr_agent_quota::cli::SidebarLayout::Gauges,
+        herdr_agent_quota::cli::SidebarRowGap::default(),
+        herdr_agent_quota::cli::FieldSet::all(),
+        herdr_agent_quota::cli::BrandColors::On,
+        order,
+        herdr_agent_quota::cli::SidebarRows::Identity,
+    )
+    .unwrap()
+}
+
+#[test]
+fn identity_rows_show_who_each_seat_is_and_no_usage() {
+    use herdr_agent_quota::cli::AgentOrder;
+    let rows = managed_rows(&identity_rows("", AgentOrder::Quota));
+    assert_eq!(
+        rows,
+        [
+            vec!["$quota_group"],
+            vec![
+                "$quota_icon",
+                "$quota_icon_working",
+                "$quota_icon_done",
+                "state_text",
+                "$al_space",
+                "tab"
+            ],
+            vec!["$al_role", "$al_model"],
+            vec!["pane"],
+        ]
+    );
+    let flat = rows.concat();
+    for usage in ["5h", "week", "month", "context", "cache", "provider_model"] {
+        assert!(
+            flat.iter().all(|token| !token.contains(usage)),
+            "{usage} leaked into identity rows: {flat:?}"
+        );
+    }
+}
+
+#[test]
+fn identity_rows_are_the_same_in_both_orders_so_a_toggle_rewrites_nothing() {
+    use herdr_agent_quota::cli::AgentOrder;
+    assert_eq!(
+        identity_rows("", AgentOrder::Quota),
+        identity_rows("", AgentOrder::Attention)
+    );
+    let applied = identity_rows("", AgentOrder::Quota);
+    assert!(applied.contains("key = \"prefix+shift+o\""), "{applied}");
+    assert!(
+        applied.contains("command = \"herdr-agent-quota.toggle-order\""),
+        "{applied}"
+    );
+}
+
+#[test]
+fn identity_rows_are_idempotent_and_switch_cleanly_with_the_usage_rows() {
+    use herdr_agent_quota::cli::AgentOrder;
+    let identity = identity_rows("", AgentOrder::Quota);
+    assert_eq!(identity_rows(&identity, AgentOrder::Quota), identity);
+    assert_eq!(grouped_rows(&identity), grouped_rows(""));
+    assert_eq!(
+        identity_rows(&grouped_rows(""), AgentOrder::Quota),
+        identity
+    );
+    assert_eq!(
+        identity_rows(&attention_rows(""), AgentOrder::Quota),
+        identity
+    );
+}
+
+#[test]
+fn identity_rows_uninstall_to_herdr_stock_rows() {
+    use herdr_agent_quota::cli::AgentOrder;
+    let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
+    let applied = identity_rows(original, AgentOrder::Attention);
+    let removed = remove_quota_row(&applied).unwrap();
+    for leftover in ["$al_", "state_text", "\"pane\"", "toggle-order", "$quota"] {
+        assert!(!removed.contains(leftover), "{leftover}: {removed}");
+    }
+    assert_eq!(
+        removed,
+        "[ui]\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
+    );
+}
+
+#[test]
+fn configure_defaults_to_identity_rows_and_can_restore_the_usage_rows() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+    // Herdr injects the plugin config directory into actions and hooks; the
+    // stored row choice lives there.
+    let prefs = root.path().join("plugin-config");
+    fs::create_dir_all(&prefs).unwrap();
+    let prefs = prefs.to_str().unwrap();
+    let output = homes.configure_with_env(
+        &["--apply", "--sidebar-rows", "identity"],
+        &[("HERDR_PLUGIN_CONFIG_DIR", prefs)],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sidebar = homes.sidebar();
+    assert_eq!(managed_rows(&sidebar)[1][3], "state_text", "{sidebar}");
+    assert!(sidebar.contains("$al_role"), "{sidebar}");
+    assert!(!sidebar.contains("$quota_5h"), "{sidebar}");
+    assert!(
+        sidebar.contains("herdr-agent-quota.toggle-order"),
+        "{sidebar}"
+    );
+
+    assert!(homes
+        .configure_with_env(
+            &["--apply", "--sidebar-rows", "quota"],
+            &[("HERDR_PLUGIN_CONFIG_DIR", prefs)]
+        )
+        .status
+        .success());
+    let sidebar = homes.sidebar();
+    assert!(sidebar.contains("$quota_5h"), "{sidebar}");
+    assert!(!sidebar.contains("$al_role"), "{sidebar}");
+
+    // No flag, no env: the stored preference (quota, from the run above) wins.
+    assert!(homes
+        .configure_with_env(
+            &["--apply"],
+            &[
+                ("HERDR_AGENT_QUOTA_SIDEBAR_ROWS", ""),
+                ("HERDR_PLUGIN_CONFIG_DIR", prefs)
+            ]
+        )
+        .status
+        .success());
+    assert!(homes.sidebar().contains("$quota_5h"));
+
+    assert!(homes
+        .configure_with_env(&["--uninstall"], &[("HERDR_PLUGIN_CONFIG_DIR", prefs)])
+        .status
+        .success());
+    let sidebar = homes.sidebar();
+    assert!(!sidebar.contains("toggle-order"), "{sidebar}");
+    assert!(!sidebar.contains("$al_"), "{sidebar}");
 }

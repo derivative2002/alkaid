@@ -46,6 +46,10 @@ impl Provider {
 pub enum Harness {
     Codex,
     Claude,
+    /// Cursor Agent CLI. Display only: it gets its brand icon and identity
+    /// rows, but alkaid carries no Cursor quota collector (F4), so it never
+    /// resolves to a billing target and is not an installable agent.
+    Cursor,
 }
 
 impl Harness {
@@ -55,6 +59,9 @@ impl Harness {
         match name.trim().to_ascii_lowercase().as_str() {
             "codex" => Some(Self::Codex),
             "claude" | "claude-code" | "anthropic" => Some(Self::Claude),
+            // Herdr's kind and PATH command; never a bare `agent`, which is
+            // Grok's name on machines that have both.
+            "cursor" | "cursor-agent" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -65,6 +72,7 @@ impl Harness {
         match self {
             Self::Codex => Some(Provider::Codex),
             Self::Claude => Some(Provider::Claude),
+            Self::Cursor => None,
         }
     }
 
