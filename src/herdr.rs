@@ -14,7 +14,7 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 37] = [
+const METADATA_TOKEN_NAMES: [&str; 38] = [
     "quota_group",
     "quota_pad",
     "quota_icon",
@@ -52,7 +52,25 @@ const METADATA_TOKEN_NAMES: [&str; 37] = [
     ROLE_TOKEN,
     MODEL_TOKEN,
     SPACE_TOKEN,
+    SORT_TOKEN,
 ];
+/// The Agent view's sort key: three-digit headroom (`999` when unknown) then
+/// the pane id. The view sorts on this token and the Space head is the pane
+/// with the smallest value, so both sides break a headroom tie the same way.
+/// Sorting on `quota_headroom` alone left ties to Herdr's own tab order while
+/// the head was chosen by pane id — two panes at `004` put the header on the
+/// second one and the first one above it (0927, 统筹 over the alioth header).
+pub(crate) const SORT_TOKEN: &str = "al_sort";
+
+/// The one definition of a pane's place in its Space; see [`SORT_TOKEN`].
+fn sort_key(headroom: u8, pane_id: &str) -> String {
+    let headroom = if headroom > 100 {
+        999
+    } else {
+        u16::from(headroom)
+    };
+    format!("{headroom:03}{pane_id}")
+}
 /// Seat role parsed from the pane label (naming-spec §5): 统筹 / 秘书 / hub /
 /// spoke / subhub / svc. Changes only when the label does.
 pub(crate) const ROLE_TOKEN: &str = "al_role";
@@ -346,7 +364,7 @@ pub fn set_agent_view(order: crate::cli::AgentOrder) -> Result<()> {
 }
 
 fn agent_view_request(order: crate::cli::AgentOrder) -> Value {
-    let headroom = serde_json::json!({"field": {"token": HEADROOM_TOKEN}, "order": "asc"});
+    let headroom = serde_json::json!({"field": {"token": SORT_TOKEN}, "order": "asc"});
     let first = if order.groups_by_space() {
         serde_json::json!({"field": "workspace_order", "order": "asc"})
     } else {
@@ -860,6 +878,11 @@ fn publish_pane_tokens_inner(
             &workspace_labels,
         );
         apply_group_and_icon(&mut desired, pane, &group_heads, &workspace_labels, style);
+        let headroom = desired
+            .get(HEADROOM_TOKEN)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(u8::MAX);
+        desired.insert(SORT_TOKEN.to_string(), sort_key(headroom, &pane.pane_id));
         let labels = label_change(pane);
         if metadata_matches(&pane.tokens, &desired) && labels == LabelChange::Keep {
             continue;
@@ -1214,7 +1237,7 @@ fn group_head_pane_ids(
         .iter()
         .map(|pane| pane.pane_id.as_str())
         .collect::<BTreeSet<_>>();
-    let mut heads: BTreeMap<String, (u8, &str)> = BTreeMap::new();
+    let mut heads: BTreeMap<String, (String, &str)> = BTreeMap::new();
     for pane in inventory {
         if pane.workspace_id.is_empty() {
             continue;
@@ -1227,9 +1250,9 @@ fn group_head_pane_ids(
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(u8::MAX)
         };
-        let candidate = (headroom, pane.pane_id.as_str());
+        let candidate = (sort_key(headroom, &pane.pane_id), pane.pane_id.as_str());
         match heads.get(&pane.workspace_id) {
-            Some(current) if *current <= candidate => {}
+            Some(current) if current.0 <= candidate.0 => {}
             _ => {
                 heads.insert(pane.workspace_id.clone(), candidate);
             }
@@ -1243,7 +1266,10 @@ fn group_head_pane_ids(
         }
         heads.insert(
             pane.workspace_id.clone(),
-            (published_headroom(pane, tokens), pane.pane_id.as_str()),
+            (
+                sort_key(published_headroom(pane, tokens), &pane.pane_id),
+                pane.pane_id.as_str(),
+            ),
         );
     }
     heads
@@ -1905,10 +1931,50 @@ mod tests {
             request["params"]["sort"],
             serde_json::json!([
                 {"field": "attention", "order": "desc"},
-                {"field": {"token": "quota_headroom"}, "order": "asc"},
+                {"field": {"token": "al_sort"}, "order": "asc"},
             ])
         );
         assert!(!request.to_string().contains("workspace_order"));
+    }
+
+    #[test]
+    fn a_headroom_tie_puts_the_header_on_the_pane_the_view_lists_first() {
+        // 0927: 统筹 (w1:p3P) and 秘书 (w1:p3N) both at 004. The view now sorts
+        // on the same key the head is chosen by, so whichever pane wins the
+        // tie is both first in the Space and the one carrying its header.
+        let coord = attention_pane("w1:p3P", "004", AgentStatus::Idle);
+        let sec = attention_pane("w1:p3N", "004", AgentStatus::Done);
+        let loose = attention_pane("w1:p55", "081", AgentStatus::Working);
+        let unknown = attention_pane("w1:p3T", "", AgentStatus::Idle);
+        let mut unknown = unknown;
+        unknown.tokens.remove(HEADROOM_TOKEN);
+        let inventory = vec![coord.clone(), sec.clone(), loose.clone(), unknown.clone()];
+        let heads = group_head_pane_ids(&inventory, &inventory, &[]);
+        let head = heads.get("w1").unwrap();
+        let mut keys = inventory
+            .iter()
+            .map(|pane| {
+                let headroom = pane
+                    .tokens
+                    .get(HEADROOM_TOKEN)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(u8::MAX);
+                (sort_key(headroom, &pane.pane_id), pane.pane_id.clone())
+            })
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            &keys[0].1, head,
+            "head must be the first pane the view lists"
+        );
+        assert_eq!(
+            keys.last().unwrap().1,
+            "w1:p3T",
+            "unknown headroom sorts last"
+        );
+        assert_eq!(sort_key(4, "w1:p3N"), "004w1:p3N");
+        assert_eq!(sort_key(u8::MAX, "w1:p3T"), "999w1:p3T");
+        assert!(sort_key(100, "w9:p9") < sort_key(u8::MAX, "w0:p0"));
     }
 
     #[test]
@@ -1920,7 +1986,7 @@ mod tests {
             request["params"]["sort"],
             serde_json::json!([
                 {"field": "workspace_order", "order": "asc"},
-                {"field": {"token": "quota_headroom"}, "order": "asc"},
+                {"field": {"token": "al_sort"}, "order": "asc"},
             ])
         );
     }
