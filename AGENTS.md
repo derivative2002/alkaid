@@ -259,6 +259,24 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    switch may not emit `pane.focused`; resolve its pane from that location's
    layout in `herdr api snapshot`. Ignore a delayed event whose workspace or
    Tab is no longer focused.
+4a. **Custom groups and the role order (round five).** A `groups` file in
+   the plugin config directory (`src/groups.rs`; user data, not in
+   `prefs::ALL`) names groups by label selectors: `role:` / `line:` /
+   `task:` / `label:`, comma for or, `&` for and. Every seat carries
+   `al_grp` — `C000`… for a custom group, `Z` for its Space — so leaving a
+   group replaces a value instead of leaving a token behind, and the value
+   never follows the order, so toggling writes nothing. Grouped views sort
+   `al_grp`, `workspace_order`, [`al_role_rank` under `role`], `al_sort`.
+   A custom group's head is chosen by what Herdr compares: the workspace
+   `number` from `workspace list`, role rank, `al_sort`. Only a pane the pass
+   labels is regrouped; any other keeps the `al_grp` it carries. A file with
+   any bad line does not take effect (the last clean copy in the state
+   directory stays in force); `herdr-agent-quota groups` checks it. Known
+   window: dragging a workspace reorders the view at once but moves a custom
+   group's head only on the next full pass — `workspace.moved` is not a
+   plugin hook event in 0.9.1 (sb7, 0928). View labels stay ASCII: Herdr
+   0.9.1 overprints a CJK panel title. The toggle cycles quota → role →
+   attention; `tightest` (flat by `al_sort`) is settings-only.
 5. **Attention order is flat on purpose, and only it.** `--agent-order
    attention` sorts Herdr's built-in `attention` descending (measured on
    0.9.1: blocked, unseen done, working, idle, then unknown), then
