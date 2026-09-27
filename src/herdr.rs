@@ -14,7 +14,7 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 44] = [
+const METADATA_TOKEN_NAMES: [&str; 45] = [
     "quota_group",
     "quota_pad",
     "quota_icon",
@@ -59,6 +59,7 @@ const METADATA_TOKEN_NAMES: [&str; 44] = [
     GROUP_TOKEN,
     ROLE_RANK_TOKEN,
     ATTENTION_TOKEN,
+    PIN_TOKEN,
 ];
 /// A blank row after a Space's last pane (group styles `rule` and `count`).
 /// It sits at the end of that pane's rows rather than above the next header:
@@ -78,6 +79,12 @@ pub(crate) const MODEL_MARK_TOKEN: &str = "al_model_mark";
 pub(crate) const GROUP_TOKEN: &str = "al_grp";
 /// The value of [`GROUP_TOKEN`] for a seat in its Space.
 const SPACE_GROUP: &str = "Z";
+/// The value of [`GROUP_TOKEN`] for a pinned seat (`置顶`): it sorts before
+/// every custom group and gets no header.
+const PIN_GROUP: &str = "A";
+/// `0` on a pinned seat, `1` on every other; the flat orders sort on it
+/// first so a pinned seat stays on top there too (owner 0928).
+pub(crate) const PIN_TOKEN: &str = "al_pin";
 /// Attention rank that follows the icon colour (`0` blocked, `1` teal unseen
 /// completion, `2` yellow working, `3` white), for the `attention` order.
 /// Herdr's built-in `attention` can disagree with the plugin's teal (a
@@ -226,9 +233,9 @@ fn role_rank(role: &str) -> char {
 pub(crate) struct Grouping {
     order: crate::cli::AgentOrder,
     rules: crate::groups::Groups,
-    /// Pane id → custom group (`None`: its Space), for panes labelled this
-    /// pass.
-    custom: BTreeMap<String, Option<usize>>,
+    /// Pane id → its `al_grp` value (`A` pinned, `C…` custom group, `Z` its
+    /// Space), for panes labelled this pass.
+    custom: BTreeMap<String, String>,
     /// Pane id → role rank, for panes labelled this pass.
     roles: BTreeMap<String, char>,
     /// Workspace id → its number in Herdr's order.
@@ -248,7 +255,15 @@ impl Grouping {
         if let Some(labels) = pane_labels {
             for pane in labelled {
                 let label = labels.get(&pane.pane_id).map(String::as_str).unwrap_or("");
-                custom.insert(pane.pane_id.clone(), rules.group_of(label));
+                let value = if rules.is_pinned(label) {
+                    PIN_GROUP.to_string()
+                } else {
+                    match rules.group_of(label) {
+                        Some(group) => format!("C{}", crate::groups::Groups::key(group)),
+                        None => SPACE_GROUP.to_string(),
+                    }
+                };
+                custom.insert(pane.pane_id.clone(), value);
                 let role = crate::identity::from_label(label).role;
                 roles.insert(pane.pane_id.clone(), role_rank(&role));
             }
@@ -277,10 +292,19 @@ impl Grouping {
     /// The `al_grp` this pass writes for a pane, or `None` to keep what it
     /// carries (its label was not read).
     fn group_value(&self, pane: &AgentPane) -> Option<String> {
-        self.custom.get(&pane.pane_id).map(|group| match group {
-            Some(group) => format!("C{}", crate::groups::Groups::key(*group)),
-            None => SPACE_GROUP.to_string(),
-        })
+        self.custom.get(&pane.pane_id).cloned()
+    }
+
+    /// The `al_grp` the view sees for this pane: written this pass, else the
+    /// one it carries.
+    fn effective_value(&self, pane: &AgentPane) -> Option<String> {
+        self.group_value(pane)
+            .or_else(|| pane.tokens.get(GROUP_TOKEN).cloned())
+    }
+
+    /// Is this seat pinned (`置顶`)?
+    fn pinned(&self, pane: &AgentPane) -> bool {
+        self.effective_value(pane).as_deref() == Some(PIN_GROUP)
     }
 
     /// The custom group the view puts this pane in, if any.
@@ -288,23 +312,33 @@ impl Grouping {
         if !self.order.custom_groups() {
             return None;
         }
-        let value = self
-            .group_value(pane)
-            .or_else(|| pane.tokens.get(GROUP_TOKEN).cloned())?;
-        value.strip_prefix('C')?.parse().ok()
+        self.effective_value(pane)?.strip_prefix('C')?.parse().ok()
     }
 
-    /// The group key: `#C…` for a custom group, else the workspace id (empty
-    /// when the pane has none, which puts it in no group).
+    /// Does the grouped view list this pane outside its Space — pinned or in
+    /// a custom group? Then its row names the Space itself.
+    fn away_from_space(&self, pane: &AgentPane) -> bool {
+        self.order.custom_groups() && (self.pinned(pane) || self.custom_group(pane).is_some())
+    }
+
+    /// The group key: `#A` for pinned seats, `#C…` for a custom group, else
+    /// the workspace id (empty when the pane has none, which puts it in no
+    /// group).
     fn gid(&self, pane: &AgentPane) -> String {
+        if self.order.custom_groups() && self.pinned(pane) {
+            return format!("#{PIN_GROUP}");
+        }
         match self.custom_group(pane) {
             Some(group) => format!("#C{}", crate::groups::Groups::key(group)),
             None => pane.workspace_id.clone(),
         }
     }
 
-    /// The header text source for a group key.
+    /// The header text source for a group key; pinned seats have none.
     fn name(&self, gid: &str, workspace_labels: &BTreeMap<String, String>) -> Option<String> {
+        if gid == format!("#{PIN_GROUP}") {
+            return None;
+        }
         if let Some(key) = gid.strip_prefix("#C") {
             return key
                 .parse()
@@ -456,11 +490,12 @@ const ROWS_THAT_MUST_NOT_LAG: [&str; 17] = [
 ];
 
 /// [`ROWS_THAT_MUST_NOT_LAG`] for the identity rows (round two onward).
-const IDENTITY_ROWS_THAT_MUST_NOT_LAG: [&str; 11] = [
+const IDENTITY_ROWS_THAT_MUST_NOT_LAG: [&str; 12] = [
     "quota_group",
     "quota_icon",
     SORT_TOKEN,
     GROUP_TOKEN,
+    PIN_TOKEN,
     ROLE_RANK_TOKEN,
     GAP_TOKEN,
     CHANNEL_TOKEN,
@@ -694,12 +729,16 @@ fn agent_view_request(order: crate::cli::AgentOrder) -> Value {
         // By the colour the user sees (`al_att`), then 中枢 and the other
         // custom groups before the Spaces, then Space, then quota.
         AgentOrder::Attention => vec![
+            serde_json::json!({"field": {"token": PIN_TOKEN}, "order": "asc"}),
             serde_json::json!({"field": {"token": ATTENTION_TOKEN}, "order": "asc"}),
             serde_json::json!({"field": {"token": GROUP_TOKEN}, "order": "asc"}),
             serde_json::json!({"field": "workspace_order", "order": "asc"}),
             key,
         ],
-        AgentOrder::Tightest => vec![key],
+        AgentOrder::Tightest => vec![
+            serde_json::json!({"field": {"token": PIN_TOKEN}, "order": "asc"}),
+            key,
+        ],
     };
     serde_json::json!({
         "id": "agent-quota:view-set",
@@ -1961,6 +2000,7 @@ fn apply_group_and_icon(
     };
     let gid = grouping.gid(pane);
     let member = !gid.is_empty()
+        && !grouping.pinned(pane)
         && group_heads
             .get(&gid)
             .is_some_and(|head| head != &pane.pane_id);
@@ -2038,7 +2078,9 @@ fn apply_grouping(
     };
     let role = desired.get(ROLE_TOKEN).map(String::as_str).unwrap_or("");
     desired.insert(ROLE_RANK_TOKEN.to_string(), role_rank(role).to_string());
-    if grouping.custom_group(pane).is_some() {
+    let pin = if grouping.pinned(pane) { "0" } else { "1" };
+    desired.insert(PIN_TOKEN.to_string(), pin.to_string());
+    if grouping.away_from_space(pane) {
         if let Some(label) = workspace_labels
             .get(&pane.workspace_id)
             .filter(|label| !label.is_empty())
@@ -2389,6 +2431,7 @@ fn must_not_lag(
         || ICON_REPORT_NAMES.contains(&name)
         || name == SORT_TOKEN
         || name == GROUP_TOKEN
+        || name == PIN_TOKEN
         || name == ROLE_RANK_TOKEN
         || match rows {
             crate::cli::SidebarRows::Quota => ROWS_THAT_MUST_NOT_LAG.contains(&name),
@@ -2679,6 +2722,54 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_seat_sits_above_every_group_without_a_header() {
+        use crate::cli::AgentOrder;
+        let (panes, labels, _) = grouped_board(AgentOrder::Quota);
+        let grouping = Grouping::new(
+            AgentOrder::Quota,
+            crate::groups::Groups::parse("置顶 = line:alioth&role:统筹\n中枢 = role:hub"),
+            &panes,
+            Some(&labels),
+            BTreeMap::from([("w1".to_string(), 2), ("w2".to_string(), 1)]),
+        );
+        let coordinator = &panes[0];
+        let spaces = BTreeMap::from([("w1".to_string(), "alioth".to_string())]);
+        let mut desired = BTreeMap::from([(ROLE_TOKEN.to_string(), "统筹".to_string())]);
+        apply_grouping(&mut desired, coordinator, &grouping, &spaces);
+        assert_eq!(desired.get(GROUP_TOKEN).map(String::as_str), Some("A"));
+        assert_eq!(desired.get(PIN_TOKEN).map(String::as_str), Some("0"));
+        assert_eq!(desired.get(SPACE_TOKEN).map(String::as_str), Some("alioth"));
+        let mut other = BTreeMap::new();
+        apply_grouping(&mut other, &panes[1], &grouping, &spaces);
+        assert_eq!(other.get(PIN_TOKEN).map(String::as_str), Some("1"));
+
+        let heads = space_group_heads(AgentOrder::Quota, &grouping, &panes, &panes, &[]);
+        assert_eq!(
+            group_label_for(coordinator, &grouping, &heads, &spaces),
+            None
+        );
+        // 中枢 is only the dubhe hub now; alioth's head is its spoke.
+        assert_eq!(heads.get("#C00").map(String::as_str), Some("w2:p1"));
+        assert_eq!(heads.get("w1").map(String::as_str), Some("w1:p2"));
+        let mut icon = BTreeMap::new();
+        apply_group_and_icon(
+            &mut icon,
+            coordinator,
+            &grouping,
+            &heads,
+            &spaces,
+            &Look::plain(),
+        );
+        assert!(
+            !icon
+                .values()
+                .any(|value| value.starts_with(GROUP_MEMBER_INDENT)),
+            "a pinned seat is never indented"
+        );
+        assert!(!icon.contains_key("quota_group"));
+    }
+
+    #[test]
     fn an_unlabelled_pane_keeps_the_group_it_carries() {
         use crate::cli::AgentOrder;
         let (mut panes, _, _) = grouped_board(AgentOrder::Quota);
@@ -2798,6 +2889,7 @@ mod tests {
         assert_eq!(
             request["params"]["sort"],
             serde_json::json!([
+                {"field": {"token": "al_pin"}, "order": "asc"},
                 {"field": {"token": "al_att"}, "order": "asc"},
                 {"field": {"token": "al_grp"}, "order": "asc"},
                 {"field": "workspace_order", "order": "asc"},
@@ -3521,7 +3613,10 @@ mod tests {
         let flat = agent_view_request(AgentOrder::Tightest);
         assert_eq!(
             flat["params"]["sort"],
-            serde_json::json!([{"field": {"token": "al_sort"}, "order": "asc"}])
+            serde_json::json!([
+                {"field": {"token": "al_pin"}, "order": "asc"},
+                {"field": {"token": "al_sort"}, "order": "asc"},
+            ])
         );
     }
 
@@ -4292,6 +4387,7 @@ mod tests {
             GROUP_TOKEN,
             ROLE_RANK_TOKEN,
             ATTENTION_TOKEN,
+            PIN_TOKEN,
         ] {
             desired.insert(name.to_string(), "x".to_string());
         }
@@ -4325,6 +4421,7 @@ mod tests {
             GROUP_TOKEN,
             ROLE_RANK_TOKEN,
             ATTENTION_TOKEN,
+            PIN_TOKEN,
         ] {
             assert!(names.contains(&name), "{name} deferred: {names:?}");
         }

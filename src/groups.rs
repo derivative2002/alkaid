@@ -20,6 +20,10 @@
 //! all hold (`line:alioth&task:统筹`). The first group a seat matches wins; a
 //! seat that matches none, or whose label is off-spec, stays in its Space.
 //!
+//! One name is reserved: a line named `置顶` pins its seats above everything
+//! in every order (owner 0928: "统筹常驻时候可以固定在最上面"), outside any
+//! group header; `置顶 = line:alioth&role:统筹`.
+//!
 //! The file takes effect only as a whole (Codex r5 g1 §6): one bad line and
 //! the plugin keeps the last version that parsed cleanly (a copy in the
 //! plugin state directory), or no custom groups if there never was one, so a
@@ -31,6 +35,9 @@ use crate::identity::SeatIdentity;
 
 /// The rules file, in the plugin config directory.
 pub const FILE: &str = "groups";
+
+/// The reserved group name that pins its seats to the top.
+pub const PIN_NAME: &str = "置顶";
 
 /// At most this many groups: the group key is two digits.
 pub const MAX_GROUPS: usize = 100;
@@ -96,6 +103,8 @@ struct Group {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Groups {
     groups: Vec<Group>,
+    /// The `置顶` line's alternatives; empty when there is none.
+    pinned: Vec<Vec<Selector>>,
     pub problems: Vec<String>,
 }
 
@@ -129,6 +138,7 @@ impl Groups {
 
     pub fn parse(text: &str) -> Self {
         let mut groups: Vec<Group> = Vec::new();
+        let mut pinned: Option<Vec<Vec<Selector>>> = None;
         let mut problems = Vec::new();
         for (number, line) in text.lines().enumerate() {
             let number = number + 1;
@@ -145,11 +155,13 @@ impl Groups {
                 problems.push(format!("groups 第 {number} 行：组名为空"));
                 continue;
             }
-            if groups.iter().any(|group| group.name == name) {
+            if groups.iter().any(|group| group.name == name)
+                || (name == PIN_NAME && pinned.is_some())
+            {
                 problems.push(format!("groups 第 {number} 行：组名「{name}」重复"));
                 continue;
             }
-            if groups.len() == MAX_GROUPS {
+            if name != PIN_NAME && groups.len() == MAX_GROUPS {
                 problems.push(format!("groups 第 {number} 行：超过 {MAX_GROUPS} 组"));
                 continue;
             }
@@ -169,6 +181,7 @@ impl Groups {
                 Ok(clauses) if clauses.is_empty() => {
                     problems.push(format!("groups 第 {number} 行：没有选择器"));
                 }
+                Ok(clauses) if name == PIN_NAME => pinned = Some(clauses),
                 Ok(clauses) => groups.push(Group {
                     name: name.to_string(),
                     clauses,
@@ -176,11 +189,15 @@ impl Groups {
                 Err(message) => problems.push(format!("groups 第 {number} 行：{message}")),
             }
         }
-        Self { groups, problems }
+        Self {
+            groups,
+            pinned: pinned.unwrap_or_default(),
+            problems,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
+        self.groups.is_empty() && self.pinned.is_empty()
     }
 
     /// The first group this seat matches, by its pane label.
@@ -189,13 +206,15 @@ impl Groups {
         if identity.role.is_empty() {
             return None;
         }
-        self.groups.iter().position(|group| {
-            group.clauses.iter().any(|clause| {
-                clause
-                    .iter()
-                    .all(|selector| selector.matches(label, &identity))
-            })
-        })
+        self.groups
+            .iter()
+            .position(|group| any_clause(&group.clauses, label, &identity))
+    }
+
+    /// Does the `置顶` line claim this seat?
+    pub fn is_pinned(&self, label: &str) -> bool {
+        let identity = crate::identity::from_label(label);
+        !identity.role.is_empty() && any_clause(&self.pinned, label, &identity)
     }
 
     pub fn name(&self, index: usize) -> Option<&str> {
@@ -207,6 +226,14 @@ impl Groups {
     pub fn key(index: usize) -> String {
         format!("{index:02}")
     }
+}
+
+fn any_clause(clauses: &[Vec<Selector>], label: &str, identity: &SeatIdentity) -> bool {
+    clauses.iter().any(|clause| {
+        clause
+            .iter()
+            .all(|selector| selector.matches(label, identity))
+    })
 }
 
 /// Where the last cleanly parsed rules are kept.
@@ -228,6 +255,17 @@ pub fn check(file: Option<&std::path::Path>) -> anyhow::Result<()> {
         println!("{problem}");
     }
     let labels = crate::herdr::list_pane_labels().unwrap_or_default();
+    if !groups.pinned.is_empty() {
+        let pinned = labels
+            .values()
+            .filter(|label| groups.is_pinned(label))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        println!("{PIN_NAME}（{} 席）", pinned.len());
+        for label in pinned {
+            println!("  {label}");
+        }
+    }
     for (index, group) in groups.groups.iter().enumerate() {
         let members = labels
             .values()
@@ -296,6 +334,20 @@ mod tests {
         assert_eq!(groups.group_of(SEC), None);
         assert_eq!(groups.group_of(SPOKE), None);
         assert!(!Groups::parse("坏 = line:alioth&").problems.is_empty());
+    }
+
+    #[test]
+    fn the_reserved_name_pins_and_is_not_a_group() {
+        let groups = Groups::parse("置顶 = line:alioth&role:统筹\n中枢 = role:统筹, role:hub");
+        assert!(groups.problems.is_empty(), "{:?}", groups.problems);
+        assert!(groups.is_pinned(COORD));
+        assert!(!groups.is_pinned(SEC));
+        assert!(!groups.is_pinned("claude"));
+        assert_eq!(groups.name(0), Some("中枢"));
+        assert_eq!(groups.name(1), None);
+        assert!(!Groups::parse("置顶 = role:统筹").is_empty());
+        let twice = Groups::parse("置顶 = role:统筹\n置顶 = role:秘书");
+        assert_eq!(twice.problems.len(), 1);
     }
 
     #[test]
