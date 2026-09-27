@@ -34,12 +34,9 @@ pub const GROUP_STYLE: &str = "group-style";
 /// Where harness / channel / model marks sit: `none` (default), `inline`,
 /// `second-row`.
 pub const LOGO_LAYOUT: &str = "logo-layout";
-/// First-row mark of a DeepSeek-base Claude Code seat under a logo layout:
-/// `launcher` (default) or `base`.
-pub const DS_MARK: &str = "ds-mark";
 
 /// Every preference a full uninstall must forget.
-pub const ALL: [&str; 14] = [
+pub const ALL: [&str; 13] = [
     AGENTS,
     WATCH_INTERVAL_SECONDS,
     SIDEBAR_LAYOUT,
@@ -53,7 +50,6 @@ pub const ALL: [&str; 14] = [
     ICON_STYLE,
     GROUP_STYLE,
     LOGO_LAYOUT,
-    DS_MARK,
 ];
 
 fn directory() -> Option<PathBuf> {

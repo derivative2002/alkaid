@@ -135,12 +135,12 @@ pub const GAP: &str = "\u{200b}";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum LogoLayout {
     /// Harness mark only; a DeepSeek base swaps it for the whale (round two).
-    #[default]
     None,
-    /// First row: harness · channel · model marks, then state and Tab.
+    /// First row: harness · channel · model marks, then Tab.
     Inline,
     /// Harness mark on the first row; channel and model marks beside the
-    /// role on the second.
+    /// role on the second (owner 0927: the default).
+    #[default]
     SecondRow,
 }
 
@@ -178,49 +178,6 @@ impl LogoLayout {
     }
 }
 
-/// What the first-row harness mark shows for a Claude Code seat on a
-/// DeepSeek base. The owner listed "dsh" among the harnesses; Codex reads
-/// the harness as the launcher (Claude Code) and the whale as the model.
-/// Both are drawn for the owner to choose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum DsMark {
-    /// The launcher's mark: a DS-base Claude Code seat keeps the Claude
-    /// mark, and the whale moves to the model mark (Codex reading).
-    #[default]
-    Launcher,
-    /// The whale replaces the harness mark, as in round two ("dsh" as its
-    /// own harness). Without a logo layout this is always the behaviour.
-    Base,
-}
-
-impl DsMark {
-    pub const ENV: &'static str = "HERDR_AGENT_QUOTA_DS_MARK";
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Launcher => "launcher",
-            Self::Base => "base",
-        }
-    }
-
-    pub fn parse(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "launcher" | "harness" => Some(Self::Launcher),
-            "base" | "dsh" | "whale" => Some(Self::Base),
-            _ => None,
-        }
-    }
-
-    pub fn installed() -> Self {
-        std::env::var(Self::ENV)
-            .ok()
-            .as_deref()
-            .and_then(Self::parse)
-            .or_else(|| crate::prefs::read(crate::prefs::DS_MARK).and_then(|v| Self::parse(&v)))
-            .unwrap_or_default()
-    }
-}
-
 /// The model family a model name belongs to: a session's own model (Claude
 /// Code `display_name`/id, Codex config) or a label's model segment.
 /// Abbreviations seen on the 0927 seats (`op5`, `ds41-flash`, `ds-v41`,
@@ -239,7 +196,11 @@ pub enum ModelFamily {
 }
 
 pub fn model_family(model: &str) -> Option<ModelFamily> {
-    let m = model.trim().to_ascii_lowercase();
+    let m = strip_channel_prefix(&model.trim().to_ascii_lowercase()).to_string();
+    // `codex-*` names the Codex product, not an OpenAI model (Dubhe brand-map).
+    if m.starts_with("codex") {
+        return None;
+    }
     let starts = |p: &str| m.starts_with(p);
     let second_is_digit = m.chars().nth(1).is_some_and(|c| c.is_ascii_digit());
     if crate::icons::is_deepseek(&m) {
@@ -269,16 +230,54 @@ pub fn model_family(model: &str) -> Option<ModelFamily> {
     }
 }
 
-/// A model family's mark. Glyphs are from the bundled Herdr Agent Icons Max
-/// face (U+E1A0–E1B6). GLM has no glyph there and no font tooling was
-/// available to add one, so it is a text badge in every style.
+/// Channel prefixes Dubhe puts in front of a model or alias name. They say
+/// which route a request takes, not whose model it is, so they come off
+/// before the family is matched (Dubhe `brand-map.ts` `CHANNEL_PREFIXES`).
+const CHANNEL_PREFIXES: [&str; 7] = [
+    "super-relay-",
+    "mh-",
+    "ag-",
+    "or-",
+    "ap-",
+    "iquest-",
+    "ark-",
+];
+
+fn strip_channel_prefix(name: &str) -> &str {
+    CHANNEL_PREFIXES
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+        .unwrap_or(name)
+}
+
+/// The short model name the second row shows, taken from the model the
+/// pane's own session reported: `Opus 5.5 (1M context)` → `opus-5.5`.
+/// Empty when there is nothing to show; never taken from the pane label.
+pub fn short_model_name(model: &str) -> String {
+    let name = model
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    strip_channel_prefix(&name)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// A model family's mark. Glyphs for the five families the seats use are
+/// the @lobehub/icons marks Dubhe's brand-map uses, added to the
+/// Herdr Agent Icons Alkaid face at U+E1BA–E1BE (GLM is the z.ai Z knocked
+/// out of a tile); Qwen, Kimi and Grok keep the original face's glyphs.
 pub fn model_mark(family: ModelFamily, style: IconStyle) -> &'static str {
     match (family, style) {
-        (ModelFamily::Glm, _) => "GLM",
-        (ModelFamily::Claude, IconStyle::Glyph) => "\u{e1a0}",
-        (ModelFamily::Gpt, IconStyle::Glyph) => "\u{e1af}",
-        (ModelFamily::DeepSeek, IconStyle::Glyph) => "\u{e1ad}",
-        (ModelFamily::Gemini, IconStyle::Glyph) => "\u{e1ae}",
+        (ModelFamily::Glm, IconStyle::Glyph) => "\u{e1bb}",
+        (ModelFamily::Glm, IconStyle::Letter) => "GLM",
+        (ModelFamily::Claude, IconStyle::Glyph) => "\u{e1ba}",
+        (ModelFamily::Gpt, IconStyle::Glyph) => "\u{e1bd}",
+        (ModelFamily::DeepSeek, IconStyle::Glyph) => "\u{e1bc}",
+        (ModelFamily::Gemini, IconStyle::Glyph) => "\u{e1be}",
         (ModelFamily::Qwen, IconStyle::Glyph) => "\u{e1b0}",
         (ModelFamily::Kimi, IconStyle::Glyph) => "\u{e1a6}",
         (ModelFamily::Grok, IconStyle::Glyph) => "\u{e1b1}",
@@ -301,16 +300,14 @@ pub enum Channel {
     Official,
 }
 
-/// A channel's mark. Glyphs are Nerd Fonts Material Design icons carried by
-/// Maple Mono NF CN, the owner's Ghostty font, so the Mac needs no new
-/// codepoint map: U+F0AE2 (four-point star, for the Dubhe star) and U+F0791
-/// (check decagram, "official").
+/// A channel's mark. Official is the character 官 in every style (a check
+/// badge read as a success state). Dubhe is its own Big Dipper logo, reduced
+/// to a one-cell glyph at U+E1BF of the Herdr Agent Icons Alkaid face.
 pub fn channel_mark(channel: Channel, style: IconStyle) -> &'static str {
     match (channel, style) {
-        (Channel::Dubhe, IconStyle::Glyph) => "\u{f0ae2}",
-        (Channel::Official, IconStyle::Glyph) => "\u{f0791}",
+        (Channel::Dubhe, IconStyle::Glyph) => "\u{e1bf}",
         (Channel::Dubhe, IconStyle::Letter) => "天枢",
-        (Channel::Official, IconStyle::Letter) => "官方",
+        (Channel::Official, _) => "官",
     }
 }
 
@@ -377,6 +374,27 @@ mod tests {
         ] {
             assert_eq!(model_family(model), family, "{model}");
         }
+    }
+
+    #[test]
+    fn the_short_model_name_and_family_follow_dubhe_naming() {
+        for (reported, short) in [
+            ("Opus 5.5 (1M context)", "opus-5.5"),
+            ("Fable 5.1", "fable-5.1"),
+            ("deepseek-v4.1-flash", "deepseek-v4.1-flash"),
+            ("iquest-m1-coder", "m1-coder"),
+            ("ark-glm-5.3", "glm-5.3"),
+            ("  ", ""),
+        ] {
+            assert_eq!(short_model_name(reported), short, "{reported}");
+        }
+        // A channel prefix is a route, not a brand; `codex-*` is the Codex
+        // product, not an OpenAI model (Dubhe brand-map).
+        assert_eq!(model_family("super-relay-glm5.2"), Some(ModelFamily::Glm));
+        assert_eq!(model_family("ark-kimi-k3"), Some(ModelFamily::Kimi));
+        assert_eq!(model_family("codex-mini"), None);
+        assert_eq!(model_family("gpt-5-codex"), Some(ModelFamily::Gpt));
+        assert_eq!(model_family("glm-5.3-fp8-1m"), Some(ModelFamily::Glm));
     }
 
     #[test]
@@ -449,18 +467,16 @@ mod tests {
     }
 
     #[test]
-    fn marks_have_a_letter_fallback_and_glm_is_always_text() {
-        assert_eq!(model_mark(ModelFamily::Glm, IconStyle::Glyph), "GLM");
+    fn marks_have_a_letter_fallback_and_glm_is_the_zai_glyph() {
+        assert_eq!(model_mark(ModelFamily::Glm, IconStyle::Glyph), "\u{e1bb}");
+        assert_eq!(model_mark(ModelFamily::Glm, IconStyle::Letter), "GLM");
         assert_eq!(
             model_mark(ModelFamily::DeepSeek, IconStyle::Glyph),
-            "\u{e1ad}"
+            "\u{e1bc}"
         );
         assert_eq!(model_mark(ModelFamily::DeepSeek, IconStyle::Letter), "DS");
         assert_eq!(channel_mark(Channel::Dubhe, IconStyle::Letter), "天枢");
-        assert_eq!(
-            channel_mark(Channel::Official, IconStyle::Glyph),
-            "\u{f0791}"
-        );
+        assert_eq!(channel_mark(Channel::Official, IconStyle::Glyph), "官");
     }
 
     #[test]
@@ -475,9 +491,6 @@ mod tests {
         }
         for layout in [LogoLayout::None, LogoLayout::Inline, LogoLayout::SecondRow] {
             assert_eq!(LogoLayout::parse(layout.as_str()), Some(layout));
-        }
-        for mark in [DsMark::Launcher, DsMark::Base] {
-            assert_eq!(DsMark::parse(mark.as_str()), Some(mark));
         }
         assert!(GroupStyle::Count.counts_status());
         assert!(GroupStyle::Count.gaps());

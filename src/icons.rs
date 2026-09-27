@@ -8,7 +8,7 @@
 use crate::model::Harness;
 
 /// DeepSeek's whale in the same face (post-table glyph name `deepseek`).
-const DEEPSEEK_MARK: &str = "\u{e1ad}";
+const DEEPSEEK_MARK: &str = "\u{e1bc}";
 
 /// How the vendor mark is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,9 +53,11 @@ impl IconStyle {
 /// One-cell mark for a harness.
 pub fn for_harness(harness: Harness) -> &'static str {
     match harness {
-        Harness::Claude => "\u{e1a0}",
-        Harness::Codex => "\u{e1a1}",
-        Harness::Cursor => "\u{e1ab}",
+        // Herdr Agent Icons Alkaid U+E1B7–E1B9: the @lobehub/icons harness
+        // marks Dubhe's brand-map uses (Claude Code pixel crab, Codex, Cursor).
+        Harness::Claude => "\u{e1b7}",
+        Harness::Codex => "\u{e1b8}",
+        Harness::Cursor => "\u{e1b9}",
     }
 }
 
@@ -115,10 +117,10 @@ mod tests {
     }
 
     #[test]
-    fn supported_harnesses_use_the_radar_pua() {
-        assert_eq!(for_harness(Harness::Claude), "\u{e1a0}");
-        assert_eq!(for_harness(Harness::Codex), "\u{e1a1}");
-        assert_eq!(for_harness(Harness::Cursor), "\u{e1ab}");
+    fn supported_harnesses_use_the_alkaid_harness_glyphs() {
+        assert_eq!(for_harness(Harness::Claude), "\u{e1b7}");
+        assert_eq!(for_harness(Harness::Codex), "\u{e1b8}");
+        assert_eq!(for_harness(Harness::Cursor), "\u{e1b9}");
     }
 
     #[test]
@@ -132,7 +134,7 @@ mod tests {
             assert!(is_deepseek(model), "{model}");
             assert_eq!(
                 for_pane(Harness::Claude, model, IconStyle::Glyph),
-                "\u{e1ad}"
+                "\u{e1bc}"
             );
             assert_eq!(for_pane(Harness::Claude, model, IconStyle::Letter), "DS");
         }

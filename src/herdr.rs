@@ -72,7 +72,6 @@ pub(crate) struct Look {
     pub style: crate::icons::IconStyle,
     pub group: crate::look::GroupStyle,
     pub logos: crate::look::LogoLayout,
-    pub ds_mark: crate::look::DsMark,
     /// Which rows the installed template shows; decides what a report over
     /// Herdr's token budget may defer.
     pub rows: crate::cli::SidebarRows,
@@ -110,7 +109,6 @@ impl Look {
             style: crate::icons::IconStyle::installed(),
             group,
             logos: crate::look::LogoLayout::installed(),
-            ds_mark: crate::look::DsMark::installed(),
             rows: crate::configure::resolved_sidebar_rows(None),
             counts: space_counts(&folded),
             tails,
@@ -123,7 +121,6 @@ impl Look {
             style: crate::icons::IconStyle::Glyph,
             group: crate::look::GroupStyle::Plain,
             logos: crate::look::LogoLayout::None,
-            ds_mark: crate::look::DsMark::Launcher,
             rows: crate::cli::SidebarRows::Identity,
             counts: BTreeMap::new(),
             tails: BTreeSet::new(),
@@ -1276,23 +1273,27 @@ fn apply_seat_identity(
                 .get(&pane.pane_id)
                 .map(|label| crate::identity::from_label(label))
                 .unwrap_or_default();
-            for (name, value) in [(ROLE_TOKEN, identity.role), (MODEL_TOKEN, identity.model)] {
-                if value.is_empty() {
-                    desired.remove(name);
-                } else {
-                    desired.insert(name.to_string(), value);
-                }
+            if identity.role.is_empty() {
+                desired.remove(ROLE_TOKEN);
+            } else {
+                desired.insert(ROLE_TOKEN.to_string(), identity.role);
             }
         }
         None => {
-            for name in [ROLE_TOKEN, MODEL_TOKEN] {
-                match pane.tokens.get(name) {
-                    Some(value) => desired.insert(name.to_string(), value.clone()),
-                    None => desired.remove(name),
-                };
-            }
+            match pane.tokens.get(ROLE_TOKEN) {
+                Some(value) => desired.insert(ROLE_TOKEN.to_string(), value.clone()),
+                None => desired.remove(ROLE_TOKEN),
+            };
         }
     }
+    // The model name comes from the same evidence as the model mark: the
+    // model this pane's own session reported. The label's model segment is a
+    // naming snapshot (a Codex coordinator writes `codex-home` there), so a
+    // pane without that evidence shows no model name (owner 0927).
+    match session_model(pane, desired).map(crate::look::short_model_name) {
+        Some(name) if !name.is_empty() => desired.insert(MODEL_TOKEN.to_string(), name),
+        _ => desired.remove(MODEL_TOKEN),
+    };
     let space = (!order.groups_by_space())
         .then(|| workspace_labels.get(&pane.workspace_id))
         .flatten()
@@ -1301,6 +1302,18 @@ fn apply_seat_identity(
         Some(label) => desired.insert(SPACE_TOKEN.to_string(), label.clone()),
         None => desired.remove(SPACE_TOKEN),
     };
+}
+
+/// The model a pane's own agent session reported (`quota_model`, per session
+/// from the Claude Code statusLine). A session-less pane can still hold a
+/// `quota_model` an older build borrowed from another seat, so it counts as
+/// no evidence.
+fn session_model<'a>(pane: &AgentPane, desired: &'a BTreeMap<String, String>) -> Option<&'a str> {
+    pane.session.as_ref()?;
+    desired
+        .get("quota_model")
+        .map(String::as_str)
+        .filter(|model| !model.trim().is_empty())
 }
 
 /// Pane id → label from one `herdr pane list` call. Metadata only: this
@@ -1646,10 +1659,10 @@ fn apply_group_and_icon(
         .or_else(|| pane.tokens.get(MODEL_TOKEN))
         .map(String::as_str)
         .unwrap_or_default();
-    // With logos on and the launcher reading, the first mark is the harness
-    // itself (Claude Code for a DS base too) and the whale is the model mark.
-    // The base reading and the logo-less rows keep round two's whale.
-    let glyph = if look.logos.shows_logos() && look.ds_mark == crate::look::DsMark::Launcher {
+    // With logos on, the first mark is the harness itself — a Claude Code
+    // seat on DeepSeek is still the crab; the whale is its model mark (owner
+    // 0927). The logo-less rows keep round two's whale.
+    let glyph = if look.logos.shows_logos() {
         crate::icons::for_harness_styled(pane.harness, style)
     } else {
         crate::icons::for_pane(pane.harness, model, style)
@@ -1725,11 +1738,7 @@ fn apply_logos(
     // pane can still hold a `quota_model` an older build borrowed (0927: two
     // such panes showed another seat's "Fable 5.1"). Nothing reported, no
     // mark.
-    let model = match pane.session {
-        Some(_) => desired.get("quota_model").map(String::as_str),
-        None => None,
-    }
-    .unwrap_or_default();
+    let model = session_model(pane, desired).unwrap_or_default();
     match crate::look::model_family(model) {
         Some(family) => desired.insert(
             MODEL_MARK_TOKEN.to_string(),
@@ -2341,15 +2350,15 @@ mod tests {
         );
         assert_eq!(
             desired.get(CHANNEL_TOKEN).map(String::as_str),
-            Some("\u{f0ae2}")
+            Some("\u{e1bf}")
         );
         assert_eq!(
             desired.get(MODEL_MARK_TOKEN).map(String::as_str),
-            Some("\u{e1ad}")
+            Some("\u{e1bc}")
         );
         assert_eq!(
             desired.get("quota_icon_working").map(String::as_str),
-            Some("\u{e1a0}"),
+            Some("\u{e1b7}"),
             "with logos on the first mark is the harness, not the whale"
         );
 
@@ -2357,13 +2366,10 @@ mod tests {
         let official = BTreeMap::from([("w2:p1".to_string(), process(None, true))]);
         let mut desired = BTreeMap::from([("quota_model".to_string(), "GLM-5.3".to_string())]);
         apply_logos(&mut desired, &pane, &look, Some(&official));
-        assert_eq!(
-            desired.get(CHANNEL_TOKEN).map(String::as_str),
-            Some("\u{f0791}")
-        );
+        assert_eq!(desired.get(CHANNEL_TOKEN).map(String::as_str), Some("官"));
         assert_eq!(
             desired.get(MODEL_MARK_TOKEN).map(String::as_str),
-            Some("GLM")
+            Some("\u{e1bb}")
         );
 
         // No process, no session model: a label naming a model (or the
@@ -2371,8 +2377,8 @@ mod tests {
         for label_model in ["ds-v41-flash", "codex-home"] {
             let mut desired = BTreeMap::from([
                 (MODEL_TOKEN.to_string(), label_model.to_string()),
-                (CHANNEL_TOKEN.to_string(), "\u{f0ae2}".to_string()),
-                (MODEL_MARK_TOKEN.to_string(), "\u{e1ad}".to_string()),
+                (CHANNEL_TOKEN.to_string(), "\u{e1bf}".to_string()),
+                (MODEL_MARK_TOKEN.to_string(), "\u{e1bc}".to_string()),
             ]);
             apply_logos(&mut desired, &pane, &look, Some(&BTreeMap::new()));
             assert!(!desired.contains_key(CHANNEL_TOKEN), "{label_model}");
@@ -2407,44 +2413,7 @@ mod tests {
         assert!(!desired.contains_key(MODEL_MARK_TOKEN));
         assert_eq!(
             desired.get("quota_icon_working").map(String::as_str),
-            Some("\u{e1ad}")
-        );
-    }
-
-    #[test]
-    fn the_base_reading_puts_the_whale_on_the_first_row() {
-        use crate::look::{DsMark, GroupStyle, LogoLayout};
-        let pane = attention_pane("w2:p1", "055", AgentStatus::Done);
-        let mut look = looked(
-            GroupStyle::Plain,
-            LogoLayout::SecondRow,
-            std::slice::from_ref(&pane),
-        );
-        look.ds_mark = DsMark::Base;
-        let mut desired = BTreeMap::from([(MODEL_TOKEN.to_string(), "ds-v41-flash".to_string())]);
-        apply_group_and_icon(
-            &mut desired,
-            &pane,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &look,
-        );
-        assert_eq!(
-            desired.get("quota_icon_done").map(String::as_str),
-            Some("\u{e1ad}")
-        );
-        // A Claude base keeps the star under either reading.
-        let mut desired = BTreeMap::from([(MODEL_TOKEN.to_string(), "opus-5-5".to_string())]);
-        apply_group_and_icon(
-            &mut desired,
-            &pane,
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-            &look,
-        );
-        assert_eq!(
-            desired.get("quota_icon_done").map(String::as_str),
-            Some("\u{e1a0}")
+            Some("\u{e1bc}")
         );
     }
 
@@ -2624,7 +2593,6 @@ mod tests {
                 style: self.look.style,
                 group: self.look.group,
                 logos: self.look.logos,
-                ds_mark: self.look.ds_mark,
                 rows: self.look.rows,
                 counts: BTreeMap::new(),
                 tails: BTreeSet::new(),
@@ -3002,11 +2970,12 @@ mod tests {
     }
 
     #[test]
-    fn seat_identity_comes_from_the_pane_label() {
+    fn the_role_comes_from_the_label_and_the_model_from_the_session() {
         use crate::cli::AgentOrder;
-        let pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
+        let mut pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
         let panes = labels(&[("w1:p1", "hub.alioth.统筹.0925-2307.opus-5-5@cpu-box")]);
-        let mut desired = BTreeMap::new();
+        // No session: the label's model segment is no evidence (owner 0927).
+        let mut desired = BTreeMap::from([("quota_model".to_string(), "Fable 5.1".to_string())]);
         apply_seat_identity(
             &mut desired,
             &pane,
@@ -3015,11 +2984,28 @@ mod tests {
             &BTreeMap::new(),
         );
         assert_eq!(desired.get(ROLE_TOKEN).map(String::as_str), Some("统筹"));
+        assert!(!desired.contains_key(MODEL_TOKEN));
+        assert!(!desired.contains_key(SPACE_TOKEN));
+        // With its own session, the reported model, shortened.
+        pane.session = Some(AgentSession {
+            kind: None,
+            value: "s-1".to_string(),
+        });
+        let mut desired = BTreeMap::from([(
+            "quota_model".to_string(),
+            "Opus 5.5 (1M context)".to_string(),
+        )]);
+        apply_seat_identity(
+            &mut desired,
+            &pane,
+            Some(&panes),
+            AgentOrder::Quota,
+            &BTreeMap::new(),
+        );
         assert_eq!(
             desired.get(MODEL_TOKEN).map(String::as_str),
-            Some("opus-5-5")
+            Some("opus-5.5")
         );
-        assert!(!desired.contains_key(SPACE_TOKEN));
     }
 
     #[test]
@@ -3055,7 +3041,9 @@ mod tests {
         let mut kept = BTreeMap::new();
         apply_seat_identity(&mut kept, &pane, None, AgentOrder::Quota, &BTreeMap::new());
         assert_eq!(kept.get(ROLE_TOKEN).map(String::as_str), Some("hub"));
-        assert_eq!(kept.get(MODEL_TOKEN).map(String::as_str), Some("opus-5-5"));
+        // The model name no longer rides on the label, so a failed label read
+        // does not keep one either: without session evidence it is empty.
+        assert!(!kept.contains_key(MODEL_TOKEN));
 
         let panes = labels(&[("w1:p1", "1")]);
         let mut cleared = pane.tokens.clone();
@@ -3108,7 +3096,7 @@ mod tests {
         );
         assert_eq!(
             desired.get("quota_icon_working").map(String::as_str),
-            Some("\u{e1ad}")
+            Some("\u{e1bc}")
         );
         // Focus / watcher passes start from the pane's tokens only.
         pane.tokens
@@ -3123,7 +3111,7 @@ mod tests {
         );
         assert_eq!(
             icon_only.get("quota_icon_working").map(String::as_str),
-            Some("\u{e1ad}")
+            Some("\u{e1bc}")
         );
         let mut letters = BTreeMap::new();
         apply_group_and_icon(

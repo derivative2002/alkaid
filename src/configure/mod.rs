@@ -135,18 +135,12 @@ pub fn run(
         let look = resolved_row_look(&options);
         prefs::write(prefs::GROUP_STYLE, look.group.as_str())?;
         prefs::write(prefs::LOGO_LAYOUT, look.logos.as_str())?;
-        // Token values only, not rows: stored for the publish pass to read.
-        let ds_mark = options
-            .ds_mark
-            .unwrap_or_else(crate::look::DsMark::installed);
-        prefs::write(prefs::DS_MARK, ds_mark.as_str())?;
         println!(
-            "Sidebar rows: {}; vendor marks: {}; Space headers: {}; logos: {}; DS-base mark: {}.",
+            "Sidebar rows: {}; vendor marks: {}; Space headers: {}; logos: {}.",
             rows.as_str(),
             style.as_str(),
             look.group.as_str(),
-            look.logos.as_str(),
-            ds_mark.as_str()
+            look.logos.as_str()
         );
         herdr::apply(agents, layout, gap, fields, brand, order, rows, look)?;
         for note in font::install(cache.root())? {

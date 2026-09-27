@@ -141,11 +141,6 @@ pub enum Command {
         /// the role).
         #[arg(long, value_enum)]
         logo_layout: Option<crate::look::LogoLayout>,
-        /// First-row mark of a DeepSeek-base Claude Code seat under a logo
-        /// layout: launcher (default, the Claude mark; the whale is the model
-        /// mark) or base (the whale, as in round two).
-        #[arg(long, value_enum)]
-        ds_mark: Option<crate::look::DsMark>,
     },
     /// Switch the Agent panel between Space grouping and the attention order.
     ///
@@ -508,7 +503,6 @@ pub struct ConfigureOptions {
     pub icon_style: Option<crate::icons::IconStyle>,
     pub group_style: Option<crate::look::GroupStyle>,
     pub logo_layout: Option<crate::look::LogoLayout>,
-    pub ds_mark: Option<crate::look::DsMark>,
 }
 
 /// Which side of a quota window a percentage reports.

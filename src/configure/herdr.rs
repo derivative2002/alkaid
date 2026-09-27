@@ -1201,10 +1201,11 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout, order: AgentOrder)
 /// each seat only when not; the other is empty and Herdr collapses it.
 ///
 /// 1. `$quota_group`
-/// 2. the brand icon twins in the existing three colours, `state_text`
-///    (Chinese labels the plugin writes once per pane), `$al_space`, `tab`
-///    (the header label)
-/// 3. `$al_role` and `$al_model` from the pane label (naming-spec §5)
+/// 2. the harness icon twins in the existing three colours — the colour is
+///    the state, no state text (owner 0927) — then `$al_space`, `tab`
+/// 3. `$al_role` from the pane label (naming-spec §5), then with the
+///    default second-row logos `$al_channel` and `$al_model_mark`, then
+///    `$al_model` from the pane's own session (empty without evidence)
 /// 4. `pane` — the pane label itself, i.e. the session name
 fn append_identity_rows(rows: &mut Array, look: RowLook) {
     let (group_fg, group_bold) = match look.group {
@@ -1238,7 +1239,8 @@ fn append_identity_rows(rows: &mut Array, look: RowLook) {
         identity.push(channel.clone());
         identity.push(mark.clone());
     }
-    identity.push(styled_token("state_text", None, Some(true), Some(false)));
+    // No state text: the harness mark's colour is the state (owner 0927 —
+    // white idle or seen, yellow working, teal finished and unseen).
     identity.push(styled_token(
         "$al_space",
         Some(AGENT_SECONDARY_COLOR),

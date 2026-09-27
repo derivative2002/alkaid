@@ -37,7 +37,6 @@ fn main() -> Result<()> {
             icon_style,
             group_style,
             logo_layout,
-            ds_mark,
         } => herdr_agent_quota::configure::run(
             check,
             apply,
@@ -56,7 +55,6 @@ fn main() -> Result<()> {
                 icon_style,
                 group_style,
                 logo_layout,
-                ds_mark,
             },
         ),
         Command::ToggleOrder => herdr_agent_quota::refresh::toggle_order(),

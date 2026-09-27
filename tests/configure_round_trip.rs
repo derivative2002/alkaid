@@ -3058,15 +3058,16 @@ fn identity_rows_show_who_each_seat_is_and_no_usage() {
         rows,
         [
             vec!["$quota_group"],
+            // No state text: the harness icon's colour is the state (0927).
             vec![
                 "$quota_icon",
                 "$quota_icon_working",
                 "$quota_icon_done",
-                "state_text",
                 "$al_space",
                 "tab"
             ],
-            vec!["$al_role", "$al_model"],
+            // Second-row logos are the default (0927).
+            vec!["$al_role", "$al_channel", "$al_model_mark", "$al_model"],
             vec!["pane"],
         ]
     );
@@ -3144,7 +3145,11 @@ fn configure_defaults_to_identity_rows_and_can_restore_the_usage_rows() {
         String::from_utf8_lossy(&output.stderr)
     );
     let sidebar = homes.sidebar();
-    assert_eq!(managed_rows(&sidebar)[1][3], "state_text", "{sidebar}");
+    assert!(
+        !managed_rows(&sidebar)[1].contains(&"state_text".to_string()),
+        "{sidebar}"
+    );
+    assert_eq!(managed_rows(&sidebar)[2][1], "$al_channel", "{sidebar}");
     assert!(sidebar.contains("$al_role"), "{sidebar}");
     assert!(!sidebar.contains("$quota_5h"), "{sidebar}");
     assert!(
@@ -3219,14 +3224,40 @@ const EVERY_LOGO: [herdr_agent_quota::look::LogoLayout; 3] = [
 #[test]
 fn every_candidate_look_writes_the_rows_it_promises() {
     use herdr_agent_quota::look::{GroupStyle, LogoLayout};
-    let plain = managed_rows(&looked_rows("", GroupStyle::Plain, LogoLayout::None));
+    // The defaults are plain headers with second-row logos.
     assert_eq!(
-        plain,
+        managed_rows(&looked_rows("", GroupStyle::Plain, LogoLayout::SecondRow)),
         managed_rows(&identity_rows(
             "",
             herdr_agent_quota::cli::AgentOrder::Quota
         ))
     );
+    // Logos off keeps round two's rows minus the state text.
+    assert_eq!(
+        managed_rows(&looked_rows("", GroupStyle::Plain, LogoLayout::None)),
+        [
+            vec!["$quota_group"],
+            vec![
+                "$quota_icon",
+                "$quota_icon_working",
+                "$quota_icon_done",
+                "$al_space",
+                "tab"
+            ],
+            vec!["$al_role", "$al_model"],
+            vec!["pane"],
+        ]
+    );
+    // No identity look shows state text any more.
+    for group in EVERY_GROUP {
+        for logos in EVERY_LOGO {
+            let rows = managed_rows(&looked_rows("", group, logos));
+            assert!(
+                !rows.concat().contains(&"state_text".to_string()),
+                "{group:?} {logos:?}"
+            );
+        }
+    }
 
     let rule = managed_rows(&looked_rows("", GroupStyle::Rule, LogoLayout::Inline));
     assert_eq!(rule[0], ["$quota_group"]);
@@ -3242,7 +3273,6 @@ fn every_candidate_look_writes_the_rows_it_promises() {
             "$quota_icon_done",
             "$al_channel",
             "$al_model_mark",
-            "state_text",
             "$al_space",
             "tab"
         ]
