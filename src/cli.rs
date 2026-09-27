@@ -128,17 +128,17 @@ pub enum Command {
         /// every usage row). Quota keeps being collected either way.
         #[arg(long, value_enum)]
         sidebar_rows: Option<SidebarRows>,
-        /// Vendor marks: glyph (Herdr Agent Icons Max PUA glyphs, default) or
-        /// letter (two-letter ASCII badges for a terminal without that face).
+        /// Vendor marks: glyph (Herdr Agent Icons Alkaid PUA glyphs, default)
+        /// or letter (ASCII badges for a terminal without that face).
         #[arg(long, value_parser = parse_icon_style)]
         icon_style: Option<crate::icons::IconStyle>,
         /// Space header in the identity rows: plain (default), rule, count
         /// or bar. Candidates for the owner (0927); plain is round two.
         #[arg(long, value_enum)]
         group_style: Option<crate::look::GroupStyle>,
-        /// Harness / channel / model marks: none (default), inline (all
-        /// three on the first row) or second-row (channel and model beside
-        /// the role).
+        /// Harness / channel / model marks: second-row (default; channel and
+        /// model beside the role), inline (all three on the first row) or
+        /// none (harness only).
         #[arg(long, value_enum)]
         logo_layout: Option<crate::look::LogoLayout>,
     },

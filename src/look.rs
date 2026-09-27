@@ -134,7 +134,7 @@ pub const GAP: &str = "\u{200b}";
 /// Where the three logo kinds sit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum LogoLayout {
-    /// Harness mark only; a DeepSeek base swaps it for the whale (round two).
+    /// Harness mark only; no channel or model mark.
     None,
     /// First row: harness · channel · model marks, then Tab.
     Inline,

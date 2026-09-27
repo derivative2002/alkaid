@@ -1,19 +1,20 @@
 //! Vendor marks for the sidebar identity row.
 //!
-//! Prefer Private Use Area glyphs from the bundled Herdr Agent Icons Max
-//! face (same marks herdr-radar ships). Terminals need the codepoint map that
+//! Prefer Private Use Area glyphs from the bundled Herdr Agent Icons Alkaid
+//! face (the herdr-radar Max marks plus the lobehub harness and model marks
+//! at U+E1B7–E1BF). Terminals need the codepoint map that
 //! [`crate::configure::font`] writes for Ghostty / kitty; without it the
 //! PUA cells render as missing glyphs. For a terminal that cannot show them,
 //! [`IconStyle::Letter`] swaps every mark for a two-letter ASCII badge.
 use crate::model::Harness;
 
-/// DeepSeek's whale in the same face (post-table glyph name `deepseek`).
+/// DeepSeek's whale (lobehub DeepSeek Mono, U+E1BC).
 const DEEPSEEK_MARK: &str = "\u{e1bc}";
 
 /// How the vendor mark is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IconStyle {
-    /// One PUA glyph from Herdr Agent Icons Max.
+    /// One PUA glyph from Herdr Agent Icons Alkaid.
     #[default]
     Glyph,
     /// Two ASCII letters, for a terminal without the icon face.
