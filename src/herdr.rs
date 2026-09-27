@@ -752,12 +752,15 @@ fn agent_view_request(order: crate::cli::AgentOrder) -> Value {
             serde_json::json!({"field": {"token": ROLE_RANK_TOKEN}, "order": "asc"}),
             key,
         ],
-        // By the colour the user sees (`al_att`), then 中枢 and the other
-        // custom groups before the Spaces, then Space, then quota.
+        // By the colour the user sees (`al_att`); within a colour the
+        // `role` order (owner 0928: attention first, then 按组·角色):
+        // 中枢 and the other custom groups before the Spaces, then Space,
+        // then role, then quota.
         AgentOrder::Attention => vec![
             serde_json::json!({"field": {"token": ATTENTION_TOKEN}, "order": "asc"}),
             serde_json::json!({"field": {"token": GROUP_TOKEN}, "order": "asc"}),
             serde_json::json!({"field": "workspace_order", "order": "asc"}),
+            serde_json::json!({"field": {"token": ROLE_RANK_TOKEN}, "order": "asc"}),
             key,
         ],
         AgentOrder::Tightest => vec![key],
@@ -2933,6 +2936,7 @@ mod tests {
                 {"field": {"token": "al_att"}, "order": "asc"},
                 {"field": {"token": "al_grp"}, "order": "asc"},
                 {"field": "workspace_order", "order": "asc"},
+                {"field": {"token": "al_role_rank"}, "order": "asc"},
                 {"field": {"token": "al_sort"}, "order": "asc"},
             ])
         );
