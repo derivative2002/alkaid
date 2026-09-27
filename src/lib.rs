@@ -11,6 +11,7 @@ pub mod process;
 
 pub mod configure;
 pub mod dashboard;
+pub mod groups;
 pub mod herdr;
 pub mod providers;
 pub mod refresh;

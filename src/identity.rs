@@ -14,6 +14,10 @@ pub struct SeatIdentity {
     pub role: String,
     /// The label's model segment, verbatim (`opus-5-5`, `ds-v4-1-flash`).
     pub model: String,
+    /// The container segment: the project line (`alioth`, `dubhe`).
+    pub line: String,
+    /// The task segment (`统筹`, `侧栏开发`).
+    pub task: String,
 }
 
 /// Seats named by their task rather than their role segment. naming-spec
@@ -51,6 +55,8 @@ fn parse(label: &str) -> Option<SeatIdentity> {
     Some(SeatIdentity {
         role: role.to_string(),
         model: model.unwrap_or_default().to_string(),
+        line: container.to_string(),
+        task: task.to_string(),
     })
 }
 
@@ -78,35 +84,44 @@ fn is_gen(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn id(role: &str, model: &str) -> SeatIdentity {
-        SeatIdentity {
-            role: role.to_string(),
-            model: model.to_string(),
-        }
+    fn id(role: &str, model: &str) -> (String, String) {
+        (role.to_string(), model.to_string())
+    }
+
+    fn role_model(label: &str) -> (String, String) {
+        let identity = from_label(label);
+        (identity.role, identity.model)
+    }
+
+    #[test]
+    fn line_and_task_are_the_container_and_task_segments() {
+        let identity = from_label("hub.alioth.侧栏开发.0926-0036.opus-5-5@cpu-box");
+        assert_eq!(identity.line, "alioth");
+        assert_eq!(identity.task, "侧栏开发");
     }
 
     #[test]
     fn coordinator_and_secretary_come_from_the_task_segment() {
         assert_eq!(
-            from_label("hub.alioth.统筹.0925-2307.opus-5-5@cpu-box"),
+            role_model("hub.alioth.统筹.0925-2307.opus-5-5@cpu-box"),
             id("统筹", "opus-5-5")
         );
-        assert_eq!(from_label("hub.alioth.秘书.0921-1800"), id("秘书", ""));
+        assert_eq!(role_model("hub.alioth.秘书.0921-1800"), id("秘书", ""));
     }
 
     #[test]
     fn role_segments_map_to_the_sidebar_words() {
         assert_eq!(
-            from_label("hub.alioth.侧栏开发.0926-0036.opus-5-5@cpu-box"),
+            role_model("hub.alioth.侧栏开发.0926-0036.opus-5-5@cpu-box"),
             id("hub", "opus-5-5")
         );
         assert_eq!(
-            from_label("spk.dubhe.audit复核.0831-2139.ds-v4-1-flash"),
+            role_model("spk.dubhe.audit复核.0831-2139.ds-v4-1-flash"),
             id("spoke", "ds-v4-1-flash")
         );
-        assert_eq!(from_label("svc.dubhe.gateway.0902-0400"), id("svc", ""));
+        assert_eq!(role_model("svc.dubhe.gateway.0902-0400"), id("svc", ""));
         assert_eq!(
-            from_label("subhub.lab.夜巡.20261231-2359.glm-5-3"),
+            role_model("subhub.lab.夜巡.20261231-2359.glm-5-3"),
             id("subhub", "glm-5-3")
         );
     }

@@ -58,6 +58,7 @@ fn main() -> Result<()> {
             },
         ),
         Command::ToggleOrder => herdr_agent_quota::refresh::toggle_order(),
+        Command::Groups { file } => herdr_agent_quota::groups::check(file.as_deref()),
         Command::ClaudeStatusline => herdr_agent_quota::configure::claude::run_statusline_hook(),
     }
 }

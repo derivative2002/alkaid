@@ -142,12 +142,22 @@ pub enum Command {
         #[arg(long, value_enum)]
         logo_layout: Option<crate::look::LogoLayout>,
     },
-    /// Switch the Agent panel between Space grouping and the attention order.
+    /// Step the Agent panel to its next order: grouped by quota, grouped by
+    /// role, attention.
     ///
     /// Bound to prefix+shift+o by configure and exposed as the
     /// `herdr-agent-quota.toggle-order` action. Sets the Agent view and
     /// republishes from cache; it fetches no quota and rewrites no config.
     ToggleOrder,
+    /// Check the custom groups file and show which seat lands in which group.
+    ///
+    /// Reads `groups` from the plugin config directory (or `--file`) and the
+    /// pane labels (metadata only). Writes nothing.
+    Groups {
+        /// A rules file to check instead of the installed one.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+    },
     /// Render the settings pane shown in the Herdr popup pane.
     Settings,
     /// Claude statusLine hook. Claude Code invokes this; not for manual use.
@@ -640,6 +650,12 @@ fn parse_row_gap(value: &str) -> Result<SidebarRowGap, String> {
 /// `$quota_group` headers, and ranking by headroom is a free extra on top.
 /// Choose `default` to hand the panel back to Herdr's own policy (also
 /// Space-grouped unless the user set `priority`).
+///
+/// Round five (owner 0928) adds `role` — grouped like `quota`, but inside a
+/// group 统筹, 秘书, hub, subhub, spoke, svc come in that order, tightest quota
+/// first within a role — and `tightest`, a flat list by quota alone. Both
+/// grouped orders also honour the user's custom groups (`crate::groups`),
+/// which sit above the Spaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum AgentOrder {
     /// Leave Herdr's own ordering alone.
@@ -650,18 +666,46 @@ pub enum AgentOrder {
     /// Across spaces: needs-you first, then working, then idle; least quota
     /// left first inside each band.
     Attention,
+    /// By group, then role (统筹 秘书 hub subhub spoke svc), then least quota
+    /// left first.
+    Role,
+    /// Across spaces, least quota left first.
+    Tightest,
 }
 
 impl AgentOrder {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_AGENT_ORDER";
     /// The order the settings pane cycles through.
-    pub const CHOICES: [Self; 3] = [Self::Default, Self::Quota, Self::Attention];
+    pub const CHOICES: [Self; 5] = [
+        Self::Default,
+        Self::Quota,
+        Self::Attention,
+        Self::Role,
+        Self::Tightest,
+    ];
+    /// What the toggle key (prefix+shift+o) steps through. `default` hands
+    /// the panel away and `tightest` is rarely wanted with identity rows
+    /// that show no quota digits, so both are left to the settings pane
+    /// (Codex r5 g1 §5).
+    pub const CYCLE: [Self; 3] = [Self::Quota, Self::Role, Self::Attention];
+
+    /// The toggle key's next order; from `default` it starts the cycle.
+    pub fn next(self) -> Self {
+        Self::CYCLE
+            .iter()
+            .position(|order| *order == self)
+            .map_or(Self::Quota, |index| {
+                Self::CYCLE[(index + 1) % Self::CYCLE.len()]
+            })
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::Quota => "quota",
             Self::Attention => "attention",
+            Self::Role => "role",
+            Self::Tightest => "tightest",
         }
     }
 
@@ -669,8 +713,10 @@ impl AgentOrder {
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "",
-            Self::Quota => "Quota by space",
-            Self::Attention => "attention",
+            Self::Quota => "按组·额度",
+            Self::Attention => "注意力",
+            Self::Role => "按组·角色",
+            Self::Tightest => "额度平铺",
         }
     }
 
@@ -679,10 +725,18 @@ impl AgentOrder {
         self != Self::Default
     }
 
-    /// Are a Space's panes contiguous in the panel? Only then does the
-    /// `$quota_group` header on the tightest pane read as a Space header.
+    /// Are a Space's (or custom group's) panes contiguous in the panel? Only
+    /// then does the `$quota_group` header on its first pane read as a
+    /// header.
     pub fn groups_by_space(self) -> bool {
-        self != Self::Attention
+        matches!(self, Self::Default | Self::Quota | Self::Role)
+    }
+
+    /// Does this order honour the user's custom groups? Only the grouped
+    /// orders whose view this plugin owns: under `default` Herdr orders the
+    /// panel and knows nothing of `al_grp`.
+    pub fn custom_groups(self) -> bool {
+        matches!(self, Self::Quota | Self::Role)
     }
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -690,6 +744,8 @@ impl AgentOrder {
             "default" | "herdr" | "off" => Some(Self::Default),
             "quota" | "headroom" | "grouped" | "on" => Some(Self::Quota),
             "attention" | "action" | "needs-you" => Some(Self::Attention),
+            "role" | "roles" => Some(Self::Role),
+            "tightest" | "flat" | "flat-quota" => Some(Self::Tightest),
             _ => None,
         }
     }
@@ -1009,6 +1065,31 @@ mod tests {
         assert!(AgentOrder::Default.groups_by_space());
         assert!(AgentOrder::Quota.groups_by_space());
         assert!(!AgentOrder::Attention.groups_by_space());
+        assert!(AgentOrder::Role.groups_by_space());
+        assert!(!AgentOrder::Tightest.groups_by_space());
+    }
+
+    #[test]
+    fn the_toggle_cycles_three_presets_and_default_starts_it() {
+        let mut order = AgentOrder::Default;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            order = order.next();
+            seen.push(order);
+        }
+        assert_eq!(
+            seen,
+            [
+                AgentOrder::Quota,
+                AgentOrder::Role,
+                AgentOrder::Attention,
+                AgentOrder::Quota,
+                AgentOrder::Role
+            ]
+        );
+        for order in AgentOrder::CHOICES {
+            assert_eq!(AgentOrder::parse(order.as_str()), Some(order));
+        }
         assert!(!AgentOrder::Default.owns_view());
         assert!(AgentOrder::Quota.owns_view());
         assert!(AgentOrder::Attention.owns_view());

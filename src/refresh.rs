@@ -441,10 +441,7 @@ fn shown(enabled: &[Harness], harness: Harness) -> bool {
 /// config is written, so the identity rows need no client-side edit.
 pub fn toggle_order() -> Result<()> {
     let cache = CacheStore::from_env()?;
-    let next = match crate::configure::resolved_agent_order(None, Some(&cache)) {
-        crate::cli::AgentOrder::Attention => crate::cli::AgentOrder::Quota,
-        _ => crate::cli::AgentOrder::Attention,
-    };
+    let next = crate::configure::resolved_agent_order(None, Some(&cache)).next();
     cache.set_agent_order(next)?;
     crate::prefs::write(crate::prefs::AGENT_ORDER, next.as_str())?;
     crate::configure::apply_agent_order(next);

@@ -158,6 +158,8 @@ impl Settings {
                 AgentOrder::Default => "Herdr's own policy",
                 AgentOrder::Quota => "by Space, least quota left first",
                 AgentOrder::Attention => "needs-you first across Spaces",
+                AgentOrder::Role => "by group, 统筹 秘书 hub spoke in order",
+                AgentOrder::Tightest => "least quota left first across Spaces",
             },
             Choice::Alert => match self.alert.is_off() {
                 true => "no notification",
