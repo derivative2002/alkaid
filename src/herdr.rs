@@ -251,6 +251,8 @@ pub(crate) struct Grouping {
     roles: BTreeMap<String, char>,
     /// Workspace id → its number in Herdr's order.
     ranks: BTreeMap<String, u64>,
+    /// Pane id → the `al_att` this pass writes, for panes it publishes.
+    atts: BTreeMap<String, String>,
 }
 
 impl Grouping {
@@ -285,7 +287,33 @@ impl Grouping {
             custom,
             roles,
             ranks,
+            atts: BTreeMap::new(),
         }
+    }
+
+    /// Record the colour rank each pane of this pass will carry. `panes`
+    /// have the plugin's unseen set folded in, so the rank is the colour
+    /// the pass draws.
+    fn publishing(mut self, panes: &[AgentPane]) -> Self {
+        for pane in panes {
+            let rank = if self.pinned(pane) {
+                PIN_ATTENTION
+            } else {
+                pane.icon_status().attention_rank()
+            };
+            self.atts.insert(pane.pane_id.clone(), rank.to_string());
+        }
+        self
+    }
+
+    /// The colour rank the view sorts this pane by: this pass's, else the
+    /// `al_att` it carries (none sorts last).
+    fn attention(&self, pane: &AgentPane) -> String {
+        self.atts
+            .get(&pane.pane_id)
+            .or_else(|| pane.tokens.get(ATTENTION_TOKEN))
+            .cloned()
+            .unwrap_or_else(|| UNSORTED.to_string())
     }
 
     /// Spaces only, as before round five.
@@ -336,12 +364,20 @@ impl Grouping {
     /// the workspace id (empty when the pane has none, which puts it in no
     /// group).
     fn gid(&self, pane: &AgentPane) -> String {
-        if self.order.custom_groups() && self.pinned(pane) {
-            return format!("#{PIN_GROUP}");
-        }
-        match self.custom_group(pane) {
-            Some(group) => format!("#C{}", crate::groups::Groups::key(group)),
-            None => pane.workspace_id.clone(),
+        let base = if self.order.custom_groups() && self.pinned(pane) {
+            format!("#{PIN_GROUP}")
+        } else {
+            match self.custom_group(pane) {
+                Some(group) => format!("#C{}", crate::groups::Groups::key(group)),
+                None => pane.workspace_id.clone(),
+            }
+        };
+        // Under attention a group repeats in each colour band (owner 0928,
+        // option B), so the band is part of the key.
+        if self.order == crate::cli::AgentOrder::Attention && !base.is_empty() {
+            format!("{}|{base}", self.attention(pane))
+        } else {
+            base
         }
     }
 
@@ -358,6 +394,7 @@ impl Grouping {
 
     /// The header text source for a group key; pinned seats have none.
     fn name(&self, gid: &str, workspace_labels: &BTreeMap<String, String>) -> Option<String> {
+        let gid = gid.rsplit('|').next().unwrap_or(gid);
         if gid == format!("#{PIN_GROUP}") {
             return None;
         }
@@ -391,7 +428,10 @@ impl Grouping {
             let rank = self.ranks.get(&pane.workspace_id).copied().unwrap_or(999);
             key.push_str(&format!("{rank:03}"));
         }
-        if self.order == crate::cli::AgentOrder::Role {
+        if matches!(
+            self.order,
+            crate::cli::AgentOrder::Role | crate::cli::AgentOrder::Attention
+        ) {
             let role = self
                 .roles
                 .get(&pane.pane_id)
@@ -1192,37 +1232,55 @@ pub fn publish_icon_tokens(panes: &[AgentPane], sequence: u64) -> Result<()> {
     };
     let order = installed_agent_order();
     // No labels here: every pane sits in the group its `al_grp` names. The
-    // workspace numbers are read only when a custom group can span Spaces.
+    // workspace list is read only when a header can move with a colour
+    // (attention) or a custom group can span Spaces.
     let rules = crate::groups::Groups::load();
-    let ranks = if order.custom_groups() && !rules.is_empty() {
-        list_workspaces()
-            .map(|(_, ranks)| ranks)
-            .unwrap_or_default()
+    let banded = order == crate::cli::AgentOrder::Attention;
+    let (labels, ranks) = if banded || (order.custom_groups() && !rules.is_empty()) {
+        list_workspaces().unwrap_or_default()
     } else {
-        BTreeMap::new()
+        (BTreeMap::new(), BTreeMap::new())
     };
-    let grouping = Grouping::new(order, rules, &[], None, ranks);
+    let labels = if banded { labels } else { BTreeMap::new() };
+    let grouping = Grouping::new(order, rules, &[], None, ranks).publishing(panes);
     let group_heads = space_group_heads(order, &grouping, &inventory, panes, &[]);
     let look = Look::installed(order, &grouping, &inventory, panes, &[]);
+    // Under attention a colour change moves a pane to another band, so the
+    // header and gap ride on its icon report too.
+    let names: &[&str] = if banded {
+        &ICON_REPORT_WITH_HEADER_NAMES
+    } else {
+        &ICON_REPORT_NAMES
+    };
     let mut reported = 0;
     let mut failed = Vec::new();
     for pane in panes {
         let mut desired = pane.tokens.clone();
-        apply_group_and_icon(
-            &mut desired,
-            pane,
-            &grouping,
-            &group_heads,
-            &BTreeMap::new(),
-            &look,
-        );
-        if icon_tokens_match(&pane.tokens, &desired) {
+        apply_group_and_icon(&mut desired, pane, &grouping, &group_heads, &labels, &look);
+        if names
+            .iter()
+            .all(|name| pane.tokens.get(*name) == desired.get(*name))
+        {
             continue;
         }
         reported += 1;
-        if !report_icon_metadata(&executable, pane, &desired, sequence)? {
+        if !report_named_metadata(&executable, pane, &desired, sequence, names)? {
             failed.push(pane.pane_id.clone());
         }
+    }
+    if banded {
+        let (synced, sync_failed) = sync_sibling_group_headers(
+            &executable,
+            &inventory,
+            panes,
+            &grouping,
+            &group_heads,
+            &labels,
+            &look,
+            sequence,
+        )?;
+        reported += synced;
+        failed.extend(sync_failed);
     }
     if reported > 0 && failed.len() == reported {
         anyhow::bail!(
@@ -1267,7 +1325,8 @@ fn publish_pane_tokens_inner(
         panes,
         pane_labels.as_ref(),
         workspace_ranks,
-    );
+    )
+    .publishing(panes);
     let mut group_heads = space_group_heads(order, &grouping, &inventory, panes, tokens);
     let mut look = Look::installed(order, &grouping, &inventory, panes, tokens);
     // Only a logo layout needs the agent processes' channel.
@@ -1417,6 +1476,17 @@ fn report_icon_metadata(
     desired: &BTreeMap<String, String>,
     sequence: u64,
 ) -> Result<bool> {
+    report_named_metadata(executable, pane, desired, sequence, &ICON_REPORT_NAMES)
+}
+
+/// Report exactly `names`: set the ones `desired` has, clear the rest.
+fn report_named_metadata(
+    executable: &std::ffi::OsStr,
+    pane: &AgentPane,
+    desired: &BTreeMap<String, String>,
+    sequence: u64,
+    names: &[&str],
+) -> Result<bool> {
     let mut command = Command::new(executable);
     command
         .args([
@@ -1427,7 +1497,7 @@ fn report_icon_metadata(
             "herdr-agent-quota",
         ])
         .args(["--seq", &sequence.to_string(), "--ttl-ms", METADATA_TTL_MS]);
-    for name in ICON_REPORT_NAMES {
+    for &name in names {
         if let Some(value) = desired.get(name) {
             command.args(["--token", &format!("{name}={value}")]);
         } else {
@@ -1514,7 +1584,10 @@ fn sync_sibling_group_headers(
             continue;
         }
         let gid = grouping.gid(sibling);
-        if !touched.contains(&gid) && !touched.contains(&sibling.workspace_id) {
+        // Under attention a colour change can reshape any band, so every
+        // sibling is checked; only a changed header is written.
+        let banded = grouping.order == crate::cli::AgentOrder::Attention;
+        if !banded && !touched.contains(&gid) && !touched.contains(&sibling.workspace_id) {
             continue;
         }
         let mut wanted = BTreeMap::new();
@@ -1622,7 +1695,7 @@ fn apply_seat_identity(
         Some(name) if !name.is_empty() => desired.insert(MODEL_TOKEN.to_string(), name),
         _ => desired.remove(MODEL_TOKEN),
     };
-    let space = (!order.groups_by_space())
+    let space = (!order.headed())
         .then(|| workspace_labels.get(&pane.workspace_id))
         .flatten()
         .filter(|label| !label.is_empty());
@@ -1777,7 +1850,7 @@ fn space_tails(
     publishing: &[AgentPane],
     tokens: &[PaneTokens],
 ) -> BTreeSet<String> {
-    if !(order.groups_by_space() && group.gaps()) {
+    if !(order.headed() && group.gaps()) {
         return BTreeSet::new();
     }
     space_ends(grouping, inventory, publishing, tokens)
@@ -1912,6 +1985,16 @@ const ICON_REPORT_NAMES: [&str; 4] = [
     "quota_icon_done",
     ATTENTION_TOKEN,
 ];
+/// [`ICON_REPORT_NAMES`] plus the header and gap, for the attention order,
+/// where a colour change moves the pane into another band's group.
+const ICON_REPORT_WITH_HEADER_NAMES: [&str; 6] = [
+    "quota_icon",
+    "quota_icon_working",
+    "quota_icon_done",
+    ATTENTION_TOKEN,
+    "quota_group",
+    GAP_TOKEN,
+];
 
 /// What Herdr's built-in `state_text` prints under the attention order: the
 /// DESIGN-r3 head row's action state, first thing on the identity row.
@@ -1985,7 +2068,7 @@ fn space_group_heads(
     publishing: &[AgentPane],
     tokens: &[PaneTokens],
 ) -> BTreeMap<String, String> {
-    if order.groups_by_space() {
+    if order.headed() {
         group_head_pane_ids(grouping, inventory, publishing, tokens)
     } else {
         BTreeMap::new()
@@ -2747,12 +2830,15 @@ mod tests {
         assert!(!spoke.contains_key(SPACE_TOKEN));
 
         // The value does not follow the order, so toggling writes nothing;
-        // under attention nobody is grouped.
-        let (panes, _, flat) = grouped_board(AgentOrder::Attention);
+        // under attention the group repeats in each colour band.
+        let (panes, _, banded) = grouped_board(AgentOrder::Attention);
+        let banded = banded.publishing(&panes);
         let mut desired = BTreeMap::new();
-        apply_grouping(&mut desired, &panes[0], &flat, &labels);
+        apply_grouping(&mut desired, &panes[0], &banded, &labels);
         assert_eq!(desired.get(GROUP_TOKEN).map(String::as_str), Some("C00"));
-        assert_eq!(flat.gid(&panes[0]), "w1");
+        assert_eq!(banded.gid(&panes[0]), "3|#C00");
+        let (panes, _, tightest) = grouped_board(AgentOrder::Tightest);
+        assert_eq!(tightest.gid(&panes[0]), "w1");
     }
 
     #[test]
@@ -3719,45 +3805,66 @@ mod tests {
     }
 
     #[test]
-    fn the_attention_order_publishes_no_space_header_and_no_indent() {
+    fn the_attention_order_heads_each_colour_band_of_a_group() {
         use crate::cli::AgentOrder;
-        let tight = attention_pane("w1:p1", "010", AgentStatus::Done);
-        let loose = attention_pane("w1:p2", "090", AgentStatus::Working);
-        let inventory = vec![tight.clone(), loose.clone()];
+        // Owner 0928, option B: colour bands first, a group header inside
+        // each band. Two teal seats and one yellow seat of one Space make two
+        // bands, each with its own head.
+        let teal = attention_pane("w1:p1", "010", AgentStatus::Done);
+        let yellow = attention_pane("w1:p2", "090", AgentStatus::Working);
+        let teal_member = attention_pane("w1:p3", "050", AgentStatus::Done);
+        let inventory = vec![teal.clone(), yellow.clone(), teal_member.clone()];
         let labels = BTreeMap::from([("w1".to_string(), "玉衡".to_string())]);
-
-        let grouped = space_group_heads(
-            AgentOrder::Quota,
-            &Grouping::spaces(AgentOrder::Quota),
+        let grouping = Grouping::spaces(AgentOrder::Attention).publishing(&inventory);
+        let heads = space_group_heads(
+            AgentOrder::Attention,
+            &grouping,
             &inventory,
             &inventory,
             &[],
         );
-        assert_eq!(grouped.get("w1").map(String::as_str), Some("w1:p1"));
+        assert_eq!(heads.get("1|w1").map(String::as_str), Some("w1:p1"));
+        assert_eq!(heads.get("2|w1").map(String::as_str), Some("w1:p2"));
+        assert_eq!(heads.len(), 2);
+
+        for (pane, header, indented) in [
+            (&teal, true, false),
+            (&yellow, true, false),
+            (&teal_member, false, true),
+        ] {
+            let mut desired = pane.tokens.clone();
+            apply_group_and_icon(
+                &mut desired,
+                pane,
+                &grouping,
+                &heads,
+                &labels,
+                &Look::plain(),
+            );
+            assert_eq!(
+                desired.get("quota_group").map(String::as_str),
+                header.then_some("玉衡"),
+                "{}",
+                pane.pane_id
+            );
+            let icon = desired.get(pane.icon_status().icon_token()).unwrap();
+            assert_eq!(
+                icon.starts_with(GROUP_MEMBER_INDENT),
+                indented,
+                "{}",
+                pane.pane_id
+            );
+        }
+
+        // The flat `tightest` order still publishes no header.
         let flat = space_group_heads(
-            AgentOrder::Attention,
-            &Grouping::spaces(AgentOrder::Attention),
+            AgentOrder::Tightest,
+            &Grouping::spaces(AgentOrder::Tightest),
             &inventory,
             &inventory,
             &[],
         );
         assert!(flat.is_empty());
-
-        for pane in [&tight, &loose] {
-            let mut desired = pane.tokens.clone();
-            desired.insert("quota_group".to_string(), "玉衡".to_string());
-            apply_group_and_icon(
-                &mut desired,
-                pane,
-                &Grouping::spaces(crate::cli::AgentOrder::Quota),
-                &flat,
-                &labels,
-                &Look::plain(),
-            );
-            assert!(!desired.contains_key("quota_group"));
-            let icon = desired.get(pane.icon_status().icon_token()).unwrap();
-            assert!(!icon.starts_with(GROUP_MEMBER_INDENT));
-        }
     }
 
     #[test]
@@ -3890,7 +3997,7 @@ mod tests {
     }
 
     #[test]
-    fn the_space_name_rides_on_each_seat_only_when_not_grouped() {
+    fn the_space_name_rides_on_each_seat_only_without_headers() {
         use crate::cli::AgentOrder;
         let pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
         let spaces = labels(&[("w1", "玉衡")]);
@@ -3899,19 +4006,15 @@ mod tests {
             &mut flat,
             &pane,
             Some(&BTreeMap::new()),
-            AgentOrder::Attention,
+            AgentOrder::Tightest,
             &spaces,
         );
         assert_eq!(flat.get(SPACE_TOKEN).map(String::as_str), Some("玉衡"));
-        let mut grouped = flat.clone();
-        apply_seat_identity(
-            &mut grouped,
-            &pane,
-            Some(&BTreeMap::new()),
-            AgentOrder::Quota,
-            &spaces,
-        );
-        assert!(!grouped.contains_key(SPACE_TOKEN));
+        for order in [AgentOrder::Quota, AgentOrder::Attention] {
+            let mut grouped = flat.clone();
+            apply_seat_identity(&mut grouped, &pane, Some(&BTreeMap::new()), order, &spaces);
+            assert!(!grouped.contains_key(SPACE_TOKEN), "{order:?}");
+        }
     }
 
     #[test]

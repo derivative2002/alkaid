@@ -734,11 +734,18 @@ impl AgentOrder {
         matches!(self, Self::Default | Self::Quota | Self::Role)
     }
 
-    /// Does this order honour the user's custom groups? Only the grouped
-    /// orders whose view this plugin owns: under `default` Herdr orders the
-    /// panel and knows nothing of `al_grp`.
+    /// Does this order honour the user's custom groups? Only the orders
+    /// whose view this plugin owns and groups: under `default` Herdr orders
+    /// the panel and knows nothing of `al_grp`.
     pub fn custom_groups(self) -> bool {
-        matches!(self, Self::Quota | Self::Role)
+        matches!(self, Self::Quota | Self::Role | Self::Attention)
+    }
+
+    /// Does the plugin publish group headers under this order? The grouped
+    /// orders do, and so does `attention` since owner 0928 (option B):
+    /// colour bands first, then a header for each group inside a band.
+    pub fn headed(self) -> bool {
+        self.groups_by_space() || self == Self::Attention
     }
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -1069,6 +1076,8 @@ mod tests {
         assert!(!AgentOrder::Attention.groups_by_space());
         assert!(AgentOrder::Role.groups_by_space());
         assert!(!AgentOrder::Tightest.groups_by_space());
+        assert!(AgentOrder::Attention.headed());
+        assert!(!AgentOrder::Tightest.headed());
     }
 
     #[test]

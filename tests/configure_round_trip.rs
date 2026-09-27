@@ -2972,7 +2972,7 @@ fn run_claude_refresh_logged(state: &Path, agent_list: &str) -> String {
 }
 
 #[test]
-fn the_attention_order_publishes_state_labels_once_and_no_space_header() {
+fn the_attention_order_publishes_state_labels_once_and_a_band_header() {
     let state = tempdir().unwrap();
     let (herdr_stub, _) = install_herdr_stub(
         state.path(),
@@ -3001,7 +3001,9 @@ fn the_attention_order_publishes_state_labels_once_and_no_space_header() {
     ] {
         assert!(report.contains(label), "missing {label}: {report}");
     }
-    assert!(!report.contains("quota_group="), "{report}");
+    // Since owner 0928 (option B) attention heads each group inside its
+    // colour band, so a lone pane is its band's head.
+    assert!(report.contains("quota_group=w1"), "{report}");
     assert!(report.contains("quota_5h_warning=5h 42%"), "{report}");
 
     // Labels read back unchanged: nothing about them is sent again.
