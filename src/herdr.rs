@@ -14,7 +14,7 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 43] = [
+const METADATA_TOKEN_NAMES: [&str; 44] = [
     "quota_group",
     "quota_pad",
     "quota_icon",
@@ -58,6 +58,7 @@ const METADATA_TOKEN_NAMES: [&str; 43] = [
     MODEL_MARK_TOKEN,
     GROUP_TOKEN,
     ROLE_RANK_TOKEN,
+    ATTENTION_TOKEN,
 ];
 /// A blank row after a Space's last pane (group styles `rule` and `count`).
 /// It sits at the end of that pane's rows rather than above the next header:
@@ -77,6 +78,14 @@ pub(crate) const MODEL_MARK_TOKEN: &str = "al_model_mark";
 pub(crate) const GROUP_TOKEN: &str = "al_grp";
 /// The value of [`GROUP_TOKEN`] for a seat in its Space.
 const SPACE_GROUP: &str = "Z";
+/// Attention rank that follows the icon colour (`0` blocked, `1` teal unseen
+/// completion, `2` yellow working, `3` white), for the `attention` order.
+/// Herdr's built-in `attention` can disagree with the plugin's teal (a
+/// same-tab sibling finishes as server `idle` while its ring is still teal),
+/// so the order sorts on the colour the user actually sees (owner 0928: green
+/// first, a clicked one sinks, one that turns yellow moves down). It rides
+/// on every icon report, so it adds no write.
+pub(crate) const ATTENTION_TOKEN: &str = "al_att";
 /// Role rank for the `role` order (`0` 统筹 … `5` svc, `9` unreported), from
 /// the label's role like `al_role`, so it moves only when the label does.
 pub(crate) const ROLE_RANK_TOKEN: &str = "al_role_rank";
@@ -524,6 +533,17 @@ impl AgentStatus {
             Self::Idle | Self::Blocked | Self::Unknown => "quota_icon",
         }
     }
+
+    /// [`ATTENTION_TOKEN`] for an icon status: needs-you first, then the
+    /// teal unseen completion, then yellow working, then white.
+    fn attention_rank(self) -> &'static str {
+        match self {
+            Self::Blocked => "0",
+            Self::Done => "1",
+            Self::Working => "2",
+            Self::Idle | Self::Unknown => "3",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -568,10 +588,12 @@ impl AgentPane {
     }
 
     pub fn icon_needs_update(&self) -> bool {
-        let active = self.icon_status().icon_token();
+        let status = self.icon_status();
+        let active = status.icon_token();
         ICON_TOKEN_NAMES
             .into_iter()
             .any(|name| self.tokens.contains_key(name) != (name == active))
+            || self.tokens.get(ATTENTION_TOKEN).map(String::as_str) != Some(status.attention_rank())
     }
 }
 
@@ -669,8 +691,12 @@ fn agent_view_request(order: crate::cli::AgentOrder) -> Value {
             serde_json::json!({"field": {"token": ROLE_RANK_TOKEN}, "order": "asc"}),
             key,
         ],
+        // By the colour the user sees (`al_att`), then 中枢 and the other
+        // custom groups before the Spaces, then Space, then quota.
         AgentOrder::Attention => vec![
-            serde_json::json!({"field": "attention", "order": "desc"}),
+            serde_json::json!({"field": {"token": ATTENTION_TOKEN}, "order": "asc"}),
+            serde_json::json!({"field": {"token": GROUP_TOKEN}, "order": "asc"}),
+            serde_json::json!({"field": "workspace_order", "order": "asc"}),
             key,
         ],
         AgentOrder::Tightest => vec![key],
@@ -1316,7 +1342,7 @@ fn icon_tokens_match(
     current: &BTreeMap<String, String>,
     desired: &BTreeMap<String, String>,
 ) -> bool {
-    ICON_TOKEN_NAMES
+    ICON_REPORT_NAMES
         .into_iter()
         .all(|name| current.get(name) == desired.get(name))
 }
@@ -1337,7 +1363,7 @@ fn report_icon_metadata(
             "herdr-agent-quota",
         ])
         .args(["--seq", &sequence.to_string(), "--ttl-ms", METADATA_TTL_MS]);
-    for name in ICON_TOKEN_NAMES {
+    for name in ICON_REPORT_NAMES {
         if let Some(value) = desired.get(name) {
             command.args(["--token", &format!("{name}={value}")]);
         } else {
@@ -1814,6 +1840,14 @@ const GROUP_MEMBER_INDENT: &str = "\u{200b}  ";
 /// Always reported together so a lagging inventory cannot leave a stale
 /// colour twin on screen after working→done or done→idle.
 const ICON_TOKEN_NAMES: [&str; 3] = ["quota_icon", "quota_icon_working", "quota_icon_done"];
+/// What an icon-only report carries: the three colour twins and the
+/// attention rank that sorts by that colour.
+const ICON_REPORT_NAMES: [&str; 4] = [
+    "quota_icon",
+    "quota_icon_working",
+    "quota_icon_done",
+    ATTENTION_TOKEN,
+];
 
 /// What Herdr's built-in `state_text` prints under the attention order: the
 /// DESIGN-r3 head row's action state, first thing on the identity row.
@@ -1935,7 +1969,8 @@ fn apply_group_and_icon(
     } else {
         glyph.to_string()
     };
-    let active = pane.icon_status().icon_token();
+    let status = pane.icon_status();
+    let active = status.icon_token();
     for token in ICON_TOKEN_NAMES {
         if token == active {
             desired.insert(token.to_string(), mark.clone());
@@ -1943,6 +1978,10 @@ fn apply_group_and_icon(
             desired.remove(token);
         }
     }
+    desired.insert(
+        ATTENTION_TOKEN.to_string(),
+        status.attention_rank().to_string(),
+    );
     desired.remove("quota_pad");
     // Never preserve a previous header: non-heads must omit the token so the
     // report clears it. Blind preserve is what left `ifs` on two panes.
@@ -2347,7 +2386,7 @@ fn must_not_lag(
     // The views sort on `al_grp`, `al_role_rank` and `al_sort` under either
     // row set.
     must_clear
-        || ICON_TOKEN_NAMES.contains(&name)
+        || ICON_REPORT_NAMES.contains(&name)
         || name == SORT_TOKEN
         || name == GROUP_TOKEN
         || name == ROLE_RANK_TOKEN
@@ -2689,6 +2728,38 @@ mod tests {
     }
 
     #[test]
+    fn the_attention_rank_follows_the_icon_colour_and_rides_on_icon_reports() {
+        let look = Look::plain();
+        let grouping = Grouping::spaces(crate::cli::AgentOrder::Attention);
+        for (status, rank, icon) in [
+            (AgentStatus::Done, "1", "quota_icon_done"),
+            (AgentStatus::Working, "2", "quota_icon_working"),
+            (AgentStatus::Idle, "3", "quota_icon"),
+            (AgentStatus::Blocked, "0", "quota_icon"),
+        ] {
+            let pane = attention_pane("w1:p1", "050", status);
+            let mut desired = BTreeMap::new();
+            apply_group_and_icon(
+                &mut desired,
+                &pane,
+                &grouping,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &look,
+            );
+            assert_eq!(desired.get(ATTENTION_TOKEN).map(String::as_str), Some(rank));
+            assert!(desired.contains_key(icon), "{status:?}");
+            // A colour change is an icon report, and so is a rank change.
+            let mut seen = pane.clone();
+            seen.tokens = desired.clone();
+            assert!(icon_tokens_match(&seen.tokens, &desired));
+            assert!(!seen.icon_needs_update(), "{status:?}");
+            seen.tokens.remove(ATTENTION_TOKEN);
+            assert!(seen.icon_needs_update(), "{status:?} without a rank");
+        }
+    }
+
+    #[test]
     fn a_seat_row_shows_the_first_segment_of_its_space_unless_it_collides() {
         let labels = BTreeMap::from([
             ("w1".to_string(), "siflow-inference-lab".to_string()),
@@ -2721,16 +2792,18 @@ mod tests {
         assert_eq!(request["method"], "agent.view.set");
         assert_eq!(request["params"]["source"], "plugin:herdr-agent-quota");
         assert_eq!(request["params"]["label"], "attention");
-        // Measured on Herdr 0.9.1: `attention` ascends idle < working < done
-        // < blocked, so descending puts the panes that need the user first.
+        // The plugin's own colour rank, not Herdr's `attention`: they
+        // disagree on a same-tab sibling that is still teal (owner 0928:
+        // green first, then 中枢 before the rest).
         assert_eq!(
             request["params"]["sort"],
             serde_json::json!([
-                {"field": "attention", "order": "desc"},
+                {"field": {"token": "al_att"}, "order": "asc"},
+                {"field": {"token": "al_grp"}, "order": "asc"},
+                {"field": "workspace_order", "order": "asc"},
                 {"field": {"token": "al_sort"}, "order": "asc"},
             ])
         );
-        assert!(!request.to_string().contains("workspace_order"));
     }
 
     fn looked(
@@ -4218,6 +4291,7 @@ mod tests {
             MODEL_MARK_TOKEN,
             GROUP_TOKEN,
             ROLE_RANK_TOKEN,
+            ATTENTION_TOKEN,
         ] {
             desired.insert(name.to_string(), "x".to_string());
         }
@@ -4250,6 +4324,7 @@ mod tests {
             SPACE_TOKEN,
             GROUP_TOKEN,
             ROLE_RANK_TOKEN,
+            ATTENTION_TOKEN,
         ] {
             assert!(names.contains(&name), "{name} deferred: {names:?}");
         }
