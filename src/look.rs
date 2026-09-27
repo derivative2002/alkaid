@@ -8,6 +8,7 @@
 //! zero-width space (Herdr keeps such a row as a blank line).
 
 use crate::icons::IconStyle;
+use crate::model::Harness;
 
 /// How a Space header is drawn in the grouped panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -300,15 +301,23 @@ pub enum Channel {
     Official,
 }
 
-/// A channel's mark. Official is the character 官 in every style (a check
-/// badge read as a success state). Dubhe is its own Big Dipper logo, reduced
-/// to a one-cell glyph at U+E1BF of the Herdr Agent Icons Alkaid face.
-pub fn channel_mark(channel: Channel, style: IconStyle) -> &'static str {
-    match (channel, style) {
+/// A channel's mark (owner 0927: a logo, not text). Dubhe is its own Big
+/// Dipper logo, reduced to a one-cell dipper at U+E1BF of the Herdr Agent
+/// Icons Alkaid face. Official is the vendor whose own endpoint serves the
+/// seat, as in Dubhe's brand-map provider table: Anthropic (U+E1C6) for
+/// Claude Code, OpenAI (U+E1BD, the same mark as the GPT model family) for
+/// Codex. The letter style is the no-font fallback and keeps 官.
+pub fn channel_mark(channel: Channel, harness: Harness, style: IconStyle) -> Option<&'static str> {
+    Some(match (channel, style) {
         (Channel::Dubhe, IconStyle::Glyph) => "\u{e1bf}",
         (Channel::Dubhe, IconStyle::Letter) => "天枢",
-        (Channel::Official, _) => "官",
-    }
+        (Channel::Official, IconStyle::Letter) => "官",
+        (Channel::Official, IconStyle::Glyph) => match harness {
+            Harness::Claude => "\u{e1c6}",
+            Harness::Codex => "\u{e1bd}",
+            Harness::Cursor => return None,
+        },
+    })
 }
 
 /// A base URL reduced to a comparable route: lower-case `host[:port]` plus
@@ -475,8 +484,26 @@ mod tests {
             "\u{e1bc}"
         );
         assert_eq!(model_mark(ModelFamily::DeepSeek, IconStyle::Letter), "DS");
-        assert_eq!(channel_mark(Channel::Dubhe, IconStyle::Letter), "天枢");
-        assert_eq!(channel_mark(Channel::Official, IconStyle::Glyph), "官");
+        assert_eq!(
+            channel_mark(Channel::Dubhe, Harness::Claude, IconStyle::Letter),
+            Some("天枢")
+        );
+        assert_eq!(
+            channel_mark(Channel::Official, Harness::Claude, IconStyle::Letter),
+            Some("官")
+        );
+    }
+
+    #[test]
+    fn the_official_channel_is_the_serving_vendor_logo() {
+        let official = |harness| channel_mark(Channel::Official, harness, IconStyle::Glyph);
+        assert_eq!(official(Harness::Claude), Some("\u{e1c6}"));
+        assert_eq!(official(Harness::Codex), Some("\u{e1bd}"));
+        assert_eq!(official(Harness::Cursor), None);
+        assert_eq!(
+            channel_mark(Channel::Dubhe, Harness::Claude, IconStyle::Glyph),
+            Some("\u{e1bf}")
+        );
     }
 
     #[test]

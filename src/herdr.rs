@@ -1724,11 +1724,10 @@ fn apply_logos(
         return;
     }
     let process = channels.and_then(|channels| channels.get(&pane.pane_id));
-    match crate::channel::classify(pane.harness, process) {
-        Some(channel) => desired.insert(
-            CHANNEL_TOKEN.to_string(),
-            crate::look::channel_mark(channel, look.style).to_string(),
-        ),
+    match crate::channel::classify(pane.harness, process)
+        .and_then(|channel| crate::look::channel_mark(channel, pane.harness, look.style))
+    {
+        Some(mark) => desired.insert(CHANNEL_TOKEN.to_string(), mark.to_string()),
         None => desired.remove(CHANNEL_TOKEN),
     };
     // The model the pane's own session reported (`quota_model`, per session
@@ -2362,11 +2361,15 @@ mod tests {
             "with logos on the first mark is the harness, not the whale"
         );
 
-        // An official lane's process, GLM without a glyph.
+        // An official lane's process: the channel is Anthropic's logo, not
+        // text; GLM is the z.ai glyph.
         let official = BTreeMap::from([("w2:p1".to_string(), process(None, true))]);
         let mut desired = BTreeMap::from([("quota_model".to_string(), "GLM-5.3".to_string())]);
         apply_logos(&mut desired, &pane, &look, Some(&official));
-        assert_eq!(desired.get(CHANNEL_TOKEN).map(String::as_str), Some("官"));
+        assert_eq!(
+            desired.get(CHANNEL_TOKEN).map(String::as_str),
+            Some("\u{e1c6}")
+        );
         assert_eq!(
             desired.get(MODEL_MARK_TOKEN).map(String::as_str),
             Some("\u{e1bb}")

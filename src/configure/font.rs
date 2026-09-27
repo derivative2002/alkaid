@@ -2,12 +2,12 @@
 //!
 //! Herdr draws the Agents sidebar inside the host terminal. Private Use Area
 //! glyphs only render when that terminal loads `Herdr Agent Icons Alkaid` for
-//! `U+E1A0`–`U+E1C5`. Without the map, the cells are tofu — so configure
+//! `U+E1A0`–`U+E1C6`. Without the map, the cells are tofu — so configure
 //! always tries to install both.
 //!
-//! The Alkaid face is Herdr Agent Icons Max plus nine glyphs at U+E1B7–E1BF
-//! (harness, model and channel marks, 0927); it is built from the Max face
-//! outside this repository and shipped as a file.
+//! The Alkaid face is Herdr Agent Icons Max plus ten glyphs at U+E1B7–E1BF
+//! and U+E1C6 (harness, model and channel marks, 0927); it is built from the
+//! Max face outside this repository and shipped as a file.
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -18,10 +18,11 @@ const FONT_FAMILY: &str = "Herdr Agent Icons Alkaid";
 const FONT_BASENAME: &str = "HerdrAgentIconsAlkaid";
 const FONT_EXTENSION: &str = "otf";
 const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/HerdrAgentIconsAlkaid-Regular.otf");
-/// herdr-radar's two ranges, the first grown by the Alkaid glyphs
-/// (U+E1B7–E1BF): vendor, harness, model and channel marks, then the state
-/// marks kept so a shared Ghostty/kitty map stays compatible.
-const CODEPOINT_RANGES: [(&str, &str); 2] = [("E1A0", "E1BF"), ("E1C0", "E1C5")];
+/// herdr-radar's two ranges grown by the Alkaid glyphs (U+E1B7–E1BF and the
+/// Anthropic channel mark at U+E1C6): vendor, harness, model and channel
+/// marks, then the state marks kept so a shared Ghostty/kitty map stays
+/// compatible.
+const CODEPOINT_RANGES: [(&str, &str); 2] = [("E1A0", "E1BF"), ("E1C0", "E1C6")];
 const MARKER_START: &str = "# BEGIN herdr-agent-quota font";
 const MARKER_END: &str = "# END herdr-agent-quota font";
 const OWNED_FONT_FILE: &str = "owned-font";
@@ -34,7 +35,7 @@ pub fn install(state_dir: &Path) -> Result<Vec<String>> {
     let mapped = configure_terminals()?;
     if mapped.is_empty() {
         notes.push(
-            "font: no Ghostty/kitty config found; map U+E1A0-U+E1C5 to \"Herdr Agent Icons Alkaid\" \
+            "font: no Ghostty/kitty config found; map U+E1A0-U+E1C6 to \"Herdr Agent Icons Alkaid\" \
              in your terminal if icons show as boxes"
                 .into(),
         );
