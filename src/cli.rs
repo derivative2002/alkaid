@@ -713,10 +713,12 @@ impl AgentOrder {
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "",
-            Self::Quota => "按组·额度",
-            Self::Attention => "注意力",
-            Self::Role => "按组·角色",
-            Self::Tightest => "额度平铺",
+            // ASCII on purpose: Herdr 0.9.1 lays the panel title out by
+            // characters, so a CJK label overprints its neighbours (sb7 0928).
+            Self::Quota => "Quota by group",
+            Self::Attention => "attention",
+            Self::Role => "Role by group",
+            Self::Tightest => "tightest quota",
         }
     }
 

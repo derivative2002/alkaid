@@ -2667,7 +2667,7 @@ mod tests {
         let request = agent_view_request(AgentOrder::Attention);
         assert_eq!(request["method"], "agent.view.set");
         assert_eq!(request["params"]["source"], "plugin:herdr-agent-quota");
-        assert_eq!(request["params"]["label"], "注意力");
+        assert_eq!(request["params"]["label"], "attention");
         // Measured on Herdr 0.9.1: `attention` ascends idle < working < done
         // < blocked, so descending puts the panes that need the user first.
         assert_eq!(
@@ -3367,7 +3367,7 @@ mod tests {
     fn the_quota_view_is_unchanged_by_the_attention_order() {
         use crate::cli::AgentOrder;
         let request = agent_view_request(AgentOrder::Quota);
-        assert_eq!(request["params"]["label"], "按组·额度");
+        assert_eq!(request["params"]["label"], "Quota by group");
         assert_eq!(
             request["params"]["sort"],
             serde_json::json!([
@@ -3382,7 +3382,7 @@ mod tests {
     fn the_role_view_ranks_roles_inside_a_space_and_tightest_is_flat() {
         use crate::cli::AgentOrder;
         let role = agent_view_request(AgentOrder::Role);
-        assert_eq!(role["params"]["label"], "按组·角色");
+        assert_eq!(role["params"]["label"], "Role by group");
         assert_eq!(
             role["params"]["sort"],
             serde_json::json!([
