@@ -1152,6 +1152,9 @@ fn publish_pane_tokens_inner(
 ) -> Result<()> {
     let executable = std::env::var_os("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
     let (workspace_labels, workspace_ranks) = list_workspaces().unwrap_or_default();
+    // The Space name a seat row shows (`$al_space`) is the short form; the
+    // group header keeps the full label.
+    let space_names = short_space_names(&workspace_labels);
     // Event/focus publish one pane. Head selection and sibling clears need the
     // full Space membership — otherwise a lone pane preserves a stale
     // `$quota_group` and the Space name prints twice (radar writes `group:null`
@@ -1201,10 +1204,10 @@ fn publish_pane_tokens_inner(
             pane,
             pane_labels.as_ref(),
             order,
-            &workspace_labels,
+            &space_names,
         );
         apply_logos(&mut desired, pane, look, channels.as_ref());
-        apply_grouping(&mut desired, pane, &grouping, &workspace_labels);
+        apply_grouping(&mut desired, pane, &grouping, &space_names);
         apply_group_and_icon(
             &mut desired,
             pane,
@@ -1948,6 +1951,37 @@ fn apply_group_and_icon(
     apply_header(desired, &pane.pane_id, header, look);
 }
 
+/// The Space name a seat row carries: the label's first `-` segment
+/// (`siflow-inference-lab` → `siflow`), so a narrow sidebar keeps the Tab
+/// name (owner 0928, option 乙). Two Spaces that would shorten to the same
+/// name both keep their full label.
+fn short_space_names(labels: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let short = |label: &str| {
+        label
+            .split('-')
+            .next()
+            .filter(|first| !first.is_empty())
+            .unwrap_or(label)
+            .to_string()
+    };
+    let mut uses: BTreeMap<String, usize> = BTreeMap::new();
+    for label in labels.values() {
+        *uses.entry(short(label)).or_default() += 1;
+    }
+    labels
+        .iter()
+        .map(|(id, label)| {
+            let name = short(label);
+            let name = if uses.get(&name) == Some(&1) {
+                name
+            } else {
+                label.clone()
+            };
+            (id.clone(), name)
+        })
+        .collect()
+}
+
 /// `al_grp` and `al_role_rank` on every seat, and the Space name on a
 /// custom-group member — its header names the group, not the line it is in.
 fn apply_grouping(
@@ -2652,6 +2686,25 @@ mod tests {
         );
         let heads = space_group_heads(AgentOrder::Quota, &quota, &panes, &panes, &[]);
         assert_eq!(heads.get("w1").map(String::as_str), Some("w1:p2"));
+    }
+
+    #[test]
+    fn a_seat_row_shows_the_first_segment_of_its_space_unless_it_collides() {
+        let labels = BTreeMap::from([
+            ("w1".to_string(), "siflow-inference-lab".to_string()),
+            ("w2".to_string(), "m1-release-sprint".to_string()),
+            ("w3".to_string(), "m1-eval".to_string()),
+            ("w4".to_string(), "alioth".to_string()),
+            ("w5".to_string(), "玉衡".to_string()),
+            ("w6".to_string(), "-odd".to_string()),
+        ]);
+        let short = short_space_names(&labels);
+        assert_eq!(short["w1"], "siflow");
+        assert_eq!(short["w2"], "m1-release-sprint", "m1 is ambiguous");
+        assert_eq!(short["w3"], "m1-eval");
+        assert_eq!(short["w4"], "alioth");
+        assert_eq!(short["w5"], "玉衡");
+        assert_eq!(short["w6"], "-odd");
     }
 
     fn our_labels() -> BTreeMap<String, String> {
