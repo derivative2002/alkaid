@@ -14,7 +14,7 @@ const MAX_METADATA_TOKENS: usize = 16;
 /// not free: it is compared on every refresh and it competes for Herdr's
 /// 16-token report budget. Add a name here only together with the field that
 /// fills it.
-const METADATA_TOKEN_NAMES: [&str; 45] = [
+const METADATA_TOKEN_NAMES: [&str; 46] = [
     "quota_group",
     "quota_pad",
     "quota_icon",
@@ -59,7 +59,8 @@ const METADATA_TOKEN_NAMES: [&str; 45] = [
     GROUP_TOKEN,
     ROLE_RANK_TOKEN,
     ATTENTION_TOKEN,
-    PIN_TOKEN,
+    PIN_HEAD_TOKEN,
+    PIN_BAR_TOKEN,
 ];
 /// A blank row after a Space's last pane (group styles `rule` and `count`).
 /// It sits at the end of that pane's rows rather than above the next header:
@@ -82,9 +83,19 @@ const SPACE_GROUP: &str = "Z";
 /// The value of [`GROUP_TOKEN`] for a pinned seat (`置顶`): it sorts before
 /// every custom group and gets no header.
 const PIN_GROUP: &str = "A";
-/// `0` on a pinned seat, `1` on every other; the flat orders sort on it
-/// first so a pinned seat stays on top there too (owner 0928).
-pub(crate) const PIN_TOKEN: &str = "al_pin";
+/// The band on a pinned seat's first row: `▌` behind the member indent, so
+/// it lines up with the bars Herdr hang-indents on the rows below. Herdr
+/// 0.9.1 rows take no background colour; this column of bars stands in
+/// for one (owner 0928). Absent on every other seat.
+pub(crate) const PIN_HEAD_TOKEN: &str = "al_pin_head";
+/// The band on a pinned seat's second and third rows.
+pub(crate) const PIN_BAR_TOKEN: &str = "al_pin_bar";
+const PIN_BAND: &str = "▌";
+/// A pinned seat's `al_att` and `al_sort` lead with these, which sort
+/// before every rank digit and headroom, so the flat orders list it first
+/// without a token of its own (Herdr takes 16 names per report).
+const PIN_ATTENTION: &str = "-";
+const PIN_SORT_PREFIX: char = '!';
 /// Attention rank that follows the icon colour (`0` blocked, `1` teal unseen
 /// completion, `2` yellow working, `3` white), for the `attention` order.
 /// Herdr's built-in `attention` can disagree with the plugin's teal (a
@@ -334,6 +345,17 @@ impl Grouping {
         }
     }
 
+    /// The `al_sort` this pane carries at `headroom`: [`sort_key`], led by
+    /// `!` on a pinned seat so the flat orders list it first.
+    fn sort_value(&self, pane: &AgentPane, headroom: u8) -> String {
+        let key = sort_key(headroom, &pane.pane_id);
+        if self.pinned(pane) {
+            format!("{PIN_SORT_PREFIX}{key}")
+        } else {
+            key
+        }
+    }
+
     /// The header text source for a group key; pinned seats have none.
     fn name(&self, gid: &str, workspace_labels: &BTreeMap<String, String>) -> Option<String> {
         if gid == format!("#{PIN_GROUP}") {
@@ -360,7 +382,7 @@ impl Grouping {
     /// lists a pane without the token last.
     fn place(&self, pane: &AgentPane, headroom: Option<u8>) -> String {
         let sort = headroom
-            .map(|headroom| sort_key(headroom, &pane.pane_id))
+            .map(|headroom| self.sort_value(pane, headroom))
             .or_else(|| pane.tokens.get(SORT_TOKEN).cloned())
             .unwrap_or_else(|| format!("{UNSORTED}{}", pane.pane_id));
         let mut key = String::new();
@@ -490,12 +512,13 @@ const ROWS_THAT_MUST_NOT_LAG: [&str; 17] = [
 ];
 
 /// [`ROWS_THAT_MUST_NOT_LAG`] for the identity rows (round two onward).
-const IDENTITY_ROWS_THAT_MUST_NOT_LAG: [&str; 12] = [
+const IDENTITY_ROWS_THAT_MUST_NOT_LAG: [&str; 13] = [
     "quota_group",
     "quota_icon",
     SORT_TOKEN,
     GROUP_TOKEN,
-    PIN_TOKEN,
+    PIN_HEAD_TOKEN,
+    PIN_BAR_TOKEN,
     ROLE_RANK_TOKEN,
     GAP_TOKEN,
     CHANNEL_TOKEN,
@@ -628,7 +651,10 @@ impl AgentPane {
         ICON_TOKEN_NAMES
             .into_iter()
             .any(|name| self.tokens.contains_key(name) != (name == active))
-            || self.tokens.get(ATTENTION_TOKEN).map(String::as_str) != Some(status.attention_rank())
+            || !matches!(
+                self.tokens.get(ATTENTION_TOKEN).map(String::as_str),
+                Some(rank) if rank == status.attention_rank() || rank == PIN_ATTENTION
+            )
     }
 }
 
@@ -729,16 +755,12 @@ fn agent_view_request(order: crate::cli::AgentOrder) -> Value {
         // By the colour the user sees (`al_att`), then 中枢 and the other
         // custom groups before the Spaces, then Space, then quota.
         AgentOrder::Attention => vec![
-            serde_json::json!({"field": {"token": PIN_TOKEN}, "order": "asc"}),
             serde_json::json!({"field": {"token": ATTENTION_TOKEN}, "order": "asc"}),
             serde_json::json!({"field": {"token": GROUP_TOKEN}, "order": "asc"}),
             serde_json::json!({"field": "workspace_order", "order": "asc"}),
             key,
         ],
-        AgentOrder::Tightest => vec![
-            serde_json::json!({"field": {"token": PIN_TOKEN}, "order": "asc"}),
-            key,
-        ],
+        AgentOrder::Tightest => vec![key],
     };
     serde_json::json!({
         "id": "agent-quota:view-set",
@@ -1285,7 +1307,7 @@ fn publish_pane_tokens_inner(
             .get(HEADROOM_TOKEN)
             .and_then(|value| value.parse().ok())
             .unwrap_or(u8::MAX);
-        desired.insert(SORT_TOKEN.to_string(), sort_key(headroom, &pane.pane_id));
+        desired.insert(SORT_TOKEN.to_string(), grouping.sort_value(pane, headroom));
         desired
     };
     let with_tokens = panes
@@ -2018,10 +2040,12 @@ fn apply_group_and_icon(
             desired.remove(token);
         }
     }
-    desired.insert(
-        ATTENTION_TOKEN.to_string(),
-        status.attention_rank().to_string(),
-    );
+    let rank = if grouping.pinned(pane) {
+        PIN_ATTENTION
+    } else {
+        status.attention_rank()
+    };
+    desired.insert(ATTENTION_TOKEN.to_string(), rank.to_string());
     desired.remove("quota_pad");
     // Never preserve a previous header: non-heads must omit the token so the
     // report clears it. Blind preserve is what left `ifs` on two panes.
@@ -2078,8 +2102,16 @@ fn apply_grouping(
     };
     let role = desired.get(ROLE_TOKEN).map(String::as_str).unwrap_or("");
     desired.insert(ROLE_RANK_TOKEN.to_string(), role_rank(role).to_string());
-    let pin = if grouping.pinned(pane) { "0" } else { "1" };
-    desired.insert(PIN_TOKEN.to_string(), pin.to_string());
+    if grouping.pinned(pane) {
+        desired.insert(
+            PIN_HEAD_TOKEN.to_string(),
+            format!("{GROUP_MEMBER_INDENT}{PIN_BAND}"),
+        );
+        desired.insert(PIN_BAR_TOKEN.to_string(), PIN_BAND.to_string());
+    } else {
+        desired.remove(PIN_HEAD_TOKEN);
+        desired.remove(PIN_BAR_TOKEN);
+    }
     if grouping.away_from_space(pane) {
         if let Some(label) = workspace_labels
             .get(&pane.workspace_id)
@@ -2431,7 +2463,6 @@ fn must_not_lag(
         || ICON_REPORT_NAMES.contains(&name)
         || name == SORT_TOKEN
         || name == GROUP_TOKEN
-        || name == PIN_TOKEN
         || name == ROLE_RANK_TOKEN
         || match rows {
             crate::cli::SidebarRows::Quota => ROWS_THAT_MUST_NOT_LAG.contains(&name),
@@ -2737,11 +2768,20 @@ mod tests {
         let mut desired = BTreeMap::from([(ROLE_TOKEN.to_string(), "统筹".to_string())]);
         apply_grouping(&mut desired, coordinator, &grouping, &spaces);
         assert_eq!(desired.get(GROUP_TOKEN).map(String::as_str), Some("A"));
-        assert_eq!(desired.get(PIN_TOKEN).map(String::as_str), Some("0"));
+        assert_eq!(
+            desired.get(PIN_HEAD_TOKEN).map(String::as_str),
+            Some("\u{200b}  ▌")
+        );
+        assert_eq!(desired.get(PIN_BAR_TOKEN).map(String::as_str), Some("▌"));
         assert_eq!(desired.get(SPACE_TOKEN).map(String::as_str), Some("alioth"));
-        let mut other = BTreeMap::new();
+        assert!(grouping.sort_value(coordinator, 50).starts_with('!'));
+        let mut other = BTreeMap::from([
+            (PIN_HEAD_TOKEN.to_string(), "old".to_string()),
+            (PIN_BAR_TOKEN.to_string(), "old".to_string()),
+        ]);
         apply_grouping(&mut other, &panes[1], &grouping, &spaces);
-        assert_eq!(other.get(PIN_TOKEN).map(String::as_str), Some("1"));
+        assert!(!other.contains_key(PIN_HEAD_TOKEN) && !other.contains_key(PIN_BAR_TOKEN));
+        assert!(!grouping.sort_value(&panes[1], 50).starts_with('!'));
 
         let heads = space_group_heads(AgentOrder::Quota, &grouping, &panes, &panes, &[]);
         assert_eq!(
@@ -2767,6 +2807,7 @@ mod tests {
             "a pinned seat is never indented"
         );
         assert!(!icon.contains_key("quota_group"));
+        assert_eq!(icon.get(ATTENTION_TOKEN).map(String::as_str), Some("-"));
     }
 
     #[test]
@@ -2889,7 +2930,6 @@ mod tests {
         assert_eq!(
             request["params"]["sort"],
             serde_json::json!([
-                {"field": {"token": "al_pin"}, "order": "asc"},
                 {"field": {"token": "al_att"}, "order": "asc"},
                 {"field": {"token": "al_grp"}, "order": "asc"},
                 {"field": "workspace_order", "order": "asc"},
@@ -3613,10 +3653,7 @@ mod tests {
         let flat = agent_view_request(AgentOrder::Tightest);
         assert_eq!(
             flat["params"]["sort"],
-            serde_json::json!([
-                {"field": {"token": "al_pin"}, "order": "asc"},
-                {"field": {"token": "al_sort"}, "order": "asc"},
-            ])
+            serde_json::json!([{"field": {"token": "al_sort"}, "order": "asc"}])
         );
     }
 
@@ -4387,7 +4424,8 @@ mod tests {
             GROUP_TOKEN,
             ROLE_RANK_TOKEN,
             ATTENTION_TOKEN,
-            PIN_TOKEN,
+            PIN_HEAD_TOKEN,
+            PIN_BAR_TOKEN,
         ] {
             desired.insert(name.to_string(), "x".to_string());
         }
@@ -4421,7 +4459,8 @@ mod tests {
             GROUP_TOKEN,
             ROLE_RANK_TOKEN,
             ATTENTION_TOKEN,
-            PIN_TOKEN,
+            PIN_HEAD_TOKEN,
+            PIN_BAR_TOKEN,
         ] {
             assert!(names.contains(&name), "{name} deferred: {names:?}");
         }

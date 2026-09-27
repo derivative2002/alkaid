@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 57] = [
+const QUOTA_ROW_MARKERS: [&str; 59] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
@@ -67,6 +67,8 @@ const QUOTA_ROW_MARKERS: [&str; 57] = [
     "$al_gap",
     "$al_channel",
     "$al_model_mark",
+    "$al_pin_head",
+    "$al_pin_bar",
 ];
 const ROW_GAP_MARKER: &str = "herdr-agent-quota";
 const MANAGED_ROW_MARKER: &str = "herdr-agent-quota-row";
@@ -118,6 +120,10 @@ const QUOTA_WARNING_COLOR: &str = "#e4b957";
 const IDLE_ICON_COLOR: &str = "#e9e9f0";
 /// Space headers and channel marks in the rule / bar candidates (0927).
 const ACCENT_COLOR: &str = "#89b4fa";
+/// The band on a pinned seat's rows (owner 0928: the resident coordinator
+/// gets a background; Herdr 0.9.1 rows take no background, so a column of
+/// ▌ in this colour stands in for one).
+const PIN_BAND_COLOR: &str = "#cba6f7";
 /// Secondary ink for Herdr's native `agent` name row. A step dimmer than the
 /// provider/model identity so the harness name reads as a subtitle, not a
 /// second heading.
@@ -1232,9 +1238,18 @@ fn append_identity_rows(rows: &mut Array, look: RowLook) {
         Some(false),
         Some(false),
     );
-    // Icons first: a Space member's indent rides on the icon value
-    // (`GROUP_MEMBER_INDENT`), which only indents the row from its first cell.
-    let mut identity = brand_icon_cells();
+    // A pinned seat's band opens each of its rows; the first row's cell
+    // carries the member indent so the three bars share one column. Empty
+    // on every other seat, so it draws nothing there.
+    let band = |token: &str| styled_token(token, Some(PIN_BAND_COLOR), Some(false), Some(false));
+    // Icons first after the band: a Space member's indent rides on the icon
+    // value (`GROUP_MEMBER_INDENT`), which only indents the row from its
+    // first cell.
+    let mut identity = Array::new();
+    identity.push(band("$al_pin_head"));
+    for cell in brand_icon_cells() {
+        identity.push(cell);
+    }
     if look.logos == LogoLayout::Inline {
         identity.push(channel.clone());
         identity.push(mark.clone());
@@ -1250,6 +1265,7 @@ fn append_identity_rows(rows: &mut Array, look: RowLook) {
     identity.push(styled_token("tab", None, Some(true), Some(false)));
     rows.push(Value::Array(identity));
     let mut seat = Array::new();
+    seat.push(band("$al_pin_bar"));
     seat.push(styled_token(
         "$al_role",
         Some(IDLE_ICON_COLOR),
@@ -1267,12 +1283,10 @@ fn append_identity_rows(rows: &mut Array, look: RowLook) {
         Some(false),
     ));
     rows.push(Value::Array(seat));
-    rows.push(Value::Array(styled_row(
-        "pane",
-        None,
-        Some(false),
-        Some(true),
-    )));
+    rows.push(Value::Array(Array::from_iter([
+        band("$al_pin_bar"),
+        styled_token("pane", None, Some(false), Some(true)),
+    ])));
     // A gapped style's blank line: last row, published only on the last
     // pane of each Space, so it separates Spaces without indenting a header
     // (Herdr hang-indents every row after a pane's first).

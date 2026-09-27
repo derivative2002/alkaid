@@ -3059,7 +3059,10 @@ fn identity_rows_show_who_each_seat_is_and_no_usage() {
         [
             vec!["$quota_group"],
             // No state text: the harness icon's colour is the state (0927).
+            // Each seat row opens with a pinned seat's band (0928), empty
+            // on every other seat.
             vec![
+                "$al_pin_head",
                 "$quota_icon",
                 "$quota_icon_working",
                 "$quota_icon_done",
@@ -3067,8 +3070,14 @@ fn identity_rows_show_who_each_seat_is_and_no_usage() {
                 "tab"
             ],
             // Second-row logos are the default (0927).
-            vec!["$al_role", "$al_channel", "$al_model_mark", "$al_model"],
-            vec!["pane"],
+            vec![
+                "$al_pin_bar",
+                "$al_role",
+                "$al_channel",
+                "$al_model_mark",
+                "$al_model"
+            ],
+            vec!["$al_pin_bar", "pane"],
         ]
     );
     let flat = rows.concat();
@@ -3149,7 +3158,7 @@ fn configure_defaults_to_identity_rows_and_can_restore_the_usage_rows() {
         !managed_rows(&sidebar)[1].contains(&"state_text".to_string()),
         "{sidebar}"
     );
-    assert_eq!(managed_rows(&sidebar)[2][1], "$al_channel", "{sidebar}");
+    assert_eq!(managed_rows(&sidebar)[2][2], "$al_channel", "{sidebar}");
     assert!(sidebar.contains("$al_role"), "{sidebar}");
     assert!(!sidebar.contains("$quota_5h"), "{sidebar}");
     assert!(
@@ -3238,14 +3247,15 @@ fn every_candidate_look_writes_the_rows_it_promises() {
         [
             vec!["$quota_group"],
             vec![
+                "$al_pin_head",
                 "$quota_icon",
                 "$quota_icon_working",
                 "$quota_icon_done",
                 "$al_space",
                 "tab"
             ],
-            vec!["$al_role", "$al_model"],
-            vec!["pane"],
+            vec!["$al_pin_bar", "$al_role", "$al_model"],
+            vec!["$al_pin_bar", "pane"],
         ]
     );
     // No identity look shows state text any more.
@@ -3268,6 +3278,7 @@ fn every_candidate_look_writes_the_rows_it_promises() {
     assert_eq!(
         rule[1],
         [
+            "$al_pin_head",
             "$quota_icon",
             "$quota_icon_working",
             "$quota_icon_done",
@@ -3292,7 +3303,13 @@ fn every_candidate_look_writes_the_rows_it_promises() {
     assert_eq!(second[0], ["$quota_group"]);
     assert_eq!(
         second[2],
-        ["$al_role", "$al_channel", "$al_model_mark", "$al_model"]
+        [
+            "$al_pin_bar",
+            "$al_role",
+            "$al_channel",
+            "$al_model_mark",
+            "$al_model"
+        ]
     );
 }
 
