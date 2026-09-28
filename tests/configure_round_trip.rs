@@ -620,6 +620,37 @@ fn claude_collector_bounds_a_hanging_previous_statusline() {
 }
 
 #[test]
+fn a_previous_statusline_that_leads_back_to_the_hook_runs_once() {
+    // 0928 sb7: the saved "previous" statusLine was this plugin's own hook
+    // behind a symlink, so every call chained into itself and forked without
+    // end. The chained call must not chain again.
+    let state = tempdir().unwrap();
+    let calls = state.path().join("calls");
+    let command = format!(
+        "echo x >> '{}'; HERDR_PLUGIN_STATE_DIR='{}' '{}' claude-statusline",
+        calls.display(),
+        state.path().display(),
+        env!("CARGO_BIN_EXE_herdr-agent-quota"),
+    );
+    locked_write(
+        state.path().join("claude-statusline.original.json"),
+        serde_json::json!({"type": "command", "command": command}).to_string(),
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    assert!(run_claude_collector_with_timeout(
+        state.path(),
+        include_bytes!("fixtures/claude/statusline-both.json"),
+        Duration::from_secs(4),
+    ));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    // Give a runaway chain time to show itself before counting.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
+}
+
+#[test]
 fn claude_cache_is_published_by_refresh_event() {
     let state = tempdir().unwrap();
     let (herdr_stub, herdr_log) = install_herdr_stub(
