@@ -331,16 +331,46 @@ fn enrich_local_sessions_at(snapshot: &mut ProviderSnapshot, home: &Path, sessio
 }
 
 pub(crate) fn find_rollout_paths(home: &Path, session_ids: &[String]) -> BTreeMap<String, PathBuf> {
+    walk_rollouts(home, session_ids, false).unwrap_or_default()
+}
+
+/// [`find_rollout_paths`], but a directory or entry that cannot be read is an
+/// error instead of being skipped, so a caller can tell "no rollout" from
+/// "could not look". A missing `sessions` / `archived_sessions` is not an
+/// error.
+pub(crate) fn find_rollout_paths_strict(
+    home: &Path,
+    session_ids: &[String],
+) -> std::io::Result<BTreeMap<String, PathBuf>> {
+    walk_rollouts(home, session_ids, true)
+}
+
+fn walk_rollouts(
+    home: &Path,
+    session_ids: &[String],
+    strict: bool,
+) -> std::io::Result<BTreeMap<String, PathBuf>> {
     let mut directories = vec![home.join("sessions"), home.join("archived_sessions")];
     let mut newest = BTreeMap::<String, (u64, PathBuf)>::new();
     while let Some(directory) = directories.pop() {
-        let Ok(entries) = fs::read_dir(directory) else {
-            continue;
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if strict && error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error);
+            }
+            Err(_) => continue,
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if strict => return Err(error),
+                Err(_) => continue,
+            };
             let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if strict => return Err(error),
+                Err(_) => continue,
             };
             if file_type.is_dir() {
                 directories.push(path);
@@ -372,10 +402,10 @@ pub(crate) fn find_rollout_paths(home: &Path, session_ids: &[String]) -> BTreeMa
             }
         }
     }
-    newest
+    Ok(newest
         .into_iter()
         .map(|(session_id, (_, path))| (session_id, path))
-        .collect()
+        .collect())
 }
 
 struct RolloutObservation {

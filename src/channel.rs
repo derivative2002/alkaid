@@ -8,8 +8,9 @@
 //! The three directories are kept as paths: they locate the seat's own
 //! transcript or rollout ([`crate::seat_model`]) and say whether the seat is
 //! a launcher-registered lane. From the command line only a Codex
-//! `resume <id>` session id is kept. Nothing else in the environment block or
-//! argv is decoded, kept, copied or logged; both can hold credentials.
+//! `resume <id>` session id is kept. The raw environ and argv blocks are held
+//! in memory only while they are filtered; no other entry or argument is
+//! decoded, kept, copied or logged — both can hold credentials.
 //!
 //! Scanned once per publish pass. Without `/proc` (macOS), or when the
 //! process is unreadable, the channel is left blank and the model unread —
@@ -19,7 +20,8 @@ use crate::look::Channel;
 use crate::model::Harness;
 use std::collections::BTreeMap;
 
-/// What one pane's agent process revealed. No raw value is kept.
+/// What one pane's agent process revealed: a route, three directory paths
+/// and a resume id. No other value from the process is kept.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcessChannel {
     /// `ANTHROPIC_BASE_URL` as a route; `None` when the variable is unset
@@ -126,16 +128,14 @@ struct Entries {
 }
 
 /// The session id after `resume` in a NUL-separated argv, when it looks like
-/// an id (hex and dashes). Nothing else from argv is kept.
+/// an id (hex and dashes). Arguments are compared as bytes; only that id is
+/// decoded and kept.
 fn resume_session(argv: &[u8]) -> Option<String> {
-    let args = argv
-        .split(|byte| *byte == 0)
-        .map(|arg| std::str::from_utf8(arg).unwrap_or_default())
-        .collect::<Vec<_>>();
-    let position = args.iter().position(|arg| *arg == "resume")?;
-    let id = args.get(position + 1)?;
-    (id.len() >= 8 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
-        .then(|| id.to_string())
+    let mut args = argv.split(|byte| *byte == 0);
+    args.find(|arg| *arg == b"resume")?;
+    let id = args.next()?;
+    (id.len() >= 8 && id.iter().all(|b| b.is_ascii_hexdigit() || *b == b'-'))
+        .then(|| String::from_utf8_lossy(id).into_owned())
 }
 
 /// The six entries named above from an environ block; every other entry is
