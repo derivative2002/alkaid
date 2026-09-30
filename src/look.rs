@@ -267,11 +267,11 @@ pub fn short_model_name(model: &str) -> String {
         .join("-")
 }
 
-/// naming-spec v2.7 model short names, matched on the lowercase model id by
+/// naming-spec v2.8 model short names, matched on the lowercase model id by
 /// prefix, longest prefix first. Real ids carry a leg or vendor suffix
 /// (`deepseek-v4.1-flash-dspark-greedy-1m-b200`, `claude-opus-5-qiniu`), so
 /// an exact table would miss them.
-const SEAT_SHORT_NAMES: [(&str, &str); 14] = [
+const SEAT_SHORT_NAMES: [(&str, &str); 16] = [
     ("claude-opus-5-5", "op55"),
     ("claude-opus-5", "op5"),
     ("claude-sonnet-5-5", "son55"),
@@ -286,6 +286,9 @@ const SEAT_SHORT_NAMES: [(&str, &str); 14] = [
     ("glm-5.3", "glm53"),
     ("gemini-3.8-flash", "gm38"),
     ("gemini-3-8-flash", "gm38"),
+    // v2.8 (规范写者 0930): Cursor 席的实际底座。
+    ("grok-4.7", "grok47"),
+    ("grok-4-7", "grok47"),
 ];
 
 /// The short name a seat row shows for the model its own session last used.
@@ -569,12 +572,14 @@ mod tests {
             ("gpt-6.1-sol", "sol61"),
             ("glm-5.3", "glm53"),
             ("gemini-3.8-flash", "gm38"),
+            ("grok-4.7", "grok47"),
+            ("grok-4-7", "grok47"),
         ] {
             assert_eq!(seat_short_name(id), short, "{id}");
         }
         // Read but not in the table: compacted, never the unknown mark.
         for (id, short) in [
-            ("grok-4.7", "grok47"),
+            ("grok-4.8", "grok48"),
             ("claude-haiku-4-5-20251001", "haiku45"),
             // A later version is not taken by an earlier prefix.
             ("claude-opus-5-6", "opus56"),
