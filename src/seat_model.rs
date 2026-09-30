@@ -13,15 +13,19 @@
 //! all, or a file that could not be read this pass, yields no entry so the
 //! pane keeps what it shows — a transient failure must not churn the token.
 //!
-//! "Missing" means a lookup answered `NotFound`. Any other error on the way
+//! "Missing" means a lookup answered `NotFound` (for a Claude project entry
+//! that is a plain file, also `NotADirectory`; the Codex walker counts only
+//! `NotFound`). Any other error on the way
 //! (a directory that cannot be listed, a file that cannot be stat'ed or
 //! read) is no answer, and the pane keeps what it shows.
 //!
 //! Reads are bounded (newest-first chunks, at most [`MODEL_SCAN_BYTES`]) and
 //! remembered per file length and mtime in `seat-models.json`, so an idle
 //! seat's transcript is only stat'ed on later passes. A located path is
-//! trusted for [`RELOCATE_AFTER_SECS`]; after that the lookup runs again, so
-//! a second file for the same session is caught within that time.
+//! cached for [`RELOCATE_AFTER_SECS`]; the first publish after that runs the
+//! lookup again, so a second file for the same session is caught then — until
+//! it does, the pane may keep showing the model it had. There is no timer:
+//! the check waits for the next publish.
 
 use crate::channel::ProcessChannel;
 use crate::herdr::AgentPane;
