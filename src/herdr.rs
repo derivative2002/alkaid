@@ -454,6 +454,8 @@ pub(crate) const ROLE_TOKEN: &str = "al_role";
 /// The pane label's model segment, verbatim. Never read from
 /// `quota_provider_model`, which can carry a borrowed provider-level model.
 pub(crate) const MODEL_TOKEN: &str = "al_model";
+/// What `$al_model` shows when the seat's model cannot be read (owner 0930).
+pub(crate) const UNKNOWN_MODEL: &str = "?";
 /// The Space name on each seat, published only when the panel is not
 /// grouped by Space — grouped, the `$quota_group` header already says it.
 pub(crate) const SPACE_TOKEN: &str = "al_space";
@@ -1329,8 +1331,16 @@ fn publish_pane_tokens_inner(
     .publishing(panes);
     let mut group_heads = space_group_heads(order, &grouping, &inventory, panes, tokens);
     let mut look = Look::installed(order, &grouping, &inventory, panes, tokens);
-    // Only a logo layout needs the agent processes' channel.
-    let channels = look.logos.shows_logos().then(crate::channel::scan);
+    // One /proc sweep: the channel logo and each seat's own model files.
+    let channels = Some(crate::channel::scan());
+    let seat_models = crate::seat_model::resolve(
+        panes,
+        channels.as_ref(),
+        crate::cache::CacheStore::from_env()
+            .ok()
+            .map(|cache| cache.root().to_path_buf())
+            .as_deref(),
+    );
     let desired_for = |pane: &AgentPane,
                        pane_tokens: &PaneTokens,
                        group_heads: &BTreeMap<String, String>,
@@ -1348,14 +1358,16 @@ fn publish_pane_tokens_inner(
             apply_context(&mut desired, context, sequence / 1_000, row);
         }
         fold_cache_row(&mut desired, row);
+        let seat_model = seat_models.get(&pane.pane_id);
         apply_seat_identity(
             &mut desired,
             pane,
             pane_labels.as_ref(),
+            seat_model,
             order,
             &space_names,
         );
-        apply_logos(&mut desired, pane, look, channels.as_ref());
+        apply_logos(&mut desired, pane, look, channels.as_ref(), seat_model);
         apply_grouping(&mut desired, pane, &grouping, &space_names);
         apply_group_and_icon(
             &mut desired,
@@ -1665,6 +1677,7 @@ fn apply_seat_identity(
     desired: &mut BTreeMap<String, String>,
     pane: &AgentPane,
     pane_labels: Option<&BTreeMap<String, String>>,
+    seat_model: Option<&crate::seat_model::SeatModel>,
     order: crate::cli::AgentOrder,
     workspace_labels: &BTreeMap<String, String>,
 ) {
@@ -1687,13 +1700,22 @@ fn apply_seat_identity(
             };
         }
     }
-    // The model name comes from the same evidence as the model mark: the
-    // model this pane's own session reported. The label's model segment is a
-    // naming snapshot (a Codex coordinator writes `codex-home` there), so a
-    // pane without that evidence shows no model name (owner 0927).
-    match session_model(pane, desired).map(crate::look::short_model_name) {
-        Some(name) if !name.is_empty() => desired.insert(MODEL_TOKEN.to_string(), name),
-        _ => desired.remove(MODEL_TOKEN),
+    // The model name comes from the seat's own session files, the same
+    // evidence as the model mark (`crate::seat_model`), shown as the
+    // naming-spec short name. Never the label's model segment — a naming
+    // snapshot — nor `quota_provider_model`. A broken evidence chain shows
+    // `?` (owner 0930); a pass that could not read keeps what the pane shows.
+    match seat_model {
+        Some(crate::seat_model::SeatModel::Known(model)) => {
+            desired.insert(MODEL_TOKEN.to_string(), crate::look::seat_short_name(model))
+        }
+        Some(crate::seat_model::SeatModel::Unknown) => {
+            desired.insert(MODEL_TOKEN.to_string(), UNKNOWN_MODEL.to_string())
+        }
+        None => match pane.tokens.get(MODEL_TOKEN) {
+            Some(value) => desired.insert(MODEL_TOKEN.to_string(), value.clone()),
+            None => desired.remove(MODEL_TOKEN),
+        },
     };
     let space = (!order.headed())
         .then(|| workspace_labels.get(&pane.workspace_id))
@@ -1703,18 +1725,6 @@ fn apply_seat_identity(
         Some(label) => desired.insert(SPACE_TOKEN.to_string(), label.clone()),
         None => desired.remove(SPACE_TOKEN),
     };
-}
-
-/// The model a pane's own agent session reported (`quota_model`, per session
-/// from the Claude Code statusLine). A session-less pane can still hold a
-/// `quota_model` an older build borrowed from another seat, so it counts as
-/// no evidence.
-fn session_model<'a>(pane: &AgentPane, desired: &'a BTreeMap<String, String>) -> Option<&'a str> {
-    pane.session.as_ref()?;
-    desired
-        .get("quota_model")
-        .map(String::as_str)
-        .filter(|model| !model.trim().is_empty())
 }
 
 /// Pane id → label from one `herdr pane list` call. Metadata only: this
@@ -2233,6 +2243,7 @@ fn apply_logos(
     pane: &AgentPane,
     look: &Look,
     channels: Option<&BTreeMap<String, crate::channel::ProcessChannel>>,
+    seat_model: Option<&crate::seat_model::SeatModel>,
 ) {
     if !look.logos.shows_logos() {
         desired.remove(CHANNEL_TOKEN);
@@ -2246,20 +2257,24 @@ fn apply_logos(
         Some(mark) => desired.insert(CHANNEL_TOKEN.to_string(), mark.to_string()),
         None => desired.remove(CHANNEL_TOKEN),
     };
-    // The model the pane's own session reported (`quota_model`, per session
-    // from the Claude Code statusLine), never the label's model segment —
-    // that is a naming snapshot, and a Codex coordinator writes `codex-home`
-    // there. Only a pane with its own agent session counts: a session-less
-    // pane can still hold a `quota_model` an older build borrowed (0927: two
-    // such panes showed another seat's "Fable 5.1"). Nothing reported, no
-    // mark.
-    let model = session_model(pane, desired).unwrap_or_default();
-    match crate::look::model_family(model) {
-        Some(family) => desired.insert(
-            MODEL_MARK_TOKEN.to_string(),
-            crate::look::model_mark(family, look.style).to_string(),
-        ),
-        None => desired.remove(MODEL_MARK_TOKEN),
+    // The model mark follows the same evidence as the model name, so a DS
+    // whale never sits beside an `op55`. Unknown shows no mark; a pass that
+    // could not read keeps the pane's mark.
+    match seat_model {
+        Some(crate::seat_model::SeatModel::Known(model)) => {
+            match crate::look::model_family(model) {
+                Some(family) => desired.insert(
+                    MODEL_MARK_TOKEN.to_string(),
+                    crate::look::model_mark(family, look.style).to_string(),
+                ),
+                None => desired.remove(MODEL_MARK_TOKEN),
+            }
+        }
+        Some(crate::seat_model::SeatModel::Unknown) => desired.remove(MODEL_MARK_TOKEN),
+        None => match pane.tokens.get(MODEL_MARK_TOKEN) {
+            Some(value) => desired.insert(MODEL_MARK_TOKEN.to_string(), value.clone()),
+            None => desired.remove(MODEL_MARK_TOKEN),
+        },
     };
 }
 
@@ -3133,18 +3148,15 @@ mod tests {
             route: route.map(str::to_string),
             official_home,
             registered_codex_home: false,
+            paths: crate::channel::SeatPaths::default(),
         }
     }
 
     #[test]
     fn logos_show_harness_channel_and_model_and_keep_the_star_for_a_ds_base() {
         use crate::look::{GroupStyle, LogoLayout};
-        let mut pane = attention_pane("w2:p1", "055", AgentStatus::Working);
-        let sessionless = pane.clone();
-        pane.session = Some(AgentSession {
-            kind: None,
-            value: "s-demo".to_string(),
-        });
+        use crate::seat_model::SeatModel;
+        let pane = attention_pane("w2:p1", "055", AgentStatus::Working);
         let look = looked(
             GroupStyle::Plain,
             LogoLayout::Inline,
@@ -3152,13 +3164,14 @@ mod tests {
         );
         let channels =
             BTreeMap::from([("w2:p1".to_string(), process(Some("127.0.0.1:8686"), false))]);
-        // The label says op5; the session reported DeepSeek. The model mark
-        // follows the session.
+        // The seat's transcript says DeepSeek (a leg-suffixed id); the model
+        // mark follows it, whatever the label or quota provider claims.
+        let deepseek = SeatModel::Known("deepseek-v4.1-flash-dspark-greedy-1m-b200".to_string());
         let mut desired = BTreeMap::from([
             (MODEL_TOKEN.to_string(), "op5".to_string()),
-            ("quota_model".to_string(), "deepseek-v4.1-flash".to_string()),
+            ("quota_model".to_string(), "Opus 5".to_string()),
         ]);
-        apply_logos(&mut desired, &pane, &look, Some(&channels));
+        apply_logos(&mut desired, &pane, &look, Some(&channels), Some(&deepseek));
         apply_group_and_icon(
             &mut desired,
             &pane,
@@ -3184,8 +3197,9 @@ mod tests {
         // An official lane's process: the channel is Anthropic's logo, not
         // text; GLM is the z.ai glyph.
         let official = BTreeMap::from([("w2:p1".to_string(), process(None, true))]);
-        let mut desired = BTreeMap::from([("quota_model".to_string(), "GLM-5.3".to_string())]);
-        apply_logos(&mut desired, &pane, &look, Some(&official));
+        let glm = SeatModel::Known("glm-5.3".to_string());
+        let mut desired = BTreeMap::new();
+        apply_logos(&mut desired, &pane, &look, Some(&official), Some(&glm));
         assert_eq!(
             desired.get(CHANNEL_TOKEN).map(String::as_str),
             Some("\u{e1c6}")
@@ -3195,36 +3209,45 @@ mod tests {
             Some("\u{e1bb}")
         );
 
-        // No process, no session model: a label naming a model (or the
-        // Codex coordinator's `codex-home`) proves neither. Old marks clear.
-        for label_model in ["ds-v41-flash", "codex-home"] {
-            let mut desired = BTreeMap::from([
-                (MODEL_TOKEN.to_string(), label_model.to_string()),
-                (CHANNEL_TOKEN.to_string(), "\u{e1bf}".to_string()),
-                (MODEL_MARK_TOKEN.to_string(), "\u{e1bc}".to_string()),
-            ]);
-            apply_logos(&mut desired, &pane, &look, Some(&BTreeMap::new()));
-            assert!(!desired.contains_key(CHANNEL_TOKEN), "{label_model}");
-            assert!(!desired.contains_key(MODEL_MARK_TOKEN), "{label_model}");
-        }
-        // A session-less pane's preserved `quota_model` is not evidence.
-        let mut desired = BTreeMap::from([("quota_model".to_string(), "Fable 5.1".to_string())]);
-        apply_logos(&mut desired, &sessionless, &look, Some(&channels));
+        // No process: no channel. An unknown model clears the model mark.
+        let mut desired = BTreeMap::from([
+            (CHANNEL_TOKEN.to_string(), "\u{e1bf}".to_string()),
+            (MODEL_MARK_TOKEN.to_string(), "\u{e1bc}".to_string()),
+        ]);
+        apply_logos(
+            &mut desired,
+            &pane,
+            &look,
+            Some(&BTreeMap::new()),
+            Some(&SeatModel::Unknown),
+        );
+        assert!(!desired.contains_key(CHANNEL_TOKEN));
         assert!(!desired.contains_key(MODEL_MARK_TOKEN));
+        // A pass that could not read the seat keeps the mark it shows.
+        let mut shown = pane.clone();
+        shown
+            .tokens
+            .insert(MODEL_MARK_TOKEN.to_string(), "\u{e1bc}".to_string());
+        let mut desired = BTreeMap::new();
+        apply_logos(&mut desired, &shown, &look, Some(&channels), None);
+        assert_eq!(
+            desired.get(MODEL_MARK_TOKEN).map(String::as_str),
+            Some("\u{e1bc}")
+        );
         // An unset base URL outside an official lane is not official.
         let bare = BTreeMap::from([("w2:p1".to_string(), process(None, false))]);
         let mut desired = BTreeMap::new();
-        apply_logos(&mut desired, &pane, &look, Some(&bare));
+        apply_logos(&mut desired, &pane, &look, Some(&bare), None);
         assert!(!desired.contains_key(CHANNEL_TOKEN));
 
         // Logos off: both marks are cleared and the whale is back.
         let off = Look::plain();
         let mut desired = BTreeMap::from([
-            (MODEL_TOKEN.to_string(), "ds-v41-flash".to_string()),
+            (MODEL_TOKEN.to_string(), "ds41".to_string()),
             (CHANNEL_TOKEN.to_string(), "x".to_string()),
             (MODEL_MARK_TOKEN.to_string(), "y".to_string()),
         ]);
-        apply_logos(&mut desired, &pane, &off, Some(&channels));
+        apply_logos(&mut desired, &pane, &off, Some(&channels), Some(&deepseek));
         apply_group_and_icon(
             &mut desired,
             &pane,
@@ -3908,42 +3931,34 @@ mod tests {
     }
 
     #[test]
-    fn the_role_comes_from_the_label_and_the_model_from_the_session() {
+    fn the_role_comes_from_the_label_and_the_model_from_the_seat_files() {
         use crate::cli::AgentOrder;
-        let mut pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
-        let panes = labels(&[("w1:p1", "hub.alioth.统筹.0925-2307.opus-5-5@cpu-box")]);
-        // No session: the label's model segment is no evidence (owner 0927).
-        let mut desired = BTreeMap::from([("quota_model".to_string(), "Fable 5.1".to_string())]);
-        apply_seat_identity(
-            &mut desired,
-            &pane,
-            Some(&panes),
-            AgentOrder::Quota,
-            &BTreeMap::new(),
-        );
-        assert_eq!(desired.get(ROLE_TOKEN).map(String::as_str), Some("统筹"));
-        assert!(!desired.contains_key(MODEL_TOKEN));
-        assert!(!desired.contains_key(SPACE_TOKEN));
-        // With its own session, the reported model, shortened.
-        pane.session = Some(AgentSession {
-            kind: None,
-            value: "s-1".to_string(),
-        });
-        let mut desired = BTreeMap::from([(
-            "quota_model".to_string(),
-            "Opus 5.5 (1M context)".to_string(),
-        )]);
-        apply_seat_identity(
-            &mut desired,
-            &pane,
-            Some(&panes),
-            AgentOrder::Quota,
-            &BTreeMap::new(),
-        );
-        assert_eq!(
-            desired.get(MODEL_TOKEN).map(String::as_str),
-            Some("opus-5.5")
-        );
+        use crate::seat_model::SeatModel;
+        let pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
+        let panes = labels(&[("w1:p1", "hub.acme.lead.0925-2307.fable-5-1@devbox")]);
+        let identity = |seat: Option<&SeatModel>| {
+            // The quota provider and the label both name another model;
+            // neither is evidence (owner 0930).
+            let mut desired =
+                BTreeMap::from([("quota_model".to_string(), "Fable 5.1".to_string())]);
+            apply_seat_identity(
+                &mut desired,
+                &pane,
+                Some(&panes),
+                seat,
+                AgentOrder::Quota,
+                &BTreeMap::new(),
+            );
+            desired
+        };
+        let known = identity(Some(&SeatModel::Known("claude-opus-5-5".to_string())));
+        assert_eq!(known.get(ROLE_TOKEN).map(String::as_str), Some("hub"));
+        assert_eq!(known.get(MODEL_TOKEN).map(String::as_str), Some("op55"));
+        assert!(!known.contains_key(SPACE_TOKEN));
+        let unknown = identity(Some(&SeatModel::Unknown));
+        assert_eq!(unknown.get(MODEL_TOKEN).map(String::as_str), Some("?"));
+        // Nothing read this pass and nothing shown yet: no model token.
+        assert!(!identity(None).contains_key(MODEL_TOKEN));
     }
 
     #[test]
@@ -3954,46 +3969,56 @@ mod tests {
             "quota_provider_model".to_string(),
             "Claude/Fable 5.1".to_string(),
         );
-        // A label without a model segment reports no model at all.
-        let panes = labels(&[("w1:p1", "spk.lab.起服.0926-0100@cpu-box")]);
+        // A label without a model segment and no seat evidence: `?`.
+        let panes = labels(&[("w1:p1", "spk.acme.serve.0926-0100@devbox")]);
         let mut desired = pane.tokens.clone();
         apply_seat_identity(
             &mut desired,
             &pane,
             Some(&panes),
+            Some(&crate::seat_model::SeatModel::Unknown),
             AgentOrder::Quota,
             &BTreeMap::new(),
         );
         assert_eq!(desired.get(ROLE_TOKEN).map(String::as_str), Some("spoke"));
-        assert!(!desired.contains_key(MODEL_TOKEN));
+        assert_eq!(desired.get(MODEL_TOKEN).map(String::as_str), Some("?"));
     }
 
     #[test]
-    fn a_failed_label_read_preserves_and_an_off_spec_label_clears() {
+    fn a_failed_read_preserves_and_an_off_spec_label_clears_the_role() {
         use crate::cli::AgentOrder;
         let mut pane = attention_pane("w1:p1", "050", AgentStatus::Idle);
         pane.tokens
             .insert(ROLE_TOKEN.to_string(), "hub".to_string());
         pane.tokens
-            .insert(MODEL_TOKEN.to_string(), "opus-5-5".to_string());
+            .insert(MODEL_TOKEN.to_string(), "op55".to_string());
+        // Neither the labels nor the seat files could be read this pass.
         let mut kept = BTreeMap::new();
-        apply_seat_identity(&mut kept, &pane, None, AgentOrder::Quota, &BTreeMap::new());
+        apply_seat_identity(
+            &mut kept,
+            &pane,
+            None,
+            None,
+            AgentOrder::Quota,
+            &BTreeMap::new(),
+        );
         assert_eq!(kept.get(ROLE_TOKEN).map(String::as_str), Some("hub"));
-        // The model name no longer rides on the label, so a failed label read
-        // does not keep one either: without session evidence it is empty.
-        assert!(!kept.contains_key(MODEL_TOKEN));
+        assert_eq!(kept.get(MODEL_TOKEN).map(String::as_str), Some("op55"));
 
+        // An off-spec label is "not reported": the role clears. The model
+        // does not ride on the label, so it stays with the seat evidence.
         let panes = labels(&[("w1:p1", "1")]);
         let mut cleared = pane.tokens.clone();
         apply_seat_identity(
             &mut cleared,
             &pane,
             Some(&panes),
+            None,
             AgentOrder::Quota,
             &BTreeMap::new(),
         );
         assert!(!cleared.contains_key(ROLE_TOKEN));
-        assert!(!cleared.contains_key(MODEL_TOKEN));
+        assert_eq!(cleared.get(MODEL_TOKEN).map(String::as_str), Some("op55"));
     }
 
     #[test]
@@ -4006,13 +4031,21 @@ mod tests {
             &mut flat,
             &pane,
             Some(&BTreeMap::new()),
+            None,
             AgentOrder::Tightest,
             &spaces,
         );
         assert_eq!(flat.get(SPACE_TOKEN).map(String::as_str), Some("玉衡"));
         for order in [AgentOrder::Quota, AgentOrder::Attention] {
             let mut grouped = flat.clone();
-            apply_seat_identity(&mut grouped, &pane, Some(&BTreeMap::new()), order, &spaces);
+            apply_seat_identity(
+                &mut grouped,
+                &pane,
+                Some(&BTreeMap::new()),
+                None,
+                order,
+                &spaces,
+            );
             assert!(!grouped.contains_key(SPACE_TOKEN), "{order:?}");
         }
     }

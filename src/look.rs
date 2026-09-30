@@ -267,6 +267,65 @@ pub fn short_model_name(model: &str) -> String {
         .join("-")
 }
 
+/// naming-spec v2.7 model short names, matched on the lowercase model id by
+/// prefix, longest prefix first. Real ids carry a leg or vendor suffix
+/// (`deepseek-v4.1-flash-dspark-greedy-1m-b200`, `claude-opus-5-qiniu`), so
+/// an exact table would miss them.
+const SEAT_SHORT_NAMES: [(&str, &str); 14] = [
+    ("claude-opus-5-5", "op55"),
+    ("claude-opus-5", "op5"),
+    ("claude-sonnet-5-5", "son55"),
+    ("claude-fable-5-1", "f51"),
+    ("deepseek-v4.1-flash", "ds41"),
+    ("deepseek-v4-1-flash", "ds41"),
+    ("ds-v41-flash", "ds41"),
+    ("gpt-6.1-sol", "sol61"),
+    ("gpt-6-1-sol", "sol61"),
+    ("gpt-6-sol", "sol"),
+    ("gpt-6-astra", "astra"),
+    ("glm-5.3", "glm53"),
+    ("gemini-3.8-flash", "gm38"),
+    ("gemini-3-8-flash", "gm38"),
+];
+
+/// The short name a seat row shows for the model its own session last used.
+/// An id the table does not know is still evidence: it is shown compacted
+/// (lowercase, no `claude-` prefix, no dots — `grok-4.7` → `grok47`), never as
+/// the unknown mark.
+pub fn seat_short_name(model: &str) -> String {
+    let id = strip_channel_prefix(&model.trim().to_ascii_lowercase()).to_string();
+    let mut table = SEAT_SHORT_NAMES;
+    table.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
+    if let Some((_, short)) = table.iter().find(|(prefix, _)| {
+        // The prefix must end the version: `claude-opus-5` takes
+        // `claude-opus-5-qiniu` and `claude-opus-5[1m]`, never
+        // `claude-opus-5-6` or `claude-opus-50`.
+        id.strip_prefix(prefix).is_some_and(|rest| {
+            rest.is_empty()
+                || rest.starts_with('[')
+                || rest
+                    .strip_prefix('-')
+                    .is_some_and(|tail| !tail.starts_with(|c: char| c.is_ascii_digit()))
+        })
+    }) {
+        return short.to_string();
+    }
+    // Unknown id: drop the vendor prefix and a trailing `-YYYYMMDD`, then
+    // dots and any dash before a digit (`grok-4.7` → `grok47`).
+    let id = id.strip_prefix("claude-").unwrap_or(&id);
+    let id = match id.rsplit_once('-') {
+        Some((head, date)) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => id,
+    };
+    let chars = id.chars().filter(|c| *c != '.').collect::<Vec<_>>();
+    chars
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| **c != '-' || !chars.get(i + 1).is_some_and(|next| next.is_ascii_digit()))
+        .map(|(_, c)| *c)
+        .collect()
+}
+
 /// A model family's mark. Glyphs for the five families the seats use are
 /// the @lobehub/icons marks Dubhe's brand-map uses, added to the
 /// Herdr Agent Icons Alkaid face at U+E1BA–E1BE (GLM is the z.ai Z knocked
@@ -492,6 +551,36 @@ mod tests {
             channel_mark(Channel::Official, Harness::Claude, IconStyle::Letter),
             Some("官")
         );
+    }
+
+    #[test]
+    fn seat_short_names_follow_the_naming_spec_table_by_family_prefix() {
+        for (id, short) in [
+            ("claude-opus-5-5", "op55"),
+            ("claude-opus-5-5[1m]", "op55"),
+            ("claude-opus-5", "op5"),
+            ("claude-opus-5-qiniu", "op5"),
+            ("claude-sonnet-5-5", "son55"),
+            ("claude-fable-5-1", "f51"),
+            ("deepseek-v4.1-flash", "ds41"),
+            ("deepseek-v4.1-flash-dspark-greedy-1m-b200", "ds41"),
+            ("gpt-6-astra", "astra"),
+            ("gpt-6-sol", "sol"),
+            ("gpt-6.1-sol", "sol61"),
+            ("glm-5.3", "glm53"),
+            ("gemini-3.8-flash", "gm38"),
+        ] {
+            assert_eq!(seat_short_name(id), short, "{id}");
+        }
+        // Read but not in the table: compacted, never the unknown mark.
+        for (id, short) in [
+            ("grok-4.7", "grok47"),
+            ("claude-haiku-4-5-20251001", "haiku45"),
+            // A later version is not taken by an earlier prefix.
+            ("claude-opus-5-6", "opus56"),
+        ] {
+            assert_eq!(seat_short_name(id), short, "{id}");
+        }
     }
 
     #[test]

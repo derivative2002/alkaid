@@ -16,4 +16,5 @@ pub mod herdr;
 pub mod providers;
 pub mod refresh;
 pub mod route;
+pub mod seat_model;
 pub mod settings;

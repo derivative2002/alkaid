@@ -304,15 +304,28 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    `--sidebar-rows quota` restores the usage rows; the collectors never stop.
    State labels are written in every order: Herdr rejects an empty label and a
    zero-width one leaves a stray ` · `, so they cannot be hidden cleanly.
-7. **Role and model come from the pane label only** (naming-spec §5:
-   `<role>.<container>.<task>.<gen>[.<model>][@<machine>]`, 统筹/秘书 from
-   the task segment). Never from `quota_provider_model`, which can carry a
-   borrowed provider model. An off-spec label publishes nothing; a failed
-   `pane list` read preserves what the pane shows. The label read is one
-   metadata-only call per publish pass and is skipped when the pass has no
-   pane. A DS base (model segment starts with `ds` or contains `deepseek`)
-   shows the whale U+E1AD; icon-only passes take the model from the pane's
-   own `$al_model` so they never swap it back.
+7. **Role comes from the pane label; the model from the seat's own files**
+   (owner 0930, replacing 0927's "session statusLine or nothing"). Role:
+   naming-spec §5 `<role>.<container>.<task>.<gen>[.<model>][@<machine>]`,
+   统筹/秘书 from the task segment; an off-spec label publishes no role, a
+   failed `pane list` read preserves it. The label read is one metadata-only
+   call per publish pass and is skipped when the pass has no pane. Model
+   (`src/seat_model.rs`): the pane's agent process, found by the one `/proc`
+   sweep per pass (`channel::scan`, no longer gated on a logo layout), names
+   its `CLAUDE_CONFIG_DIR`/`HOME`/`CODEX_HOME`; Claude reads the last
+   non-`<synthetic>` assistant `message.model` of
+   `projects/*/<session>.jsonl`, Codex the last `turn_context` model of its
+   rollout (session from Herdr, else argv `resume <id>`), Cursor
+   `~/.cursor/cli-config.json` `model.modelId`. Reads are newest-first,
+   bounded to 8 MiB, and cached per file length and mtime in
+   `seat-models.json`. `$al_model` is the naming-spec short name
+   (`look::seat_short_name`, by family prefix; an unlisted id is compacted,
+   not hidden). A broken evidence chain shows `?`; an empty scan or a read
+   error preserves what the pane shows. Never the label's model segment,
+   never `quota_provider_model`. The model mark uses the same evidence. A DS
+   base (`$al_model` starts with `ds`) shows the whale U+E1AD; icon-only
+   passes take the model from the pane's own `$al_model` so they never swap
+   it back.
 8. **Cursor is display-only.** `Harness::Cursor` has no collector
    (`billing()` is `None`), is not in `AgentSelection::SUPPORTED`, and is
    never read for a topic: `refresh_pane_topic` checks the harness *before*

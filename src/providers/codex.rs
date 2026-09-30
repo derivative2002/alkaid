@@ -23,18 +23,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const FIVE_HOUR_WINDOW_MINUTES: u64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
 const ROLLOUT_TAIL_BYTES: u64 = 256 * 1024;
-/// How far back from EOF to look for the latest `turn_context` when the tail
-/// has none. Codex writes that event at turn start, then tool calls and
-/// `token_count` lines; a long turn can push the model several megabytes
-/// behind EOF. The previous 256 KB *head* fallback returned the session-start
-/// model instead. Chunked reverse reads stay within this budget so a 40 MB
-/// rollout is not scanned on every watch pulse. Observed live threads put the
-/// latest model 1–4 MB from EOF.
-const ROLLOUT_MODEL_SCAN_BYTES: u64 = 8 * 1024 * 1024;
-/// Extra bytes kept from the newer chunk so a `turn_context` line that
-/// straddles a 256 KB boundary is complete in the older window. Live
-/// `turn_context` records are about 2 KB.
-const ROLLOUT_LINE_OVERLAP_BYTES: u64 = 8 * 1024;
 const CODEX_CONTEXT_BASELINE_TOKENS: u64 = 12_000;
 /// Prompt cache lifetime assumed for a Codex request.
 ///
@@ -342,7 +330,7 @@ fn enrich_local_sessions_at(snapshot: &mut ProviderSnapshot, home: &Path, sessio
     }
 }
 
-fn find_rollout_paths(home: &Path, session_ids: &[String]) -> BTreeMap<String, PathBuf> {
+pub(crate) fn find_rollout_paths(home: &Path, session_ids: &[String]) -> BTreeMap<String, PathBuf> {
     let mut directories = vec![home.join("sessions"), home.join("archived_sessions")];
     let mut newest = BTreeMap::<String, (u64, PathBuf)>::new();
     while let Some(directory) = directories.pop() {
@@ -418,59 +406,13 @@ fn read_rollout_observation(path: &Path, session_id: &str) -> Option<RolloutObse
     Some(observation)
 }
 
-/// Walk the rollout newest-first in tail-sized chunks until a `turn_context`
-/// model is found, stopping at [`ROLLOUT_MODEL_SCAN_BYTES`]. Adjacent chunks
-/// overlap so a `turn_context` that straddles a boundary is still parsed.
+/// The latest `turn_context` model, newest-first (see
+/// [`crate::seat_model::newest_match`]). Never the file head: that is the
+/// first turn's model, not the current one.
 fn read_latest_rollout_model(path: &Path) -> Option<String> {
-    let mut file = fs::File::open(path).ok()?;
-    let length = file.metadata().ok()?.len();
-    if length == 0 {
-        return None;
-    }
-    let floor = length.saturating_sub(ROLLOUT_MODEL_SCAN_BYTES);
-    let mut cursor = length;
-    while cursor > floor {
-        let start = cursor.saturating_sub(ROLLOUT_TAIL_BYTES).max(floor);
-        file.seek(SeekFrom::Start(start)).ok()?;
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(cursor.saturating_sub(start))
-            .read_to_end(&mut bytes)
-            .ok()?;
-        let text = String::from_utf8_lossy(&bytes);
-        let mut slice = text.as_ref();
-        if start > 0 {
-            slice = match slice.split_once('\n') {
-                Some((_, rest)) => rest,
-                None => {
-                    let Some(next) = next_reverse_cursor(start, cursor, floor) else {
-                        break;
-                    };
-                    cursor = next;
-                    continue;
-                }
-            };
-        }
-        if cursor < length && !slice.is_empty() && !slice.ends_with('\n') {
-            slice = slice.rsplit_once('\n').map(|(rest, _)| rest).unwrap_or("");
-        }
-        if let Some(model) = parse_rollout_model(slice) {
-            return Some(model);
-        }
-        let Some(next) = next_reverse_cursor(start, cursor, floor) else {
-            break;
-        };
-        cursor = next;
-    }
-    None
-}
-
-fn next_reverse_cursor(start: u64, cursor: u64, floor: u64) -> Option<u64> {
-    if start <= floor {
-        return None;
-    }
-    let next = start.saturating_add(ROLLOUT_LINE_OVERLAP_BYTES);
-    (next < cursor).then_some(next)
+    crate::seat_model::newest_match(path, parse_rollout_model)
+        .ok()
+        .flatten()
 }
 
 fn parse_rollout_observation(text: &str, session_id: &str) -> Option<RolloutObservation> {
@@ -554,7 +496,7 @@ fn parse_rollout_timestamp(entry: &Value) -> Option<u64> {
         .map(ResetAt::unix_seconds)
 }
 
-fn parse_rollout_model(text: &str) -> Option<String> {
+pub(crate) fn parse_rollout_model(text: &str) -> Option<String> {
     text.lines().rev().find_map(|line| {
         let entry = serde_json::from_str::<Value>(line).ok()?;
         (entry.get("type").and_then(Value::as_str) == Some("turn_context"))

@@ -1211,7 +1211,8 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout, order: AgentOrder)
 ///    the state, no state text (owner 0927) — then `$al_space`, `tab`
 /// 3. `$al_role` from the pane label (naming-spec §5), then with the
 ///    default second-row logos `$al_channel` and `$al_model_mark`, then
-///    `$al_model` from the pane's own session (empty without evidence)
+///    `$al_model`, the short name of the model the seat's own session files
+///    last used (`?` when they cannot be found)
 /// 4. `pane` — the pane label itself, i.e. the session name
 fn append_identity_rows(rows: &mut Array, look: RowLook) {
     let (group_fg, group_bold) = match look.group {
