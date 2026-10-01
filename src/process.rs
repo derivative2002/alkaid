@@ -225,7 +225,15 @@ impl Tree {
     pub(crate) fn end(&self, child: &mut Child) -> Result<()> {
         #[cfg(test)]
         if self.fails {
-            anyhow::bail!("injected end failure");
+            // A stage and a code, like a real Win32 failure, so a caller's
+            // report can be checked for both.
+            anyhow::bail!(
+                "{}",
+                JobFailure {
+                    stage: "TerminateJobObject",
+                    code: Some(1234),
+                }
+            );
         }
         #[cfg(unix)]
         unsafe {
@@ -515,6 +523,17 @@ impl Tree {
     }
 }
 
+/// What a test outside this module needs to drive the tree paths.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::Tree;
+
+    /// A tree whose `end` fails with a stage and a code.
+    pub(crate) fn failing_tree() -> Tree {
+        super::tests::failing_tree()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,7 +578,15 @@ mod tests {
         let result =
             run_shell_with_deadline("sleep 20 & wait", b"", Duration::from_millis(100)).unwrap();
         assert!(result.timed_out);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Loose on purpose: the point is that the 100 ms budget was honoured
+        // and not the twenty seconds the command asked for. One second was
+        // within reach of a loaded parallel run on Windows (measured 1001),
+        // which made this a flake rather than a check.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the budget was not honoured: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -723,7 +750,7 @@ mod tests {
 
     /// A tree whose ending always fails, so the caller's reporting of a
     /// termination error can be seen without a Windows job object.
-    fn failing_tree() -> Tree {
+    pub(super) fn failing_tree() -> Tree {
         #[cfg(windows)]
         {
             Tree {

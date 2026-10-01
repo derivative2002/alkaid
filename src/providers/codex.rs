@@ -166,24 +166,73 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
         .context("open codex app-server stdout")?;
     let mut output = BufReader::new(stdout);
 
+    request_quota(
+        &mut input,
+        &mut output,
+        child,
+        tree,
+        REQUEST_TIMEOUT,
+        session_ids,
+    )
+}
+
+/// Ask the app-server, ending its tree if the request runs past `timeout`.
+///
+/// `timeout` is a parameter so the entry point can be exercised without
+/// waiting the real fifteen seconds, and so the timeout branch — where the
+/// watchdog, not this thread, is the one that ends the tree — can be run
+/// (Codex g1e).
+fn request_quota(
+    input: &mut ChildStdin,
+    output: &mut BufReader<impl std::io::Read>,
+    child: Child,
+    tree: crate::process::Tree,
+    timeout: Duration,
+    session_ids: &[String],
+) -> Result<ProviderSnapshot> {
     // The watchdog and this thread share the child, so it can only ever be
     // signalled while it is still unreaped. Signalling a bare pid after
     // `wait` would race with the operating system recycling that pid.
     let child = Arc::new(Mutex::new(Some((child, tree))));
+    // Whoever ends the tree reports its own failure here; the other thread
+    // finds the child already taken. An empty slot is not proof that the
+    // tree ended, so the failure has to be kept somewhere both threads can
+    // reach (Codex g1e).
+    let end_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let watchdog = Arc::clone(&child);
+    let watchdog_end_failure = Arc::clone(&end_failure);
     thread::spawn(move || {
-        thread::sleep(REQUEST_TIMEOUT);
-        let _ = terminate(&watchdog);
+        thread::sleep(timeout);
+        if let Err(error) = terminate(&watchdog) {
+            let mut slot = watchdog_end_failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *slot = Some(format!(
+                "the timed-out codex app-server could not be ended: {error:#}"
+            ));
+        }
     });
 
-    let result = fetch_from_process(&mut input, &mut output, session_ids);
+    let fetched = fetch_from_process(input, output, session_ids);
     let ended = terminate(&child);
-    // A tree that could not be ended is worth reporting when nothing else
-    // went wrong, but it never hides the fetch's own error.
-    match (result, ended) {
-        (Ok(snapshot), Ok(())) => Ok(snapshot),
-        (Ok(_), Err(error)) => Err(error.context("end the codex app-server's tree")),
-        (Err(error), _) => Err(error),
+    let timed_out_without_ending = end_failure
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    let end_failure = match (ended, timed_out_without_ending) {
+        (Err(error), _) => Some(format!("{error:#}")),
+        (Ok(()), failure) => failure,
+    };
+    match (fetched, end_failure) {
+        (Ok(snapshot), None) => Ok(snapshot),
+        // The fetch's own error stays the one the caller recovers from; the
+        // termination failure rides along in its chain rather than replacing
+        // it.
+        (Err(error), failure) => Err(match failure {
+            Some(failure) => error.context(failure),
+            None => error,
+        }),
+        (Ok(_), Some(failure)) => Err(anyhow::anyhow!(failure)),
     }
 }
 
@@ -736,6 +785,107 @@ pub fn account_is_chatgpt(value: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A child running `command`, contained the way a real app-server is.
+    fn contained_server(
+        command: &str,
+    ) -> (
+        ChildStdin,
+        BufReader<std::process::ChildStdout>,
+        Child,
+        crate::process::Tree,
+    ) {
+        let mut server = Command::new("sh");
+        server
+            .args(["-c", command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let (mut child, tree) = crate::process::spawn_constrained(&mut server).unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = BufReader::new(child.stdout.take().unwrap());
+        (input, output, child, tree)
+    }
+
+    #[test]
+    fn a_timeout_whose_tree_cannot_be_ended_is_reported_to_the_caller() {
+        // Codex g1e: the watchdog, not this thread, is the one that ends a
+        // timed-out app-server's tree, so its failure has to be kept where
+        // the caller can find it. No network, no credentials: the child is
+        // `sh -c 'sleep 1'`, which outlives the 50 ms timeout and answers
+        // nothing, so the request thread is still blocked when the watchdog
+        // takes the child.
+        let (mut input, mut output, child, real_tree) = contained_server("sleep 0.5");
+        let error = request_quota(
+            &mut input,
+            &mut output,
+            child,
+            crate::process::testing::failing_tree(),
+            Duration::from_millis(50),
+            &[],
+        )
+        .unwrap_err();
+        drop(real_tree);
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("the timed-out codex app-server could not be ended"),
+            "only the watchdog writes this line: {chain}"
+        );
+        assert!(
+            chain.contains("TerminateJobObject failed (win32 error 1234)"),
+            "the stage and the code must reach the caller: {chain}"
+        );
+    }
+
+    #[test]
+    fn a_timeout_whose_tree_ends_cleanly_reports_no_termination_failure() {
+        // The positive side of the same entry: the watchdog ends the tree
+        // for real, and the caller sees only the fetch's own error.
+        let (mut input, mut output, child, tree) = contained_server("sleep 0.5");
+        let error = request_quota(
+            &mut input,
+            &mut output,
+            child,
+            tree,
+            Duration::from_millis(50),
+            &[],
+        )
+        .unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(!chain.contains("could not be ended"), "{chain}");
+    }
+
+    #[test]
+    fn a_fake_app_server_yields_the_subscription_windows() {
+        // The happy path through the same entry, end to end and offline: the
+        // "app-server" is a shell loop that answers each request line with
+        // the id it was given.
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) inner='{}' ;;
+    *account/read*) inner='{"account":{"type":"chatgpt"}}' ;;
+    *rateLimits/read*) inner='{"rateLimits":{"primary":{"usedPercent":12.0,"windowDurationMins":300,"resetsAt":1786795200},"secondary":{"usedPercent":24.0,"windowDurationMins":10080,"resetsAt":1787400000}}}' ;;
+    *thread/list*) inner='{"data":[]}' ;;
+    *) continue ;;
+  esac
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$inner"
+done
+"#;
+        let (mut input, mut output, child, tree) = contained_server(script);
+        let snapshot = request_quota(
+            &mut input,
+            &mut output,
+            child,
+            tree,
+            Duration::from_secs(5),
+            &[],
+        )
+        .unwrap();
+        assert!(snapshot.window(WindowKind::FiveHour).is_some());
+        assert!(snapshot.window(WindowKind::Weekly).is_some());
+    }
 
     #[test]
     fn selects_codex_windows_by_duration_not_position() {
