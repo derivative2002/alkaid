@@ -908,6 +908,7 @@ fn refresh_provider(
                 preserve_context,
                 session_id,
             } = fetched;
+            cache.clear_provider_error(provider)?;
             if preserve_context {
                 cache.save_preserving_context_for_session(snapshot, session_id.as_deref())?;
             } else if matches!(provider, Provider::Codex) {
@@ -927,12 +928,21 @@ fn refresh_provider(
                 error: None,
             })
         }
-        Err(error) => Ok(ProviderOutcome {
-            provider,
-            available: load_usable_snapshot(cache, provider)?.is_some(),
-            from_cache: true,
-            error: Some(error.to_string()),
-        }),
+        Err(error) => {
+            // The whole chain, not just its top context: on Windows the
+            // diagnosis of a missing Codex quota is the OS error under
+            // "start codex app-server", and `error.to_string()` drops it.
+            // Recorded because every caller of `refresh_selected` drops this
+            // outcome and the watcher's stderr is null.
+            let detail = format!("{error:#}");
+            cache.record_provider_error(provider, &detail)?;
+            Ok(ProviderOutcome {
+                provider,
+                available: load_usable_snapshot(cache, provider)?.is_some(),
+                from_cache: true,
+                error: Some(detail),
+            })
+        }
     }
 }
 
