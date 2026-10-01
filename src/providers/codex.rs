@@ -157,7 +157,8 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
             Ok(())
         });
     }
-    let mut child = command.spawn().context("start codex app-server")?;
+    let (mut child, tree) =
+        crate::process::spawn_constrained(&mut command).context("start codex app-server")?;
     let mut input = child.stdin.take().context("open codex app-server stdin")?;
     let stdout = child
         .stdout
@@ -168,34 +169,40 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
     // The watchdog and this thread share the child, so it can only ever be
     // signalled while it is still unreaped. Signalling a bare pid after
     // `wait` would race with the operating system recycling that pid.
-    let tree = crate::process::Tree::contain(&child);
     let child = Arc::new(Mutex::new(Some((child, tree))));
     let watchdog = Arc::clone(&child);
     thread::spawn(move || {
         thread::sleep(REQUEST_TIMEOUT);
-        terminate(&watchdog);
+        let _ = terminate(&watchdog);
     });
 
     let result = fetch_from_process(&mut input, &mut output, session_ids);
-    terminate(&child);
-    result
+    let ended = terminate(&child);
+    // A tree that could not be ended is worth reporting when nothing else
+    // went wrong, but it never hides the fetch's own error.
+    match (result, ended) {
+        (Ok(snapshot), Ok(())) => Ok(snapshot),
+        (Ok(_), Err(error)) => Err(error.context("end the codex app-server's tree")),
+        (Err(error), _) => Err(error),
+    }
 }
 
 /// Kill the app-server's process group and reap it, at most once.
 ///
 /// Whichever of the request thread and the watchdog gets here first takes the
 /// child; the other one finds an empty slot and does nothing.
-fn terminate(child: &Mutex<Option<(Child, crate::process::Tree)>>) {
+fn terminate(child: &Mutex<Option<(Child, crate::process::Tree)>>) -> Result<()> {
     let Ok(mut slot) = child.lock() else {
-        return;
+        anyhow::bail!("lock codex app-server child");
     };
     let Some((mut child, tree)) = slot.take() else {
-        return;
+        return Ok(());
     };
     // `pre_exec` put the app-server in its own process group (a job object
     // on Windows), so this also collects any helper it spawned.
-    tree.end(&mut child);
+    tree.end(&mut child)?;
     let _ = child.wait();
+    Ok(())
 }
 
 fn fetch_from_process(
