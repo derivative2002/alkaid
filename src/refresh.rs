@@ -1451,18 +1451,30 @@ mod tests {
     fn with_isolated_credentials(body: impl FnOnce()) {
         let root = tempdir().unwrap();
         let _guard = crate::providers::test_support::env_guard();
-        let previous_auth = std::env::var_os("CODEX_AUTH_FILE");
-        let previous_home = std::env::var_os("CODEX_HOME");
+        // Held to the end, and dropped before the lock: a body that panics
+        // must not leave the redirect behind for the tests beside it
+        // (Codex g1h, suggestion).
+        let _restore = EnvRestore(vec![
+            ("CODEX_AUTH_FILE", std::env::var_os("CODEX_AUTH_FILE")),
+            ("CODEX_HOME", std::env::var_os("CODEX_HOME")),
+        ]);
         std::env::set_var("CODEX_AUTH_FILE", root.path().join("auth.json"));
         std::env::set_var("CODEX_HOME", root.path());
         body();
-        match previous_auth {
-            Some(value) => std::env::set_var("CODEX_AUTH_FILE", value),
-            None => std::env::remove_var("CODEX_AUTH_FILE"),
-        }
-        match previous_home {
-            Some(value) => std::env::set_var("CODEX_HOME", value),
-            None => std::env::remove_var("CODEX_HOME"),
+    }
+
+    /// Puts back the environment variables it was given when it goes out of
+    /// scope, panic or not.
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, previous) in self.0.drain(..) {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
         }
     }
 

@@ -719,11 +719,15 @@ fn read_rpc(output: &mut BufReader<impl std::io::Read>, expected_id: u64) -> Res
 /// code and a message stripped of credential-shaped runs is kept, and this
 /// string is what reaches the recorded diagnostic file (Codex g1c G2).
 fn safe_rpc_error(error: &Value) -> String {
-    let code = error.get("code").and_then(|code| match code {
-        Value::Number(number) => Some(number.to_string()),
-        Value::String(text) => Some(redact_secrets(text)),
+    // JSON-RPC 2.0 says `code` is an integer. A string code is upstream's
+    // free text like the message, and it is not quoted at all: a whitelist
+    // field name does not make a value trustworthy (Codex g1h G2).
+    let code = match error.get("code") {
+        Some(Value::Number(number)) if number.is_i64() || number.is_u64() => {
+            Some(number.to_string())
+        }
         _ => None,
-    });
+    };
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -739,8 +743,9 @@ fn safe_rpc_error(error: &Value) -> String {
 
 const REDACTED: &str = "<redacted>";
 
-/// Names whose value is a credential wherever they appear as `name=value`
-/// or `name: value`. Matched without regard to case.
+/// Names whose value is a credential wherever they appear, quoted or not,
+/// as `name=value`, `name: value`, `"name": "value"`. Matched without regard
+/// to case.
 const CREDENTIAL_PARAMETERS: [&str; 9] = [
     "api_key",
     "apikey",
@@ -753,44 +758,107 @@ const CREDENTIAL_PARAMETERS: [&str; 9] = [
     "authorization",
 ];
 
-/// The end of a credential run: anything that cannot be part of one.
+/// Authentication schemes: the word before the credential, not the credential.
+const AUTH_SCHEMES: [&str; 2] = ["Bearer", "Basic"];
+
+/// The end of a credential run: anything that cannot be part of one. Quotes
+/// end it too, so `api_key="value"` hides `value` and not the quote.
 fn is_value_end(character: char) -> bool {
-    character.is_whitespace() || matches!(character, '&' | ',' | ';' | '"' | '\'' | ')' | '}' | ']')
+    character.is_whitespace()
+        || matches!(
+            character,
+            '&' | ',' | ';' | '"' | '\'' | ')' | '}' | ']' | '<' | '>' | '|'
+        )
+}
+
+fn is_uri_end(character: char) -> bool {
+    is_value_end(character) || character == '/'
 }
 
 /// Remove credential-shaped runs from free text.
 ///
-/// Defence in depth rather than a proof: the projection above already drops
-/// every field it did not name, and free upstream text is only quoted after
-/// passing through here. `scheme://user:password@host` keeps the host, and a
-/// named credential keeps its name but not its value (Codex g1c G2).
+/// Defence in depth rather than a proof: the projection above drops every
+/// field it did not name, and free upstream text is only quoted after passing
+/// through here. Every URI is handled, not just the first, and both the
+/// quoted and the header spellings are covered (Codex g1h G2).
 fn redact_secrets(text: &str) -> String {
-    let mut text = redact_userinfo(text);
+    let text = redact_uris(text);
+    let text = redact_auth_schemes(&text);
+    redact_parameters(&text)
+}
+
+/// `scheme://user:password@host` → `scheme://<redacted>@host`, for every URI
+/// in the text: a message can carry a plain endpoint and a credentialed
+/// proxy, or two credentialed ones.
+fn redact_uris(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find("://") {
+        let after = cursor + offset + "://".len();
+        out.push_str(&text[cursor..after]);
+        let tail = &text[after..];
+        let boundary = tail.find(is_uri_end).unwrap_or(tail.len());
+        cursor = match tail[..boundary].find('@') {
+            Some(at) => {
+                out.push_str(REDACTED);
+                out.push_str(&tail[at..boundary]);
+                after + boundary
+            }
+            // No userinfo here: keep this run and look for the next URI.
+            None => after,
+        };
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// `Bearer <token>` → `Bearer <redacted>`, for each authentication scheme.
+/// This runs before the parameter pass, which would otherwise hide the scheme
+/// word itself and leave the token behind.
+fn redact_auth_schemes(text: &str) -> String {
+    let mut out = text.to_string();
+    for scheme in AUTH_SCHEMES {
+        out = redact_after_word(&out, scheme, is_value_end);
+    }
+    out
+}
+
+/// Hide the run after every occurrence of `word`.
+fn redact_after_word(text: &str, word: &str, ends: fn(char) -> bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find(word) {
+        let start = cursor + offset;
+        let after = start + word.len();
+        let rest = &text[after..];
+        let spaced = rest.len().saturating_sub(rest.trim_start().len());
+        let value_at = after + spaced;
+        if spaced == 0 {
+            // Not a scheme followed by a credential.
+            out.push_str(&text[cursor..after]);
+            cursor = after;
+            continue;
+        }
+        let tail = &text[value_at..];
+        let end = tail.find(ends).unwrap_or(tail.len());
+        out.push_str(&text[cursor..value_at]);
+        out.push_str(REDACTED);
+        cursor = value_at + end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// Every credential parameter, one name at a time.
+fn redact_parameters(text: &str) -> String {
+    let mut text = text.to_string();
     for name in CREDENTIAL_PARAMETERS {
         text = redact_parameter(&text, name);
     }
     text
 }
 
-/// `scheme://user:password@host` → `scheme://<redacted>@host`, for the first
-/// URL in the text. A userinfo run is what sits between `://` and the first
-/// `@` before any `/` or space.
-fn redact_userinfo(text: &str) -> String {
-    let Some(scheme) = text.find("://") else {
-        return text.to_string();
-    };
-    let after = scheme + "://".len();
-    let tail = &text[after..];
-    let boundary = tail
-        .find(|character: char| character == '/' || character.is_whitespace())
-        .unwrap_or(tail.len());
-    let Some(at) = tail[..boundary].find('@') else {
-        return text.to_string();
-    };
-    format!("{}{}{}", &text[..after], REDACTED, &tail[at..])
-}
-
-/// `name=value` → `name=<redacted>`, for one credential name.
+/// `name=value` → `name=<redacted>`, for one credential name, quoted or not.
 fn redact_parameter(text: &str, name: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
@@ -798,7 +866,13 @@ fn redact_parameter(text: &str, name: &str) -> String {
         if start < cursor {
             continue;
         }
-        let Some(candidate) = text.get(start..start + name.len()) else {
+        // A quoted name, as in `{"api_key": "…"}`.
+        let name_at = if matches!(text[start..].chars().next(), Some('"') | Some('\'')) {
+            start + 1
+        } else {
+            start
+        };
+        let Some(candidate) = text.get(name_at..name_at + name.len()) else {
             continue;
         };
         if !candidate.eq_ignore_ascii_case(name) {
@@ -808,28 +882,33 @@ fn redact_parameter(text: &str, name: &str) -> String {
         if text[..start].chars().next_back().is_some_and(is_word) {
             continue;
         }
-        let after = start + name.len();
-        let mut value_at = None;
-        for (offset, character) in text[after..].char_indices() {
-            if character.is_whitespace() {
-                continue;
-            }
-            if character == '=' || character == ':' {
-                value_at = Some(after + offset + character.len_utf8());
-            }
-            break;
-        }
-        let Some(after_separator) = value_at else {
+        // After the name: an optional closing quote, spacing, then `=`/`:`.
+        let after = name_at + name.len();
+        let rest = &text[after..];
+        let quote = usize::from(matches!(rest.chars().next(), Some('"') | Some('\'')));
+        let spaced = rest[quote..]
+            .len()
+            .saturating_sub(rest[quote..].trim_start().len());
+        let separator_at = after + quote + spaced;
+        let Some(separator) = text[separator_at..].chars().next() else {
             continue;
         };
-        // `name: value` is as common as `name=value`, and the run to hide
-        // starts after the spacing, not at the separator.
-        let value_at = after_separator
-            + text[after_separator..]
-                .len()
-                .saturating_sub(text[after_separator..].trim_start().len());
-        let tail = &text[value_at..];
-        let end = tail.find(is_value_end).unwrap_or(tail.len());
+        if separator != '=' && separator != ':' {
+            continue;
+        }
+        // The value may itself be quoted; either way the run ends at the
+        // first character that cannot be part of it.
+        let value_or_quote = separator_at + separator.len_utf8();
+        let trailer = &text[value_or_quote..];
+        let spaced = trailer.len() - trailer.trim_start().len();
+        let quoted_at = value_or_quote + spaced;
+        let value_at = quoted_at
+            + usize::from(matches!(
+                text[quoted_at..].chars().next(),
+                Some('"') | Some('\'')
+            ));
+        let value = &text[value_at..];
+        let end = value.find(is_value_end).unwrap_or(value.len());
         out.push_str(&text[cursor..value_at]);
         out.push_str(REDACTED);
         cursor = value_at + end;
@@ -1070,7 +1149,7 @@ done
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   [ -n "$id" ] || continue
-  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"denied: GET https://user:pw@api.example.com/v1/limits?api_key=%s","data":{{"access_token":"%s","nested":{{"refresh_token":"%s"}}}}}}}}\n' "$id" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}"
+  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"denied: GET https://api.example.com/v1 via https://user:pw@proxy.example.com, api_key=%s, Authorization: Bearer %s","data":{{"access_token":"%s","nested":{{"refresh_token":"%s"}}}}}}}}\n' "$id" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}"
 done
 "#
         );
@@ -1102,6 +1181,94 @@ done
             !chain.contains("user:pw@") && chain.contains(REDACTED),
             "the URI userinfo must be redacted: {chain}"
         );
+        assert!(
+            chain.contains("https://api.example.com/v1"),
+            "the readable part of the diagnosis must survive: {chain}"
+        );
+        assert!(
+            chain.contains("api_key=<redacted>"),
+            "the parameter's value must be hidden: {chain}"
+        );
+        assert!(
+            chain.contains("Authorization: <redacted> <redacted>"),
+            "the scheme word and its token must both be hidden: {chain}"
+        );
+    }
+
+    /// The shapes Codex g1h probed against the previous redactor. The first
+    /// seven used to keep the sentinel; the last three are the controls that
+    /// must stay readable (Codex g1h G2).
+    #[test]
+    fn redaction_covers_every_shape_codex_g1h_probed() {
+        const S: &str = "sentinel-9f2c";
+        for (shape, input, expected) in [
+            (
+                "single_uri_control",
+                format!("GET https://user:pw@api.example.com/v1"),
+                format!("GET https://{REDACTED}@api.example.com/v1"),
+            ),
+            (
+                "plain_then_secret_uri",
+                format!("GET https://api.example.com/v1 via https://user:pw@proxy.example.com"),
+                format!("GET https://api.example.com/v1 via https://{REDACTED}@proxy.example.com"),
+            ),
+            (
+                "two_secret_uris",
+                format!("https://a:b@one.example.com https://c:d@two.example.com"),
+                format!("https://{REDACTED}@one.example.com https://{REDACTED}@two.example.com"),
+            ),
+            (
+                "quoted_equal",
+                format!("api_key=\"{S}\""),
+                format!("api_key=\"{REDACTED}\""),
+            ),
+            (
+                "quoted_json_key",
+                format!("{{\"api_key\": \"{S}\"}}"),
+                format!("{{\"api_key\": \"{REDACTED}\"}}"),
+            ),
+            (
+                "bearer_header",
+                format!("Authorization: Bearer {S}"),
+                format!("Authorization: {REDACTED} {REDACTED}"),
+            ),
+            (
+                "single_quoted",
+                format!("token='{S}'"),
+                format!("token='{REDACTED}'"),
+            ),
+            (
+                "parameter_control",
+                "token: value".to_string(),
+                format!("token: {REDACTED}"),
+            ),
+            (
+                "normal_url_control",
+                "GET https://api.example.com/v1/limits".to_string(),
+                "GET https://api.example.com/v1/limits".to_string(),
+            ),
+        ] {
+            let out = redact_secrets(&input);
+            assert_eq!(out, expected, "{shape}");
+            assert!(!out.contains(S), "{shape} kept the sentinel: {out}");
+        }
+    }
+
+    #[test]
+    fn a_string_code_is_not_quoted_but_an_integer_one_is() {
+        // Codex g1h G2: JSON-RPC's code is an integer, and a string code is
+        // upstream's free text like the message.
+        let sentinel = "sentinel-9f2c";
+        let projected = safe_rpc_error(&json!({"code": sentinel, "message": "denied"}));
+        assert_eq!(projected, "denied");
+        assert!(!projected.contains(sentinel));
+        assert_eq!(
+            safe_rpc_error(&json!({"code": -32000, "message": "denied"})),
+            "code -32000: denied"
+        );
+        // An object code is as untrusted as a string one.
+        let projected = safe_rpc_error(&json!({"code": {"secret": sentinel}, "message": "denied"}));
+        assert_eq!(projected, "denied");
     }
 
     #[test]
@@ -1153,7 +1320,7 @@ done
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   [ -n "$id" ] || continue
-  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"denied","data":{{"access_token":"{SENTINEL}"}}}}}}\n' "$id"
+  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":"{SENTINEL}","message":"denied for api_key=\\"{SENTINEL}\" and Authorization: Bearer {SENTINEL} via https://user:pw@proxy.example.com","data":{{"access_token":"{SENTINEL}"}}}}}}\n' "$id"
 done"#
         )
         .unwrap();
