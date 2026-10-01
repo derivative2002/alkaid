@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -141,8 +142,7 @@ fn parse_reset(value: &Value) -> Option<ResetAt> {
 /// the refresh path supplies pane session ids so an older pane is not lost
 /// behind the bounded `thread/list` page.
 pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
-    let executable = std::env::var_os("CODEX_BIN_PATH").unwrap_or_else(|| "codex".into());
-    let mut command = Command::new(executable);
+    let mut command = Command::new(codex_executable()?);
     command
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
@@ -175,6 +175,82 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
         session_ids,
     )
 }
+
+/// The names a Windows PATH is searched for, in the order they win.
+///
+/// npm installs Codex as a `codex.cmd` shim next to a shell script, and
+/// `CreateProcess` resolves neither for the bare name, so a Windows seat
+/// showed a model but no quota (measured 1001).
+const WINDOWS_CODEX_NAMES: [&str; 2] = ["codex.exe", "codex.cmd"];
+
+/// The executable to start.
+fn codex_executable() -> Result<PathBuf> {
+    let configured = std::env::var_os("CODEX_BIN_PATH");
+    let search = std::env::var_os("PATH");
+    resolve_codex(
+        configured.as_deref(),
+        search.as_deref(),
+        cfg!(windows),
+        |path| path.is_file(),
+    )
+}
+
+/// `CODEX_BIN_PATH` wins when it is set, as it always has. On Windows the
+/// bare name is not enough, so the PATH is searched and the first of
+/// [`WINDOWS_CODEX_NAMES`] found is used by its absolute path — a `.cmd` is
+/// handed to Rust's own batch-file handling, and the arguments passed to it
+/// are ours, carrying no user input. Elsewhere the bare name is kept: it is
+/// what a shell has always resolved.
+///
+/// Pure in its inputs so the search can be tested on any platform: `search`
+/// is a PATH value, `exists` answers whether a candidate is a file.
+fn resolve_codex(
+    configured: Option<&OsStr>,
+    search: Option<&OsStr>,
+    windows: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<PathBuf> {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(configured));
+    }
+    if !windows {
+        return Ok(PathBuf::from(UNIX_CODEX_NAME));
+    }
+    let directories: Vec<PathBuf> = search
+        .map(|search| {
+            search
+                .to_string_lossy()
+                .split(';')
+                .map(str::trim)
+                .filter(|directory| !directory.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    for name in WINDOWS_CODEX_NAMES {
+        for directory in &directories {
+            let candidate = directory.join(name);
+            if exists(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    // The names and the directories are the whole diagnosis of a Windows
+    // seat with no quota, so they are what the caller gets (and what the
+    // recorded provider error says).
+    anyhow::bail!(
+        "no codex executable: looked for {} in {}",
+        WINDOWS_CODEX_NAMES.join(", "),
+        directories
+            .iter()
+            .map(|directory| directory.display().to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+/// What a Unix-like system runs: the name the shell resolves.
+const UNIX_CODEX_NAME: &str = "codex";
 
 /// Ask the app-server, ending its tree if the request runs past `timeout`.
 ///
@@ -712,12 +788,6 @@ fn read_rpc(output: &mut BufReader<impl std::io::Read>, expected_id: u64) -> Res
     }
 }
 
-/// What is safe to quote from an app-server error.
-///
-/// `error` is upstream's object. `data` may carry anything the service chose
-/// — including a credential — and `message` is free text, so only a named
-/// code and a message stripped of credential-shaped runs is kept, and this
-/// string is what reaches the recorded diagnostic file (Codex g1c G2).
 /// What is safe to quote from an app-server error: the stage, and the
 /// integer code JSON-RPC defines.
 ///
@@ -958,6 +1028,77 @@ done
         );
     }
 
+    /// The PATH search on Windows, offline: each case is a set of names the
+    /// fake filesystem holds (todo 5's fix b).
+    fn resolve_with(names: &[&str], path: &str) -> Result<PathBuf> {
+        // `Path::join` uses the host's separator, so both the fake
+        // filesystem and the assertions compare Windows-shaped paths.
+        resolve_codex(None, Some(OsStr::new(path)), true, |candidate| {
+            names.contains(&windows_shaped(candidate).as_str())
+        })
+    }
+
+    fn windows_shaped(path: &Path) -> String {
+        path.to_string_lossy().replace('/', "\\")
+    }
+
+    #[test]
+    fn the_windows_search_prefers_the_executable_and_accepts_the_shim() {
+        let path = "C:\\npm;C:\\bin";
+        for (held, expected) in [
+            (vec!["C:\\npm\\codex.exe"], "C:\\npm\\codex.exe"),
+            (vec!["C:\\npm\\codex.cmd"], "C:\\npm\\codex.cmd"),
+            // Both present: the executable wins, wherever it is.
+            (
+                vec!["C:\\npm\\codex.exe", "C:\\bin\\codex.cmd"],
+                "C:\\npm\\codex.exe",
+            ),
+            (
+                vec!["C:\\bin\\codex.exe", "C:\\npm\\codex.cmd"],
+                "C:\\bin\\codex.exe",
+            ),
+        ] {
+            assert_eq!(
+                windows_shaped(&resolve_with(&held, path).unwrap()),
+                expected,
+                "{held:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_windows_search_says_what_it_looked_for_and_where() {
+        let error = resolve_with(&[], "C:\\npm;C:\\bin").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("codex.exe, codex.cmd"), "{message}");
+        assert!(message.contains("C:\\npm; C:\\bin"), "{message}");
+    }
+
+    #[test]
+    fn an_explicit_binary_wins_and_other_systems_keep_the_bare_name() {
+        // `CODEX_BIN_PATH` has always won, and a Unix-like system runs the
+        // name its shell resolves.
+        assert_eq!(
+            resolve_codex(
+                Some(OsStr::new("/opt/codex")),
+                None,
+                true,
+                |_| unreachable!("an explicit path is not searched for")
+            )
+            .unwrap(),
+            PathBuf::from("/opt/codex")
+        );
+        assert_eq!(
+            resolve_codex(None, None, false, |_| unreachable!()).unwrap(),
+            PathBuf::from("codex")
+        );
+        // An empty value is the same as none: it names nothing.
+        assert_eq!(
+            resolve_codex(Some(OsStr::new("")), None, false, |_| unreachable!()).unwrap(),
+            PathBuf::from("codex")
+        );
+    }
+
     /// Every hostile shape the three review rounds produced, in one error
     /// frame, driven through the real RPC path.
     const HOSTILE_MESSAGE: &str = "denied: GET https://api.example.com/v1 via https://user:pw@proxy.example.com, api_key=%s, Authorization: bearer %s, password=prefix %s end";
@@ -969,7 +1110,7 @@ done
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   [ -n "$id" ] || continue
-  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"{HOSTILE_MESSAGE}","data":{{"access_token":"%s","nested":{{"refresh_token":"%s"}}}}}}}}\n' "$id" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}"
+  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"{HOSTILE_MESSAGE}","data":{{"access_token":"%s","nested":{{"refresh_token":"%s"}}}}}}}}\n' "$id" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}"
 done
 "#
         )
@@ -980,6 +1121,8 @@ done
         // Codex g1i: upstream's message is not quoted at all. Three rounds
         // found three more credential shapes each time, so the persistent
         // diagnostic is the stage plus the integer code, and nothing else.
+        // The frame carries a sentinel in the message's own fields and in
+        // both of the payload's values.
         let (mut input, mut output, child, tree) = contained_server(&hostile_error_server());
         let error = request_quota(
             &mut input,
@@ -1064,10 +1207,9 @@ done
     }
 
     #[test]
-    fn redaction_keeps_what_can_be_read_and_hides_what_cannot() {
-        // Kept as the positive control for the shapes that are ordinary
-        // text: nothing here is quoted from upstream any more, so a message
-        // that is only words changes nothing.
+    fn an_ordinary_message_changes_nothing_about_the_projection() {
+        // The positive control: a message that is only words is not quoted
+        // either — the projection no longer looks at it at all.
         assert_eq!(
             safe_rpc_error(&json!({"code": -32000, "message": "no credentials in this sentence"})),
             "code -32000"
@@ -1085,9 +1227,9 @@ done
     }
 
     /// The recorded diagnostic file is written from whatever the fetch
-    /// returned, so the redaction above has to be where the text is made:
-    /// this drives the real refresh path with a real app-server stub and
-    /// reads the file back.
+    /// returned, so the projection above has to be what the text is made
+    /// from: this drives the real refresh path with a real app-server stub
+    /// and reads the file back.
     #[cfg(unix)]
     #[test]
     fn the_recorded_diagnostic_never_holds_a_credential_from_an_rpc_error() {
