@@ -249,7 +249,21 @@ fn resolve_codex(
             // Windows keeps one per drive; with none to read, the entry is
             // dropped rather than guessed at (Codex g1l).
             Entry::DriveRelative(drive, rest) => {
-                if let Some(current) = drive_cwd(drive) {
+                // The current drive's own current directory is this pass's
+                // base when the two are the same drive: the environment's
+                // `=X:` entry can be stale, and the base is what the process
+                // is actually running from (Codex g1n).
+                let current = if base.and_then(drive_of) == Some(drive) {
+                    base.filter(|base| windows_absolute(base))
+                        .map(str::to_string)
+                } else {
+                    // Another drive's saved context, kept per drive by
+                    // Windows — and only when it really is an absolute
+                    // directory of the drive that was asked for.
+                    drive_cwd(drive)
+                        .filter(|saved| drive_of(saved) == Some(drive) && windows_absolute(saved))
+                };
+                if let Some(current) = current {
                     directories.push(if rest.is_empty() {
                         current
                     } else {
@@ -1182,23 +1196,35 @@ done
         )
     }
 
-    /// The same, with a drive's own current directory supplied — what a
-    /// `C:bin` entry needs.
+    /// The same, with a base and a drive's own current directory supplied —
+    /// what a `C:bin` entry needs.
+    fn resolve_at(
+        held: &[&str],
+        path: &str,
+        base: Option<&str>,
+        saved: Option<(char, &str)>,
+    ) -> Result<PathBuf> {
+        let drive_cwd = |wanted: char| match saved {
+            Some((drive, directory)) if drive == wanted => Some(directory.to_string()),
+            _ => None,
+        };
+        resolve_codex(
+            None,
+            Some(OsStr::new(path)),
+            true,
+            base,
+            &drive_cwd,
+            |candidate| held.contains(&windows_shaped(candidate).as_str()),
+        )
+    }
+
     fn resolve_with_drive_cwd(
         held: &[&str],
         path: &str,
         drive: char,
         cwd: &str,
     ) -> Result<PathBuf> {
-        let drive_cwd = |wanted: char| (wanted == drive).then(|| cwd.to_string());
-        resolve_codex(
-            None,
-            Some(OsStr::new(path)),
-            true,
-            Some("C:\\work"),
-            &drive_cwd,
-            |candidate| held.contains(&windows_shaped(candidate).as_str()),
-        )
+        resolve_at(held, path, Some("C:\\work"), Some((drive, cwd)))
     }
 
     fn windows_shaped(path: &Path) -> String {
@@ -1304,13 +1330,77 @@ done
             error.to_string().contains("no absolute directory on PATH"),
             "{error}"
         );
-        // Another drive's current directory is not the one the entry needs.
-        let error = resolve_with_drive_cwd(&["C:\\work\\bin\\codex.exe"], "C:bin", 'D', "D:\\work")
-            .unwrap_err();
+    }
+
+    #[test]
+    fn the_current_drive_uses_this_pass_base_not_a_stale_environment_entry() {
+        // Codex g1n: the current drive's current directory is where the
+        // process is running from, so the live base wins over a saved `=C:`
+        // — and over the other drive's context entirely.
+        let held = ["C:\\live\\bin\\codex.exe", "C:\\old\\bin\\codex.exe"];
+        for saved in [Some(('C', "C:\\old")), Some(('D', "D:\\work")), None] {
+            assert_eq!(
+                windows_shaped(&resolve_at(&held, "C:bin", Some("C:\\live"), saved).unwrap()),
+                "C:\\live\\bin\\codex.exe",
+                "{saved:?}"
+            );
+        }
+        // A base that is not the entry's drive is not used for it.
+        let error = resolve_at(
+            &["C:\\live\\bin\\codex.exe"],
+            "D:bin",
+            Some("C:\\live"),
+            None,
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("no absolute directory on PATH"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_saved_drive_directory_must_be_that_drives_absolute_path() {
+        // Codex g1n: what the `=X:` entry holds goes into the search only
+        // when it really is an absolute directory of the drive asked for.
+        let held = [
+            "relative-base\\bin\\codex.exe",
+            "C:\\other\\bin\\codex.exe",
+            "D:relative\\bin\\codex.exe",
+            "\\\\server\\share\\bin\\codex.exe",
+        ];
+        for saved in [
+            "relative-base",
+            "C:\\other",
+            "D:relative",
+            "\\\\server\\share",
+        ] {
+            let error =
+                resolve_at(&held, "D:bin", Some("C:\\work"), Some(('D', saved))).unwrap_err();
+            assert!(
+                error.to_string().contains("no absolute directory on PATH"),
+                "{saved}: {error}"
+            );
+        }
+        // The right shape still works, for both names.
+        for (name, expected) in [
+            ("codex.exe", "D:\\work\\bin\\codex.exe"),
+            ("codex.cmd", "D:\\work\\bin\\codex.cmd"),
+        ] {
+            assert_eq!(
+                windows_shaped(
+                    &resolve_at(
+                        &[expected],
+                        "D:bin",
+                        Some("C:\\work"),
+                        Some(('D', "D:\\work"))
+                    )
+                    .unwrap()
+                ),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]
