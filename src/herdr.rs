@@ -1392,6 +1392,7 @@ fn publish_pane_tokens_inner(
     let seat_models = crate::seat_model::resolve(
         panes,
         channels.as_ref(),
+        crate::seat_model::platform_paths().as_ref(),
         crate::cache::CacheStore::from_env()
             .ok()
             .map(|cache| cache.root().to_path_buf())

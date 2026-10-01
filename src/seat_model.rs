@@ -27,7 +27,7 @@
 //! it does, the pane may keep showing the model it had. There is no timer:
 //! the check waits for the next publish.
 
-use crate::channel::ProcessChannel;
+use crate::channel::{ProcessChannel, SeatPaths};
 use crate::herdr::AgentPane;
 use crate::model::Harness;
 use serde::{Deserialize, Serialize};
@@ -63,19 +63,34 @@ pub enum SeatModel {
 
 /// Pane id → model for every agent pane in `panes`. A pane without an entry
 /// keeps what it shows.
+///
+/// `fallback` stands in for a process scan on a system without `/proc`
+/// (Windows, macOS): every seat is taken to keep its files in this
+/// process's own home ([`platform_paths`]). On Linux it is `None`, and a scan
+/// that found nothing still means "no answer this pass".
 pub fn resolve(
     panes: &[AgentPane],
     scan: Option<&BTreeMap<String, ProcessChannel>>,
+    fallback: Option<&SeatPaths>,
     cache_root: Option<&Path>,
 ) -> BTreeMap<String, SeatModel> {
     let mut resolved = BTreeMap::new();
-    // No socket, no /proc, or nothing readable: this pass learned nothing.
-    let Some(scan) = scan.filter(|scan| !scan.is_empty()) else {
+    let scan = scan.filter(|scan| !scan.is_empty());
+    let shared = fallback.map(|paths| ProcessChannel {
+        paths: paths.clone(),
+        ..ProcessChannel::default()
+    });
+    // No socket, no /proc, or nothing readable, and no home to fall back on:
+    // this pass learned nothing.
+    if scan.is_none() && shared.is_none() {
         return resolved;
-    };
+    }
     let mut cache = cache_root.map(Cache::load).unwrap_or_default();
     for pane in panes {
-        let process = scan.get(&pane.pane_id);
+        let process = match scan {
+            Some(scan) => scan.get(&pane.pane_id),
+            None => shared.as_ref(),
+        };
         if let Some(model) = resolve_pane(pane, process, &mut cache) {
             resolved.insert(pane.pane_id.clone(), model);
         }
@@ -157,6 +172,29 @@ fn resolve_pane(
         Ok(None) => Some(SeatModel::Unknown),
         Err(()) => None,
     }
+}
+
+/// Where seats keep their files when no process can be read: this plugin
+/// process's own `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and home directory. Herdr
+/// runs hooks in its server's environment, which on a single-user machine is
+/// the same account the agents run as. Linux reads each seat's own process
+/// instead, so it gets `None`.
+pub fn platform_paths() -> Option<SeatPaths> {
+    if cfg!(target_os = "linux") {
+        return None;
+    }
+    let var = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    let home = var("HOME").or_else(|| var("USERPROFILE"))?;
+    Some(SeatPaths {
+        home: Some(home),
+        claude_config_dir: var("CLAUDE_CONFIG_DIR"),
+        codex_home: var("CODEX_HOME"),
+        resume_session: None,
+    })
 }
 
 /// Where a seat's session file is, as far as this pass can tell.
@@ -611,7 +649,7 @@ mod tests {
             ),
         ]);
         let known = |model: &str| SeatModel::Known(model.to_string());
-        let resolved = resolve(&panes, Some(&scan), Some(&state));
+        let resolved = resolve(&panes, Some(&scan), None, Some(&state));
         assert_eq!(resolved["w1:p1"], known("claude-sonnet-5-5"));
         assert_eq!(resolved["w1:p2"], known("gpt-6.1-sol"));
         assert_eq!(resolved["w1:p3"], known("grok-4.7"));
@@ -622,12 +660,12 @@ mod tests {
         let cache = Cache::load(&state);
         assert_eq!(cache.sessions.len(), 2);
         assert_eq!(cache.files.len(), 2);
-        assert_eq!(resolve(&panes, Some(&scan), Some(&state)), resolved);
+        assert_eq!(resolve(&panes, Some(&scan), None, Some(&state)), resolved);
 
         // A scan that found no process at all learned nothing: every pane
         // keeps what it shows.
-        assert!(resolve(&panes, Some(&BTreeMap::new()), Some(&state)).is_empty());
-        assert!(resolve(&panes, None, Some(&state)).is_empty());
+        assert!(resolve(&panes, Some(&BTreeMap::new()), None, Some(&state)).is_empty());
+        assert!(resolve(&panes, None, None, Some(&state)).is_empty());
     }
 
     fn claude_scene(root: &Path) -> (Vec<AgentPane>, BTreeMap<String, ProcessChannel>) {
@@ -670,7 +708,9 @@ mod tests {
         let (panes, scan) = claude_scene(root.path());
         let known = |model: &str| Some(SeatModel::Known(model.to_string()));
         assert_eq!(
-            resolve(&panes, Some(&scan), None).get("w1:p1").cloned(),
+            resolve(&panes, Some(&scan), None, None)
+                .get("w1:p1")
+                .cloned(),
             known("deepseek-v4.1-flash")
         );
         // A single reply longer than a whole chunk is still read.
@@ -679,7 +719,9 @@ mod tests {
         );
         fs::write(project.join("s.jsonl"), format!("{old}{huge}")).unwrap();
         assert_eq!(
-            resolve(&panes, Some(&scan), None).get("w1:p1").cloned(),
+            resolve(&panes, Some(&scan), None, None)
+                .get("w1:p1")
+                .cloned(),
             known("claude-opus-5-5")
         );
         // Control: a reply wholly beyond the budget is out of reach.
@@ -691,7 +733,9 @@ mod tests {
         );
         fs::write(project.join("s.jsonl"), past).unwrap();
         assert_eq!(
-            resolve(&panes, Some(&scan), None).get("w1:p1").cloned(),
+            resolve(&panes, Some(&scan), None, None)
+                .get("w1:p1")
+                .cloned(),
             Some(SeatModel::Unknown)
         );
     }
@@ -715,7 +759,7 @@ mod tests {
         let (panes, scan) = claude_scene(root.path());
         let known = Some(SeatModel::Known("claude-opus-5".to_string()));
         let at = |state: &Path| {
-            resolve(&panes, Some(&scan), Some(state))
+            resolve(&panes, Some(&scan), None, Some(state))
                 .get("w1:p1")
                 .cloned()
         };
@@ -751,7 +795,7 @@ mod tests {
         };
         let (panes, scan) = claude_scene(root.path());
         let at = || {
-            resolve(&panes, Some(&scan), Some(state.path()))
+            resolve(&panes, Some(&scan), None, Some(state.path()))
                 .get("w1:p1")
                 .cloned()
         };
@@ -773,6 +817,47 @@ mod tests {
         // Control: once the duplicate is gone the seat resolves again.
         fs::remove_file(root.path().join("projects/b/s.jsonl")).unwrap();
         assert_eq!(at(), Some(SeatModel::Known("claude-opus-5".to_string())));
+    }
+
+    #[test]
+    fn without_a_process_scan_seats_are_read_from_the_fallback_home() {
+        // Windows / macOS: no /proc, so the plugin's own home stands in.
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".claude/projects/H--diche-proj-CM");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("s-win.jsonl"),
+            assistant("deepseek-v4.1-flash-dspark-greedy-1m-b200"),
+        )
+        .unwrap();
+        let day = home.path().join(".codex/sessions/2026/10/01");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-2026-10-01T08-00-00-01a0dd00-1111.jsonl"),
+            r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#,
+        )
+        .unwrap();
+        let fallback = SeatPaths {
+            home: Some(home.path().display().to_string()),
+            ..SeatPaths::default()
+        };
+        let panes = [
+            pane("w9:p30", Harness::Claude, Some("s-win")),
+            pane("w9:p41", Harness::Codex, Some("01a0dd00-1111")),
+            pane("w9:p42", Harness::Claude, Some("s-gone")),
+        ];
+        let resolved = resolve(&panes, Some(&BTreeMap::new()), Some(&fallback), None);
+        assert_eq!(
+            resolved["w9:p30"],
+            SeatModel::Known("deepseek-v4.1-flash-dspark-greedy-1m-b200".to_string())
+        );
+        assert_eq!(
+            resolved["w9:p41"],
+            SeatModel::Known("gpt-6.1-sol".to_string())
+        );
+        assert_eq!(resolved["w9:p42"], SeatModel::Unknown);
+        // Linux passes no fallback: an empty scan still answers nothing.
+        assert!(resolve(&panes, Some(&BTreeMap::new()), None, None).is_empty());
     }
 
     #[test]
