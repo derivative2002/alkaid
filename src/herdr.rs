@@ -840,22 +840,10 @@ pub fn clear_quota_agent_view() -> Result<()> {
 /// Outside Herdr there is no socket and this is a no-op, exactly like
 /// [`crate::prefs::write`], so a direct CLI run still works.
 fn socket_request(payload: &Value) -> Result<Option<Value>> {
-    use std::io::{BufRead, BufReader, Write};
-
     let Some(path) = std::env::var_os("HERDR_SOCKET_PATH") else {
         return Ok(None);
     };
-    let stream = std::os::unix::net::UnixStream::connect(&path)
-        .with_context(|| format!("connect to Herdr at {}", path.to_string_lossy()))?;
-    stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
-    stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
-    let mut writer = &stream;
-    writeln!(writer, "{payload}").context("send Herdr socket request")?;
-    writer.flush().context("flush Herdr socket request")?;
-    let mut line = String::new();
-    BufReader::new(&stream)
-        .read_line(&mut line)
-        .context("read Herdr socket reply")?;
+    let line = socket_exchange(&path, &format!("{payload}\n"))?;
     let reply: Value = serde_json::from_str(&line).context("parse Herdr socket reply")?;
     if let Some(error) = reply.get("error") {
         let message = error
@@ -865,6 +853,74 @@ fn socket_request(payload: &Value) -> Result<Option<Value>> {
         anyhow::bail!("{message}");
     }
     Ok(Some(reply))
+}
+
+/// Send one request line and read one reply line over Herdr's Unix socket.
+#[cfg(unix)]
+fn socket_exchange(path: &std::ffi::OsStr, request: &str) -> Result<String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let stream = std::os::unix::net::UnixStream::connect(path)
+        .with_context(|| format!("connect to Herdr at {}", path.to_string_lossy()))?;
+    stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+    stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+    let mut writer = &stream;
+    writer
+        .write_all(request.as_bytes())
+        .context("send Herdr socket request")?;
+    writer.flush().context("flush Herdr socket request")?;
+    let mut line = String::new();
+    BufReader::new(&stream)
+        .read_line(&mut line)
+        .context("read Herdr socket reply")?;
+    Ok(line)
+}
+
+/// On Windows Herdr listens on a named pipe: `HERDR_SOCKET_PATH` holds the
+/// path form, and the pipe is `\\.\pipe\<that path>` (measured 1001 on
+/// herdr 0.9.1). A pipe opened as a file has no I/O timeout, so the exchange
+/// runs on a helper thread bounded by [`SOCKET_TIMEOUT`]; a stuck pipe leaves
+/// that thread behind for the life of this short-lived process.
+#[cfg(windows)]
+fn socket_exchange(path: &std::ffi::OsStr, request: &str) -> Result<String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let name = pipe_name(&path.to_string_lossy());
+    let request = request.to_string();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let pipe = name.clone();
+    std::thread::spawn(move || {
+        let exchange = || -> Result<String> {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&pipe)
+                .with_context(|| format!("connect to Herdr at {pipe}"))?;
+            file.write_all(request.as_bytes())
+                .context("send Herdr socket request")?;
+            file.flush().context("flush Herdr socket request")?;
+            let mut line = String::new();
+            BufReader::new(file)
+                .read_line(&mut line)
+                .context("read Herdr socket reply")?;
+            Ok(line)
+        };
+        let _ = sender.send(exchange());
+    });
+    receiver
+        .recv_timeout(SOCKET_TIMEOUT)
+        .map_err(|_| anyhow::anyhow!("Herdr at {name} did not reply in time"))?
+}
+
+/// `\\.\pipe\<path>` for a socket path; a value that already names a pipe
+/// is used as it is.
+#[cfg(any(windows, test))]
+fn pipe_name(path: &str) -> String {
+    if path.starts_with(r"\\.\pipe\") {
+        path.to_string()
+    } else {
+        format!(r"\\.\pipe\{path}")
+    }
 }
 
 pub fn list_agent_panes() -> Result<Vec<AgentPane>> {
@@ -3921,6 +3977,15 @@ mod tests {
             }
             assert_eq!(grouped.get(name), flat.get(name), "{name} moved");
         }
+    }
+
+    #[test]
+    fn a_windows_socket_path_maps_to_herdrs_named_pipe() {
+        assert_eq!(
+            pipe_name(r"C:\Users\a\AppData\Roaming\herdr\herdr.sock"),
+            r"\\.\pipe\C:\Users\a\AppData\Roaming\herdr\herdr.sock"
+        );
+        assert_eq!(pipe_name(r"\\.\pipe\x"), r"\\.\pipe\x");
     }
 
     fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

@@ -696,6 +696,8 @@ mod tests {
         );
     }
 
+    // The access error is staged with a symlink loop, which needs Unix.
+    #[cfg(unix)]
     #[test]
     fn a_lookup_that_cannot_look_keeps_the_shown_model_instead_of_unknown() {
         // Codex g1 R2: an unreadable project directory is no answer, not a

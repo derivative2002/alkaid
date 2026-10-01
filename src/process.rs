@@ -61,7 +61,8 @@ pub fn run_shell_with_deadline(
         let _ = stdin.write_all(&input);
     });
 
-    let child = Arc::new(Mutex::new(Some(child)));
+    let tree = Tree::contain(&child);
+    let child = Arc::new(Mutex::new(Some((child, tree))));
     let timed_out = Arc::new(AtomicBool::new(false));
     let (cancel, cancelled) = mpsc::channel();
     let watchdog_child = Arc::clone(&child);
@@ -90,20 +91,118 @@ pub fn run_shell_with_deadline(
     })
 }
 
-fn terminate_and_reap(child: &Mutex<Option<Child>>) -> Result<Option<ExitStatus>> {
+fn terminate_and_reap(child: &Mutex<Option<(Child, Tree)>>) -> Result<Option<ExitStatus>> {
     let mut slot = child
         .lock()
         .map_err(|_| anyhow::anyhow!("lock previous statusLine child"))?;
-    let Some(mut child) = slot.take() else {
+    let Some((mut child, tree)) = slot.take() else {
         return Ok(None);
     };
-    #[cfg(unix)]
-    unsafe {
-        // setpgid in the child setup makes this include shell descendants.
-        let _ = libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-    }
-    let _ = child.kill();
+    tree.end(&mut child);
     child.wait().map(Some).context("reap previous statusLine")
+}
+
+/// Everything a child we started went on to start, so it can be ended as
+/// one. On Unix the child was put in its own process group before exec
+/// (`setpgid`). On Windows there are no process groups, and Git's MSYS `sh`
+/// re-parents a background job to an intermediate process, so walking the
+/// parent chain (`taskkill /T`) misses it (measured 1001). A job object does
+/// not: every process the child creates joins it. A process the child starts
+/// before it is assigned would escape; a shell has not started anything yet
+/// in that window.
+pub(crate) struct Tree {
+    #[cfg(windows)]
+    job: Option<windows_job::Job>,
+}
+
+impl Tree {
+    pub(crate) fn contain(child: &Child) -> Self {
+        #[cfg(windows)]
+        {
+            Tree {
+                job: windows_job::Job::containing(child),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            Tree {}
+        }
+    }
+
+    /// End the child and its descendants. The child is still held and not
+    /// yet reaped, so its pid cannot belong to anything else.
+    pub(crate) fn end(&self, child: &mut Child) {
+        #[cfg(unix)]
+        unsafe {
+            let _ = libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+        let _ = child.kill();
+    }
+}
+
+#[cfg(windows)]
+mod windows_job {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// A job that ends its processes when terminated or when the last
+    /// handle to it closes.
+    pub(crate) struct Job(HANDLE);
+
+    // The handle is only used through the kernel calls below, which are safe
+    // from any thread.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        pub(crate) fn containing(child: &Child) -> Option<Self> {
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if handle.is_null() {
+                    return None;
+                }
+                let job = Job(handle);
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let set = SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    &limits as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if set == 0 || AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) == 0
+                {
+                    return None;
+                }
+                Some(job)
+            }
+        }
+
+        pub(crate) fn terminate(&self) {
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

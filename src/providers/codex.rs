@@ -168,7 +168,8 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
     // The watchdog and this thread share the child, so it can only ever be
     // signalled while it is still unreaped. Signalling a bare pid after
     // `wait` would race with the operating system recycling that pid.
-    let child = Arc::new(Mutex::new(Some(child)));
+    let tree = crate::process::Tree::contain(&child);
+    let child = Arc::new(Mutex::new(Some((child, tree))));
     let watchdog = Arc::clone(&child);
     thread::spawn(move || {
         thread::sleep(REQUEST_TIMEOUT);
@@ -184,20 +185,16 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
 ///
 /// Whichever of the request thread and the watchdog gets here first takes the
 /// child; the other one finds an empty slot and does nothing.
-fn terminate(child: &Mutex<Option<Child>>) {
+fn terminate(child: &Mutex<Option<(Child, crate::process::Tree)>>) {
     let Ok(mut slot) = child.lock() else {
         return;
     };
-    let Some(mut child) = slot.take() else {
+    let Some((mut child, tree)) = slot.take() else {
         return;
     };
-    // `pre_exec` put the app-server in its own process group, so this also
-    // collects any helper it spawned.
-    #[cfg(unix)]
-    unsafe {
-        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-    }
-    let _ = child.kill();
+    // `pre_exec` put the app-server in its own process group (a job object
+    // on Windows), so this also collects any helper it spawned.
+    tree.end(&mut child);
     let _ = child.wait();
 }
 
