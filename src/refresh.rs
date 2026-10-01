@@ -1327,7 +1327,7 @@ fn spawn_watch(defer: bool) -> Result<()> {
         });
     }
     #[cfg(windows)]
-    detach_on_windows(&mut command);
+    detach_on_windows(&mut command)?;
     command.spawn().context("start active-turn quota watcher")?;
     Ok(())
 }
@@ -1336,14 +1336,20 @@ fn spawn_watch(defer: bool) -> Result<()> {
 /// stdio is set to. Herdr hands a hook or action its output pipe as this
 /// process's standard handles, so a watcher started from there would hold
 /// that pipe open and Herdr would show the action as running for as long as
-/// the watcher lives (measured 1001: configure stayed "running"). Mark this
-/// process's standard handles non-inheritable before spawning, and give the
-/// watcher no console window and its own process group.
+/// the watcher lives (measured 1001: configure stayed "running"). This marks
+/// this process's standard handles non-inheritable, and gives the watcher no
+/// console window and its own process group.
+///
+/// A handle that cannot be marked fails the spawn rather than being reported
+/// as detached: a watcher that inherited the pipe is the bug this exists to
+/// prevent, and starting one anyway would leave Herdr waiting on an action
+/// that has already finished (Codex g1 S1). One that is absent is not a
+/// failure — a hook may run with no console at all.
 #[cfg(windows)]
-fn detach_on_windows(command: &mut Command) {
+fn detach_on_windows(command: &mut Command) -> Result<()> {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::Foundation::{
-        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        GetLastError, SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::System::Console::{
         GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -1351,14 +1357,42 @@ fn detach_on_windows(command: &mut Command) {
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 
     command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+    let mut failed = Vec::new();
+    for (name, id) in [
+        ("stdin", STD_INPUT_HANDLE),
+        ("stdout", STD_OUTPUT_HANDLE),
+        ("stderr", STD_ERROR_HANDLE),
+    ] {
         unsafe {
             let handle = GetStdHandle(id);
-            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
-                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) == 0 {
+                failed.push(format!("{name} (win32 error {})", GetLastError()));
             }
         }
     }
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "could not mark this process's standard handles non-inheritable: {}",
+            failed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The success path, on a real process: the handles this test binary
+/// holds can be marked, so a watcher started from here is detached. The
+/// failing branch cannot be injected — `SetHandleInformation` does not
+/// fail on request — so it is covered by reading the code that reports
+/// it. Marking the test process's own handles is harmless: every child
+/// this binary starts sets its stdio explicitly.
+#[cfg(windows)]
+#[test]
+fn the_standard_handles_of_this_process_can_be_marked_non_inheritable() {
+    let mut command = Command::new("cmd");
+    detach_on_windows(&mut command).unwrap();
 }
 
 // Event payloads are nested and their shape differs per event, so look the
