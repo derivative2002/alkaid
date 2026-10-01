@@ -1340,11 +1340,11 @@ fn spawn_watch(defer: bool) -> Result<()> {
 /// this process's standard handles non-inheritable, and gives the watcher no
 /// console window and its own process group.
 ///
-/// A handle that cannot be marked fails the spawn rather than being reported
-/// as detached: a watcher that inherited the pipe is the bug this exists to
-/// prevent, and starting one anyway would leave Herdr waiting on an action
-/// that has already finished (Codex g1 S1). One that is absent is not a
-/// failure — a hook may run with no console at all.
+/// A handle that cannot be read or marked fails the spawn rather than being
+/// reported as detached: a watcher that inherited the pipe is the bug this
+/// exists to prevent, and starting one anyway would leave Herdr waiting on
+/// an action that has already finished (Codex g1 S1). A handle that is
+/// simply absent is not a failure — a hook may run with no console at all.
 #[cfg(windows)]
 fn detach_on_windows(command: &mut Command) -> Result<()> {
     use std::os::windows::process::CommandExt;
@@ -1357,20 +1357,41 @@ fn detach_on_windows(command: &mut Command) -> Result<()> {
     use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 
     command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    let mut failed = Vec::new();
-    for (name, id) in [
+    let queried: Vec<(&'static str, _, StandardHandle)> = [
         ("stdin", STD_INPUT_HANDLE),
         ("stdout", STD_OUTPUT_HANDLE),
         ("stderr", STD_ERROR_HANDLE),
-    ] {
-        unsafe {
-            let handle = GetStdHandle(id);
-            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-                continue;
-            }
-            if SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) == 0 {
-                failed.push(format!("{name} (win32 error {})", GetLastError()));
-            }
+    ]
+    .into_iter()
+    .map(|(name, id)| {
+        let handle = unsafe { GetStdHandle(id) };
+        let answer = if handle.is_null() {
+            StandardHandle::Absent
+        } else if handle == INVALID_HANDLE_VALUE {
+            StandardHandle::Failed(unsafe { GetLastError() } as i32)
+        } else {
+            StandardHandle::Present
+        };
+        (name, handle, answer)
+    })
+    .collect();
+    let answers: Vec<(&'static str, StandardHandle)> = queried
+        .iter()
+        .map(|(name, _, answer)| (*name, *answer))
+        .collect();
+    let to_mark = handles_to_mark(&answers)?;
+
+    let mut failed = Vec::new();
+    // The handles are this process's own, borrowed from it rather than
+    // opened here: they are marked and left alone.
+    for (name, handle, answer) in queried {
+        if answer != StandardHandle::Present || !to_mark.contains(&name) {
+            continue;
+        }
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            failed.push(format!("{name} (win32 error {})", unsafe {
+                GetLastError()
+            }));
         }
     }
     if !failed.is_empty() {
@@ -1382,17 +1403,89 @@ fn detach_on_windows(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
-/// The success path, on a real process: the handles this test binary
-/// holds can be marked, so a watcher started from here is detached. The
-/// failing branch cannot be injected — `SetHandleInformation` does not
-/// fail on request — so it is covered by reading the code that reports
-/// it. Marking the test process's own handles is harmless: every child
-/// this binary starts sets its stdio explicitly.
-#[cfg(windows)]
-#[test]
-fn the_standard_handles_of_this_process_can_be_marked_non_inheritable() {
-    let mut command = Command::new("cmd");
-    detach_on_windows(&mut command).unwrap();
+/// What `GetStdHandle` answered for one standard handle.
+///
+/// The two kinds of "nothing" differ: `NULL` means the process has no such
+/// handle, which a hook with no console legitimately has, while
+/// `INVALID_HANDLE_VALUE` means the call itself failed (Codex g1o).
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandardHandle {
+    /// The process has one: it must be marked.
+    Present,
+    /// No such handle: normal, and nothing to mark.
+    Absent,
+    /// The call failed, with its win32 error.
+    Failed(i32),
+}
+
+/// Which of the three standard handles a watcher spawn needs marked.
+///
+/// Pure, so both answers can be exercised where Windows is not: a failure
+/// refuses the spawn exactly as a failed `SetHandleInformation` does, while
+/// an absent handle is passed over (Codex g1o S1).
+#[cfg(any(windows, test))]
+fn handles_to_mark(answers: &[(&'static str, StandardHandle)]) -> Result<Vec<&'static str>> {
+    let failed: Vec<String> = answers
+        .iter()
+        .filter_map(|(name, answer)| match answer {
+            StandardHandle::Failed(code) => Some(format!("{name} (win32 error {code})")),
+            _ => None,
+        })
+        .collect();
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "could not read this process's standard handles: {}",
+            failed.join(", ")
+        );
+    }
+    Ok(answers
+        .iter()
+        .filter(|(_, answer)| *answer == StandardHandle::Present)
+        .map(|(name, _)| *name)
+        .collect())
+}
+
+/// What `GetStdHandle` answers decides whether a watcher may be started:
+/// a handle that cannot be read is a failure, one that is simply absent is
+/// not (Codex g1o S1). Pure, so both answers are exercised here rather than
+/// on Windows.
+#[cfg(test)]
+mod standard_handle_tests {
+    use super::{handles_to_mark, StandardHandle};
+
+    #[test]
+    fn a_handle_that_cannot_be_read_refuses_the_spawn() {
+        let error = handles_to_mark(&[
+            ("stdin", StandardHandle::Present),
+            ("stdout", StandardHandle::Failed(6)),
+            ("stderr", StandardHandle::Absent),
+        ])
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("stdout (win32 error 6)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_absent_handle_is_not_a_failure_and_is_not_marked() {
+        let marked = handles_to_mark(&[
+            ("stdin", StandardHandle::Absent),
+            ("stdout", StandardHandle::Present),
+            ("stderr", StandardHandle::Present),
+        ])
+        .unwrap();
+        assert_eq!(marked, vec!["stdout", "stderr"]);
+        // Nothing present at all is nothing to mark, not an error.
+        assert!(handles_to_mark(&[
+            ("stdin", StandardHandle::Absent),
+            ("stdout", StandardHandle::Absent),
+            ("stderr", StandardHandle::Absent),
+        ])
+        .unwrap()
+        .is_empty());
+    }
 }
 
 // Event payloads are nested and their shape differs per event, so look the
@@ -1456,6 +1549,19 @@ fn tokens_for_loaded_snapshot(
 
 #[cfg(test)]
 mod tests {
+    /// The success path, on a real process: the handles this test binary
+    /// holds can be marked, so a watcher started from here is detached. The
+    /// failing branches cannot be made to happen on demand — a real
+    /// `GetStdHandle` does not fail and `SetHandleInformation` does not fail
+    /// on request — and are covered by `standard_handle_tests` and by the
+    /// code that reports them.
+    #[cfg(windows)]
+    #[test]
+    fn the_standard_handles_of_this_process_can_be_marked_non_inheritable() {
+        let mut command = Command::new("cmd");
+        detach_on_windows(&mut command).unwrap();
+    }
+
     use super::*;
     use crate::cli::{PercentStyle, SidebarLayout};
     use crate::model::{ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
