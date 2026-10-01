@@ -187,10 +187,16 @@ const WINDOWS_CODEX_NAMES: [&str; 2] = ["codex.exe", "codex.cmd"];
 fn codex_executable() -> Result<PathBuf> {
     let configured = std::env::var_os("CODEX_BIN_PATH");
     let search = std::env::var_os("PATH");
+    // A relative PATH entry is resolved against the current directory, which
+    // is what Windows does with one.
+    let base = std::env::current_dir()
+        .ok()
+        .and_then(|base| base.to_str().map(str::to_string));
     resolve_codex(
         configured.as_deref(),
         search.as_deref(),
         cfg!(windows),
+        base.as_deref(),
         |path| path.is_file(),
     )
 }
@@ -208,6 +214,7 @@ fn resolve_codex(
     configured: Option<&OsStr>,
     search: Option<&OsStr>,
     windows: bool,
+    base: Option<&str>,
     exists: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf> {
     if let Some(configured) = configured.filter(|value| !value.is_empty()) {
@@ -216,20 +223,35 @@ fn resolve_codex(
     if !windows {
         return Ok(PathBuf::from(UNIX_CODEX_NAME));
     }
-    let directories: Vec<PathBuf> = search
-        .map(|search| {
-            search
-                .to_string_lossy()
-                .split(';')
-                .map(str::trim)
-                .filter(|directory| !directory.is_empty())
-                .map(PathBuf::from)
-                .collect()
-        })
+    let mut directories = Vec::new();
+    let named = search
+        .map(|search| windows_path_directories(&search.to_string_lossy()))
         .unwrap_or_default();
+    for directory in named {
+        if windows_absolute(&directory) {
+            directories.push(directory);
+        } else if let Some(base) = base.filter(|base| windows_absolute(base)) {
+            // Windows resolves a relative entry against the current
+            // directory. Doing it here is what keeps the promise that the
+            // program handed to `Command` is an absolute path (Codex g1k).
+            // A leading `.\` names that directory itself; anything else,
+            // `..\` included, is left for Windows to make sense of.
+            let relative = directory
+                .strip_prefix(".\\")
+                .or_else(|| directory.strip_prefix("./"))
+                .unwrap_or(directory.as_str());
+            directories.push(if relative.is_empty() || relative == "." {
+                base.to_string()
+            } else {
+                join_windows(base, relative)
+            });
+        }
+        // With no absolute base to resolve against, a relative entry is
+        // dropped rather than handed over as a relative program.
+    }
     for name in WINDOWS_CODEX_NAMES {
         for directory in &directories {
-            let candidate = directory.join(name);
+            let candidate = PathBuf::from(join_windows(directory, name));
             if exists(&candidate) {
                 return Ok(candidate);
             }
@@ -241,12 +263,55 @@ fn resolve_codex(
     anyhow::bail!(
         "no codex executable: looked for {} in {}",
         WINDOWS_CODEX_NAMES.join(", "),
-        directories
-            .iter()
-            .map(|directory| directory.display().to_string())
-            .collect::<Vec<_>>()
-            .join("; ")
+        if directories.is_empty() {
+            "no absolute directory on PATH".to_string()
+        } else {
+            directories.join("; ")
+        }
     )
+}
+
+/// The directories a Windows PATH names, in order.
+///
+/// Windows separates them with `;`, and one that contains a `;` of its own is
+/// quoted — `"C:\Tools;Codex";C:\bin` — so the quotes delimit a directory
+/// rather than being part of it. The rule is implemented here, instead of
+/// calling `std::env::split_paths`, because the host running this code need
+/// not be the Windows the search is for: the host's own rules would split the
+/// example wrongly. The result is what that function returns for a Windows
+/// target.
+fn windows_path_directories(search: &str) -> Vec<String> {
+    let mut directories = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in search.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            ';' if !quoted => directories.push(std::mem::take(&mut current)),
+            _ => current.push(character),
+        }
+    }
+    directories.push(current);
+    directories
+        .into_iter()
+        .map(|directory| directory.trim().to_string())
+        .filter(|directory| !directory.is_empty())
+        .collect()
+}
+
+/// A Windows path that names a drive (`C:\…`) or a UNC share (`\\…`).
+fn windows_absolute(directory: &str) -> bool {
+    let bytes = directory.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    drive || directory.starts_with("\\\\")
+}
+
+/// `directory\name`, the way Windows joins, on any host.
+fn join_windows(directory: &str, name: &str) -> String {
+    format!("{}\\{name}", directory.trim_end_matches(['\\', '/']))
 }
 
 /// What a Unix-like system runs: the name the shell resolves.
@@ -1028,18 +1093,26 @@ done
         );
     }
 
-    /// The PATH search on Windows, offline: each case is a set of names the
-    /// fake filesystem holds (todo 5's fix b).
-    fn resolve_with(names: &[&str], path: &str) -> Result<PathBuf> {
-        // `Path::join` uses the host's separator, so both the fake
-        // filesystem and the assertions compare Windows-shaped paths.
-        resolve_codex(None, Some(OsStr::new(path)), true, |candidate| {
-            names.contains(&windows_shaped(candidate).as_str())
+    /// The PATH search on Windows, offline: `held` is the fake filesystem,
+    /// `base` the directory a relative entry resolves against.
+    fn resolve_with(held: &[&str], path: &str) -> Result<PathBuf> {
+        resolve_with_base(held, path, Some("C:\\work"))
+    }
+
+    fn resolve_with_base(held: &[&str], path: &str, base: Option<&str>) -> Result<PathBuf> {
+        resolve_codex(None, Some(OsStr::new(path)), true, base, |candidate| {
+            held.contains(&windows_shaped(candidate).as_str())
         })
     }
 
     fn windows_shaped(path: &Path) -> String {
         path.to_string_lossy().replace('/', "\\")
+    }
+
+    fn absolute(held: &[&str], path: &str) -> String {
+        let selected = windows_shaped(&resolve_with(held, path).unwrap());
+        assert!(windows_absolute(&selected), "not absolute: {selected}");
+        selected
     }
 
     #[test]
@@ -1058,12 +1131,67 @@ done
                 "C:\\bin\\codex.exe",
             ),
         ] {
-            assert_eq!(
-                windows_shaped(&resolve_with(&held, path).unwrap()),
-                expected,
-                "{held:?}"
-            );
+            assert_eq!(absolute(&held, path), expected, "{held:?}");
         }
+    }
+
+    #[test]
+    fn a_relative_path_entry_is_resolved_to_an_absolute_program() {
+        // Codex g1k: what is handed to `Command` has to be absolute, so a
+        // relative entry is resolved against the current directory — the
+        // same thing Windows would search.
+        assert_eq!(
+            absolute(&["C:\\work\\codex.exe"], "."),
+            "C:\\work\\codex.exe"
+        );
+        assert_eq!(
+            absolute(&["C:\\work\\codex.cmd"], "."),
+            "C:\\work\\codex.cmd"
+        );
+        assert_eq!(
+            absolute(&["C:\\work\\bin\\codex.exe"], "bin;C:\\fallback"),
+            "C:\\work\\bin\\codex.exe"
+        );
+        assert_eq!(
+            absolute(&["C:\\work\\bin\\codex.cmd"], "bin;C:\\fallback"),
+            "C:\\work\\bin\\codex.cmd"
+        );
+        // With nothing absolute to resolve against, a relative entry is
+        // dropped rather than handed over relative.
+        let error = resolve_with_base(&["codex.exe"], ".", None).unwrap_err();
+        assert!(
+            error.to_string().contains("no absolute directory on PATH"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_quoted_windows_path_entry_is_read_by_windows_rules() {
+        // Codex g1k: quotes delimit an entry, and a `;` inside them is part
+        // of the directory rather than a separator.
+        let path = "\"C:\\Program Files\\Codex\";C:\\bin";
+        assert_eq!(
+            absolute(&["C:\\Program Files\\Codex\\codex.exe"], path),
+            "C:\\Program Files\\Codex\\codex.exe"
+        );
+        assert_eq!(
+            absolute(&["C:\\Program Files\\Codex\\codex.cmd"], path),
+            "C:\\Program Files\\Codex\\codex.cmd"
+        );
+        let path = "\"C:\\Tools;Codex\";C:\\bin";
+        assert_eq!(
+            absolute(&["C:\\Tools;Codex\\codex.exe"], path),
+            "C:\\Tools;Codex\\codex.exe"
+        );
+        assert_eq!(
+            absolute(&["C:\\Tools;Codex\\codex.cmd"], path),
+            "C:\\Tools;Codex\\codex.cmd"
+        );
+        // The separator still separates outside the quotes.
+        assert_eq!(
+            absolute(&["C:\\bin\\codex.exe"], path),
+            "C:\\bin\\codex.exe"
+        );
     }
 
     #[test]
@@ -1075,6 +1203,20 @@ done
     }
 
     #[test]
+    fn an_empty_path_names_no_directory() {
+        for search in [None, Some(""), Some(";;")] {
+            let error = resolve_codex(None, search.map(OsStr::new), true, Some("C:\\work"), |_| {
+                unreachable!("nothing can be found without a directory")
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("no absolute directory on PATH"),
+                "{search:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn an_explicit_binary_wins_and_other_systems_keep_the_bare_name() {
         // `CODEX_BIN_PATH` has always won, and a Unix-like system runs the
         // name its shell resolves.
@@ -1083,18 +1225,19 @@ done
                 Some(OsStr::new("/opt/codex")),
                 None,
                 true,
+                None,
                 |_| unreachable!("an explicit path is not searched for")
             )
             .unwrap(),
             PathBuf::from("/opt/codex")
         );
         assert_eq!(
-            resolve_codex(None, None, false, |_| unreachable!()).unwrap(),
+            resolve_codex(None, None, false, None, |_| unreachable!()).unwrap(),
             PathBuf::from("codex")
         );
         // An empty value is the same as none: it names nothing.
         assert_eq!(
-            resolve_codex(Some(OsStr::new("")), None, false, |_| unreachable!()).unwrap(),
+            resolve_codex(Some(OsStr::new("")), None, false, None, |_| unreachable!()).unwrap(),
             PathBuf::from("codex")
         );
     }
