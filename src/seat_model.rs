@@ -52,6 +52,10 @@ pub(crate) const MODEL_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 /// directory: measured 0930 at ~7 ms per session over 556 directories.
 const RELOCATE_AFTER_SECS: u64 = 60;
 const CACHE_FILE: &str = "seat-models.json";
+/// The declared pane → root file, in the plugin config directory. User data,
+/// so it is not in [`crate::prefs::ALL`]: neither install nor uninstall
+/// rewrites it (the same rule the `groups` file lives by).
+pub const FILE: &str = "seat-roots";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeatModel {
@@ -61,37 +65,47 @@ pub enum SeatModel {
     Unknown,
 }
 
+/// Pane id → the root that pane's files are read from, when no process scan
+/// can bind one. See [`configured_roots`].
+pub type SeatRoots = BTreeMap<String, SeatPaths>;
+
 /// Pane id → model for every agent pane in `panes`. A pane without an entry
 /// keeps what it shows.
 ///
-/// `fallback` stands in for a process scan on a system without `/proc`
-/// (Windows, macOS): every seat is taken to keep its files in this
-/// process's own home ([`platform_paths`]). On Linux it is `None`, and a scan
-/// that found nothing still means "no answer this pass".
+/// `roots` stands in for the process scan on a system without `/proc`
+/// (Windows, macOS). It is **per pane** and comes only from an explicit
+/// configuration ([`configured_roots`]): the plugin's own environment is the
+/// Herdr server's, and that is not evidence about any seat. Two seats can run
+/// from two config roots on one machine, and a copy of a session under the
+/// wrong root would otherwise be published as a real model (Codex g1 R1). A
+/// pane with no declared root stays [`SeatModel::Unknown`].
 pub fn resolve(
     panes: &[AgentPane],
     scan: Option<&BTreeMap<String, ProcessChannel>>,
-    fallback: Option<&SeatPaths>,
+    roots: Option<&SeatRoots>,
     cache_root: Option<&Path>,
 ) -> BTreeMap<String, SeatModel> {
     let mut resolved = BTreeMap::new();
     let scan = scan.filter(|scan| !scan.is_empty());
-    let shared = fallback.map(|paths| ProcessChannel {
-        paths: paths.clone(),
-        ..ProcessChannel::default()
-    });
-    // No socket, no /proc, or nothing readable, and no home to fall back on:
-    // this pass learned nothing.
-    if scan.is_none() && shared.is_none() {
+    let roots = roots.filter(|roots| !roots.is_empty());
+    // No socket, no /proc, or nothing readable, and nothing declared: this
+    // pass learned nothing.
+    if scan.is_none() && roots.is_none() {
         return resolved;
     }
     let mut cache = cache_root.map(Cache::load).unwrap_or_default();
     for pane in panes {
+        let declared = roots
+            .and_then(|roots| roots.get(&pane.pane_id))
+            .map(|paths| ProcessChannel {
+                paths: paths.clone(),
+                ..ProcessChannel::default()
+            });
         let process = match scan {
-            Some(scan) => scan.get(&pane.pane_id),
-            None => shared.as_ref(),
+            Some(scan) => scan.get(&pane.pane_id).cloned(),
+            None => declared,
         };
-        if let Some(model) = resolve_pane(pane, process, &mut cache) {
+        if let Some(model) = resolve_pane(pane, process.as_ref(), &mut cache) {
             resolved.insert(pane.pane_id.clone(), model);
         }
     }
@@ -174,27 +188,44 @@ fn resolve_pane(
     }
 }
 
-/// Where seats keep their files when no process can be read: this plugin
-/// process's own `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and home directory. Herdr
-/// runs hooks in its server's environment, which on a single-user machine is
-/// the same account the agents run as. Linux reads each seat's own process
-/// instead, so it gets `None`.
-pub fn platform_paths() -> Option<SeatPaths> {
-    if cfg!(target_os = "linux") {
-        return None;
+/// The seats' roots when no process can be read, from the `seat-roots` file
+/// in the plugin config directory — one `<pane id> = <home>` line each, `#`
+/// starting a comment.
+///
+/// ```text
+/// w9:p47 = C:\Users\11727
+/// ```
+///
+/// There is deliberately no default. Herdr starts a hook in its server's
+/// environment, which says nothing about any seat's environment: on one
+/// Windows account two seats can still run from two `CLAUDE_CONFIG_DIR`s, and
+/// a session copied into the wrong root is not that seat's model (Codex g1
+/// R1). A pane with no line here shows `?`. Linux and other `/proc` systems
+/// bind each pane to its own process instead and never read this file.
+pub fn configured_roots() -> Option<SeatRoots> {
+    let text = crate::prefs::read(FILE)?;
+    let mut roots = SeatRoots::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((pane, home)) = line.split_once('=') else {
+            continue;
+        };
+        let (pane, home) = (pane.trim(), home.trim());
+        if pane.is_empty() || home.is_empty() {
+            continue;
+        }
+        roots.insert(
+            pane.to_string(),
+            SeatPaths {
+                home: Some(home.to_string()),
+                ..SeatPaths::default()
+            },
+        );
     }
-    let var = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    };
-    let home = var("HOME").or_else(|| var("USERPROFILE"))?;
-    Some(SeatPaths {
-        home: Some(home),
-        claude_config_dir: var("CLAUDE_CONFIG_DIR"),
-        codex_home: var("CODEX_HOME"),
-        resume_session: None,
-    })
+    (!roots.is_empty()).then_some(roots)
 }
 
 /// Where a seat's session file is, as far as this pass can tell.
@@ -820,8 +851,9 @@ mod tests {
     }
 
     #[test]
-    fn without_a_process_scan_seats_are_read_from_the_fallback_home() {
-        // Windows / macOS: no /proc, so the plugin's own home stands in.
+    fn without_a_process_scan_only_a_declared_root_is_used() {
+        // Windows / macOS: no /proc. A root is read only for the pane the
+        // `seat-roots` file names it for (Codex g1 R1).
         let home = tempfile::tempdir().unwrap();
         let project = home.path().join(".claude/projects/H--diche-proj-CM");
         fs::create_dir_all(&project).unwrap();
@@ -837,27 +869,140 @@ mod tests {
             r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#,
         )
         .unwrap();
-        let fallback = SeatPaths {
-            home: Some(home.path().display().to_string()),
-            ..SeatPaths::default()
+        let declared = |pane: &str| {
+            BTreeMap::from([(
+                pane.to_string(),
+                SeatPaths {
+                    home: Some(home.path().display().to_string()),
+                    ..SeatPaths::default()
+                },
+            )])
         };
         let panes = [
             pane("w9:p30", Harness::Claude, Some("s-win")),
             pane("w9:p41", Harness::Codex, Some("01a0dd00-1111")),
             pane("w9:p42", Harness::Claude, Some("s-gone")),
         ];
-        let resolved = resolve(&panes, Some(&BTreeMap::new()), Some(&fallback), None);
+        // Only w9:p30 is declared: the other two panes answer nothing, even
+        // though the same root holds the Codex rollout w9:p41 would need.
+        let resolved = resolve(
+            &panes,
+            Some(&BTreeMap::new()),
+            Some(&declared("w9:p30")),
+            None,
+        );
         assert_eq!(
             resolved["w9:p30"],
             SeatModel::Known("deepseek-v4.1-flash-dspark-greedy-1m-b200".to_string())
         );
+        assert_eq!(resolved["w9:p41"], SeatModel::Unknown);
+        assert_eq!(resolved["w9:p42"], SeatModel::Unknown);
+        // Declaring both seats reads each from its own files; a session with
+        // no file under its declared root is still Unknown.
+        let mut both = declared("w9:p30");
+        both.extend(declared("w9:p41"));
+        both.extend(declared("w9:p42"));
+        let resolved = resolve(&panes, Some(&BTreeMap::new()), Some(&both), None);
         assert_eq!(
             resolved["w9:p41"],
             SeatModel::Known("gpt-6.1-sol".to_string())
         );
         assert_eq!(resolved["w9:p42"], SeatModel::Unknown);
-        // Linux passes no fallback: an empty scan still answers nothing.
+        // No declaration at all: an empty scan still answers nothing.
         assert!(resolve(&panes, Some(&BTreeMap::new()), None, None).is_empty());
+    }
+
+    #[test]
+    fn a_seat_whose_root_is_not_declared_never_borrows_another_seats_root() {
+        // Codex g1 R1 negative: two config roots, one session id in both,
+        // different models. The pane bound to B must not be served from A,
+        // which is where the plugin process happens to live.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        for (root, model) in [(&a, "claude-opus-5"), (&b, "claude-sonnet-5-5")] {
+            let project = root.path().join(".claude/projects/-proj");
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join("s-shared.jsonl"), assistant(model)).unwrap();
+        }
+        let panes = [
+            pane("w9:p1", Harness::Claude, Some("s-shared")),
+            pane("w9:p2", Harness::Claude, Some("s-shared")),
+        ];
+        let seat_a = SeatPaths {
+            home: Some(a.path().display().to_string()),
+            ..SeatPaths::default()
+        };
+        let seat_b = SeatPaths {
+            home: Some(b.path().display().to_string()),
+            ..SeatPaths::default()
+        };
+        // Only A is declared: B has no root, so it is Unknown and never A's
+        // model, even though A holds a file with B's session id.
+        let only_a = BTreeMap::from([("w9:p1".to_string(), seat_a.clone())]);
+        let resolved = resolve(&panes, Some(&BTreeMap::new()), Some(&only_a), None);
+        assert_eq!(resolved["w9:p1"], SeatModel::Known("claude-opus-5".into()));
+        assert_eq!(resolved["w9:p2"], SeatModel::Unknown);
+        // Both declared: each pane reads its own root.
+        let both = BTreeMap::from([("w9:p1".to_string(), seat_a), ("w9:p2".to_string(), seat_b)]);
+        let resolved = resolve(&panes, Some(&BTreeMap::new()), Some(&both), None);
+        assert_eq!(resolved["w9:p1"], SeatModel::Known("claude-opus-5".into()));
+        assert_eq!(
+            resolved["w9:p2"],
+            SeatModel::Known("claude-sonnet-5-5".into())
+        );
+    }
+
+    #[test]
+    fn a_stale_copy_under_the_servers_root_is_not_the_seats_model() {
+        // Codex g1 R1 negative: the server's CODEX_HOME holds a copy of a
+        // seat's session; the seat's own root holds the live one. Reading the
+        // server's root would publish the wrong model.
+        let server = tempfile::tempdir().unwrap();
+        let seat = tempfile::tempdir().unwrap();
+        let rollout = |root: &Path, model: &str| {
+            let day = root.join(".codex/sessions/2026/10/01");
+            fs::create_dir_all(&day).unwrap();
+            fs::write(
+                day.join("rollout-2026-10-01T08-00-00-01a0dd00-2222.jsonl"),
+                format!(r#"{{"type":"turn_context","payload":{{"model":"{model}"}}}}"#),
+            )
+            .unwrap();
+        };
+        rollout(server.path(), "gpt-6.1-sol");
+        rollout(seat.path(), "gpt-6.2-sol");
+        let panes = [pane("w9:p7", Harness::Codex, Some("01a0dd00-2222"))];
+        let declared = BTreeMap::from([(
+            "w9:p7".to_string(),
+            SeatPaths {
+                home: Some(seat.path().display().to_string()),
+                ..SeatPaths::default()
+            },
+        )]);
+        let resolved = resolve(&panes, Some(&BTreeMap::new()), Some(&declared), None);
+        assert_eq!(resolved["w9:p7"], SeatModel::Known("gpt-6.2-sol".into()));
+    }
+
+    #[test]
+    fn declared_roots_parse_one_seat_per_line() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::prefs::testing::with_env(
+            &[(
+                "HERDR_PLUGIN_CONFIG_DIR",
+                Some(directory.path().as_os_str()),
+            )],
+            || {
+                assert_eq!(configured_roots(), None);
+                fs::write(
+                    directory.path().join(FILE),
+                    "# 座位自己的根\n\nw9:p47 = C:\\Users\\11727\n w9:p4B = /home/alice # 备注\n掉行\n",
+                )
+                .unwrap();
+                let roots = configured_roots().unwrap();
+                assert_eq!(roots.len(), 2);
+                assert_eq!(roots["w9:p47"].home.as_deref(), Some(r"C:\Users\11727"));
+                assert_eq!(roots["w9:p4B"].home.as_deref(), Some("/home/alice"));
+            },
+        );
     }
 
     #[test]
