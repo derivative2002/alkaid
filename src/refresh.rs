@@ -1280,8 +1280,39 @@ fn spawn_watch(defer: bool) -> Result<()> {
             Ok(())
         });
     }
+    #[cfg(windows)]
+    detach_on_windows(&mut command);
     command.spawn().context("start active-turn quota watcher")?;
     Ok(())
+}
+
+/// Windows passes every inheritable handle to a child, whatever its own
+/// stdio is set to. Herdr hands a hook or action its output pipe as this
+/// process's standard handles, so a watcher started from there would hold
+/// that pipe open and Herdr would show the action as running for as long as
+/// the watcher lives (measured 1001: configure stayed "running"). Mark this
+/// process's standard handles non-inheritable before spawning, and give the
+/// watcher no console window and its own process group.
+#[cfg(windows)]
+fn detach_on_windows(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        unsafe {
+            let handle = GetStdHandle(id);
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 // Event payloads are nested and their shape differs per event, so look the
