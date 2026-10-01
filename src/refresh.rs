@@ -897,10 +897,7 @@ fn refresh_provider(
         .collect::<Vec<_>>();
     let (account_id, _) = current_account_gate(provider);
     cache.mark_refresh_account(provider, now, account_id.as_deref())?;
-    let fetched = match provider {
-        Provider::Codex => codex::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Claude => load_statusline_snapshot(cache, provider),
-    };
+    let fetched = fetch_provider(provider, &session_ids, cache);
     match fetched {
         Ok(fetched) => {
             let FetchedSnapshot {
@@ -908,7 +905,6 @@ fn refresh_provider(
                 preserve_context,
                 session_id,
             } = fetched;
-            cache.clear_provider_error(provider)?;
             if preserve_context {
                 cache.save_preserving_context_for_session(snapshot, session_id.as_deref())?;
             } else if matches!(provider, Provider::Codex) {
@@ -921,6 +917,11 @@ fn refresh_provider(
             } else {
                 cache.save(&snapshot)?;
             }
+            // Cleared only after the new snapshot is in the cache, and only
+            // because this file means "the last fetch failed": a fetch that
+            // succeeded must not be blocked, or reported as failed, by a
+            // cleanup that could not run (Codex g1c G1).
+            let _ = cache.clear_provider_error(provider);
             Ok(ProviderOutcome {
                 provider,
                 available: true,
@@ -932,10 +933,17 @@ fn refresh_provider(
             // The whole chain, not just its top context: on Windows the
             // diagnosis of a missing Codex quota is the OS error under
             // "start codex app-server", and `error.to_string()` drops it.
-            // Recorded because every caller of `refresh_selected` drops this
-            // outcome and the watcher's stderr is null.
+            // Recorded because the watch and event paths drop this outcome
+            // and the watcher's stderr is null.
             let detail = format!("{error:#}");
-            cache.record_provider_error(provider, &detail)?;
+            // Best effort: the diagnostic is not the fetch. A state
+            // directory that cannot take the file must not replace the
+            // result, stop the other providers, or stop the publish pass —
+            // and it must not be reported as recorded either (Codex g1c G1).
+            let detail = match cache.record_provider_error(provider, &detail) {
+                Ok(()) => detail,
+                Err(error) => format!("{detail} (not recorded: {error:#})"),
+            };
             Ok(ProviderOutcome {
                 provider,
                 available: load_usable_snapshot(cache, provider)?.is_some(),
@@ -943,6 +951,25 @@ fn refresh_provider(
                 error: Some(detail),
             })
         }
+    }
+}
+
+/// Fetch one provider's snapshot.
+///
+/// Behind a seam so the failure branches around it — a state directory that
+/// cannot take the diagnostic file — can be driven offline (Codex g1c G1).
+fn fetch_provider(
+    provider: Provider,
+    session_ids: &[String],
+    cache: &CacheStore,
+) -> Result<FetchedSnapshot> {
+    #[cfg(test)]
+    if let Some(injected) = tests::injected_fetch() {
+        return injected(provider, session_ids, cache);
+    }
+    match provider {
+        Provider::Codex => codex::fetch_for_sessions(session_ids).map(FetchedSnapshot::direct),
+        Provider::Claude => load_statusline_snapshot(cache, provider),
     }
 }
 
@@ -1389,7 +1416,141 @@ mod tests {
     use super::*;
     use crate::cli::{PercentStyle, SidebarLayout};
     use crate::model::{ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
+    use std::cell::Cell;
     use tempfile::tempdir;
+
+    pub(super) type Fetch = fn(Provider, &[String], &CacheStore) -> Result<FetchedSnapshot>;
+
+    thread_local! {
+        static INJECTED_FETCH: Cell<Option<Fetch>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn injected_fetch() -> Option<Fetch> {
+        INJECTED_FETCH.with(Cell::get)
+    }
+
+    fn inject(fetch: Fetch) {
+        INJECTED_FETCH.with(|slot| slot.set(Some(fetch)));
+    }
+
+    fn clear_injection() {
+        INJECTED_FETCH.with(|slot| slot.set(None));
+    }
+
+    /// Point the credential roots at a temporary directory for the length of
+    /// `body`, so no test here reads the machine's own login.
+    fn with_isolated_credentials(body: impl FnOnce()) {
+        let root = tempdir().unwrap();
+        let _guard = crate::providers::test_support::env_guard();
+        let previous_auth = std::env::var_os("CODEX_AUTH_FILE");
+        let previous_home = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_AUTH_FILE", root.path().join("auth.json"));
+        std::env::set_var("CODEX_HOME", root.path());
+        body();
+        match previous_auth {
+            Some(value) => std::env::set_var("CODEX_AUTH_FILE", value),
+            None => std::env::remove_var("CODEX_AUTH_FILE"),
+        }
+        match previous_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+
+    fn a_snapshot() -> FetchedSnapshot {
+        FetchedSnapshot::direct(ProviderSnapshot::new(
+            Provider::Codex,
+            vec![UsageWindow::new(WindowKind::Weekly, 42.5, None).unwrap()],
+            1,
+        ))
+    }
+
+    fn failing_fetch(_: Provider, _: &[String], _: &CacheStore) -> Result<FetchedSnapshot> {
+        anyhow::bail!("start codex app-server: program not found");
+    }
+
+    fn succeeding_fetch(_: Provider, _: &[String], _: &CacheStore) -> Result<FetchedSnapshot> {
+        Ok(a_snapshot())
+    }
+
+    /// Make the diagnostic file impossible to write or remove: a directory
+    /// stands where the file would be.
+    fn break_the_diagnostic_file(cache: &CacheStore) {
+        std::fs::create_dir_all(cache.root().join("codex-app-server.error.json")).unwrap();
+    }
+
+    #[test]
+    fn a_diagnostic_that_cannot_be_written_does_not_replace_the_fetch_result() {
+        // Codex g1c G1: the file is a diagnostic. A state directory that
+        // cannot take it must leave the fetch's own outcome alone, say so,
+        // and not stop the other providers or the publish pass.
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        with_isolated_credentials(|| {
+            break_the_diagnostic_file(&cache);
+            inject(failing_fetch);
+            let outcome = refresh_provider(&cache, Provider::Codex, true, &[]).unwrap();
+            clear_injection();
+            assert!(!outcome.available);
+            assert!(outcome.from_cache);
+            let error = outcome.error.expect("the fetch error must survive");
+            assert!(
+                error.contains("start codex app-server: program not found"),
+                "{error}"
+            );
+            assert!(
+                error.contains("not recorded"),
+                "a file that was not written must not be reported as written: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_diagnostic_that_cannot_be_cleared_does_not_stop_a_successful_fetch() {
+        // The other direction: the snapshot has already been saved by the
+        // time the clearing is attempted, so a failure there cannot make a
+        // successful fetch look like a failed one.
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        with_isolated_credentials(|| {
+            break_the_diagnostic_file(&cache);
+            inject(succeeding_fetch);
+            let outcome = refresh_provider(&cache, Provider::Codex, true, &[]).unwrap();
+            clear_injection();
+            assert!(outcome.available);
+            assert!(!outcome.from_cache);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            assert!(
+                cache.load(Provider::Codex).unwrap().is_some(),
+                "the new snapshot must still be in the cache"
+            );
+        });
+    }
+
+    #[test]
+    fn the_diagnostic_file_still_records_a_failure_and_goes_on_success() {
+        // Normal root: the file appears with the fetch's chain and is gone
+        // again once a fetch succeeds.
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let path = directory.path().join("codex-app-server.error.json");
+        with_isolated_credentials(|| {
+            inject(failing_fetch);
+            let outcome = refresh_provider(&cache, Provider::Codex, true, &[]).unwrap();
+            clear_injection();
+            assert!(!outcome.error.unwrap().contains("not recorded"));
+            let recorded: String = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                recorded.contains("start codex app-server: program not found"),
+                "{recorded}"
+            );
+
+            inject(succeeding_fetch);
+            refresh_provider(&cache, Provider::Codex, true, &[]).unwrap();
+            clear_injection();
+            assert!(!path.exists(), "a successful fetch clears the record");
+        });
+    }
 
     fn test_pane(id: &str, harness: Harness) -> AgentPane {
         AgentPane {
