@@ -55,6 +55,18 @@ pub struct SeatPaths {
 /// renames its main thread `MainThread`.
 const AGENT_COMMS: [&str; 4] = ["claude", "node", "codex", "MainThread"];
 
+/// Whether this system can read a seat's own process at all.
+///
+/// The scan reads `/proc`, so a system without it has no process evidence:
+/// there a pane's root has to be declared, and an undeclared pane answers
+/// Unknown rather than keeping whatever it showed (Codex g1d R1). The two
+/// kinds of "nothing" differ: no scan mechanism at all is a standing state,
+/// while an empty scan on a system that has one means only that this pass
+/// learned nothing.
+pub fn process_scan_available() -> bool {
+    cfg!(target_os = "linux")
+}
+
 /// Pane id → the first agent process found in it, among processes of the
 /// Herdr server this plugin runs under.
 ///

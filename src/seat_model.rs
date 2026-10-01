@@ -69,44 +69,60 @@ pub enum SeatModel {
 /// can bind one. See [`configured_roots`].
 pub type SeatRoots = BTreeMap<String, SeatPaths>;
 
+/// What this pass knows about where each seat keeps its files.
+pub enum SeatEvidence<'a> {
+    /// This system reads every seat's own process (Linux): the map is that
+    /// scan's result. A pane it did not find answers Unknown, while a scan
+    /// that came back empty means this pass learned nothing and the rows
+    /// keep what they show.
+    Processes(&'a BTreeMap<String, ProcessChannel>),
+    /// This system cannot read a seat's process (no `/proc`): the declared
+    /// roots are the only binding there is, so **every** pane is answered
+    /// and an undeclared one is Unknown — a model read under a rule that no
+    /// longer exists must not survive (Codex g1d R1).
+    DeclaredRoots(&'a SeatRoots),
+}
+
 /// Pane id → model for every agent pane in `panes`. A pane without an entry
 /// keeps what it shows.
 ///
-/// `roots` stands in for the process scan on a system without `/proc`
-/// (Windows, macOS). It is **per pane** and comes only from an explicit
-/// configuration ([`configured_roots`]): the plugin's own environment is the
-/// Herdr server's, and that is not evidence about any seat. Two seats can run
-/// from two config roots on one machine, and a copy of a session under the
-/// wrong root would otherwise be published as a real model (Codex g1 R1). A
-/// pane with no declared root stays [`SeatModel::Unknown`].
+/// `roots` comes only from an explicit per-pane configuration
+/// ([`configured_roots`]): the plugin's own environment is the Herdr
+/// server's, and that is not evidence about any seat. Two seats can run from
+/// two config roots on one machine, and a copy of a session under the wrong
+/// root would otherwise be published as a real model (Codex g1 R1).
 pub fn resolve(
     panes: &[AgentPane],
-    scan: Option<&BTreeMap<String, ProcessChannel>>,
-    roots: Option<&SeatRoots>,
+    evidence: SeatEvidence<'_>,
     cache_root: Option<&Path>,
 ) -> BTreeMap<String, SeatModel> {
     let mut resolved = BTreeMap::new();
-    let scan = scan.filter(|scan| !scan.is_empty());
-    let roots = roots.filter(|roots| !roots.is_empty());
-    // No socket, no /proc, or nothing readable, and nothing declared: this
-    // pass learned nothing.
-    if scan.is_none() && roots.is_none() {
-        return resolved;
-    }
     let mut cache = cache_root.map(Cache::load).unwrap_or_default();
-    for pane in panes {
-        let declared = roots
-            .and_then(|roots| roots.get(&pane.pane_id))
-            .map(|paths| ProcessChannel {
-                paths: paths.clone(),
-                ..ProcessChannel::default()
-            });
-        let process = match scan {
-            Some(scan) => scan.get(&pane.pane_id).cloned(),
-            None => declared,
-        };
-        if let Some(model) = resolve_pane(pane, process.as_ref(), &mut cache) {
+    let answer = |pane: &AgentPane,
+                  process: Option<&ProcessChannel>,
+                  cache: &mut Cache,
+                  resolved: &mut BTreeMap<String, SeatModel>| {
+        if let Some(model) = resolve_pane(pane, process, cache) {
             resolved.insert(pane.pane_id.clone(), model);
+        }
+    };
+    match evidence {
+        // Nothing readable this pass: keep every row as it is.
+        SeatEvidence::Processes(scan) if scan.is_empty() => return resolved,
+        SeatEvidence::Processes(scan) => {
+            for pane in panes {
+                let process = scan.get(&pane.pane_id);
+                answer(pane, process, &mut cache, &mut resolved);
+            }
+        }
+        SeatEvidence::DeclaredRoots(roots) => {
+            for pane in panes {
+                let declared = roots.get(&pane.pane_id).map(|paths| ProcessChannel {
+                    paths: paths.clone(),
+                    ..ProcessChannel::default()
+                });
+                answer(pane, declared.as_ref(), &mut cache, &mut resolved);
+            }
         }
     }
     if let Some(root) = cache_root {
@@ -680,7 +696,7 @@ mod tests {
             ),
         ]);
         let known = |model: &str| SeatModel::Known(model.to_string());
-        let resolved = resolve(&panes, Some(&scan), None, Some(&state));
+        let resolved = resolve(&panes, SeatEvidence::Processes(&scan), Some(&state));
         assert_eq!(resolved["w1:p1"], known("claude-sonnet-5-5"));
         assert_eq!(resolved["w1:p2"], known("gpt-6.1-sol"));
         assert_eq!(resolved["w1:p3"], known("grok-4.7"));
@@ -691,12 +707,25 @@ mod tests {
         let cache = Cache::load(&state);
         assert_eq!(cache.sessions.len(), 2);
         assert_eq!(cache.files.len(), 2);
-        assert_eq!(resolve(&panes, Some(&scan), None, Some(&state)), resolved);
+        assert_eq!(
+            resolve(&panes, SeatEvidence::Processes(&scan), Some(&state)),
+            resolved
+        );
 
         // A scan that found no process at all learned nothing: every pane
         // keeps what it shows.
-        assert!(resolve(&panes, Some(&BTreeMap::new()), None, Some(&state)).is_empty());
-        assert!(resolve(&panes, None, None, Some(&state)).is_empty());
+        assert!(resolve(
+            &panes,
+            SeatEvidence::Processes(&BTreeMap::new()),
+            Some(&state)
+        )
+        .is_empty());
+        assert!(resolve(
+            &panes,
+            SeatEvidence::Processes(&BTreeMap::new()),
+            Some(&state)
+        )
+        .is_empty());
     }
 
     fn claude_scene(root: &Path) -> (Vec<AgentPane>, BTreeMap<String, ProcessChannel>) {
@@ -739,7 +768,7 @@ mod tests {
         let (panes, scan) = claude_scene(root.path());
         let known = |model: &str| Some(SeatModel::Known(model.to_string()));
         assert_eq!(
-            resolve(&panes, Some(&scan), None, None)
+            resolve(&panes, SeatEvidence::Processes(&scan), None)
                 .get("w1:p1")
                 .cloned(),
             known("deepseek-v4.1-flash")
@@ -750,7 +779,7 @@ mod tests {
         );
         fs::write(project.join("s.jsonl"), format!("{old}{huge}")).unwrap();
         assert_eq!(
-            resolve(&panes, Some(&scan), None, None)
+            resolve(&panes, SeatEvidence::Processes(&scan), None)
                 .get("w1:p1")
                 .cloned(),
             known("claude-opus-5-5")
@@ -764,7 +793,7 @@ mod tests {
         );
         fs::write(project.join("s.jsonl"), past).unwrap();
         assert_eq!(
-            resolve(&panes, Some(&scan), None, None)
+            resolve(&panes, SeatEvidence::Processes(&scan), None)
                 .get("w1:p1")
                 .cloned(),
             Some(SeatModel::Unknown)
@@ -790,7 +819,7 @@ mod tests {
         let (panes, scan) = claude_scene(root.path());
         let known = Some(SeatModel::Known("claude-opus-5".to_string()));
         let at = |state: &Path| {
-            resolve(&panes, Some(&scan), None, Some(state))
+            resolve(&panes, SeatEvidence::Processes(&scan), Some(state))
                 .get("w1:p1")
                 .cloned()
         };
@@ -826,7 +855,7 @@ mod tests {
         };
         let (panes, scan) = claude_scene(root.path());
         let at = || {
-            resolve(&panes, Some(&scan), None, Some(state.path()))
+            resolve(&panes, SeatEvidence::Processes(&scan), Some(state.path()))
                 .get("w1:p1")
                 .cloned()
         };
@@ -887,8 +916,7 @@ mod tests {
         // though the same root holds the Codex rollout w9:p41 would need.
         let resolved = resolve(
             &panes,
-            Some(&BTreeMap::new()),
-            Some(&declared("w9:p30")),
+            SeatEvidence::DeclaredRoots(&declared("w9:p30")),
             None,
         );
         assert_eq!(
@@ -902,14 +930,43 @@ mod tests {
         let mut both = declared("w9:p30");
         both.extend(declared("w9:p41"));
         both.extend(declared("w9:p42"));
-        let resolved = resolve(&panes, Some(&BTreeMap::new()), Some(&both), None);
+        let resolved = resolve(&panes, SeatEvidence::DeclaredRoots(&both), None);
         assert_eq!(
             resolved["w9:p41"],
             SeatModel::Known("gpt-6.1-sol".to_string())
         );
         assert_eq!(resolved["w9:p42"], SeatModel::Unknown);
         // No declaration at all: an empty scan still answers nothing.
-        assert!(resolve(&panes, Some(&BTreeMap::new()), None, None).is_empty());
+        assert!(resolve(&panes, SeatEvidence::Processes(&BTreeMap::new()), None).is_empty());
+    }
+
+    #[test]
+    fn without_a_process_scan_an_undeclared_pane_goes_back_to_unknown() {
+        // Codex g1d R1: on a system that cannot read a seat's process, "no
+        // declaration" is a standing answer, not a pass that learned nothing.
+        // The pane must be published as Unknown so the row drops whatever a
+        // previous rule had put there, instead of keeping it for ever.
+        let panes = [
+            pane("w9:p1", Harness::Claude, Some("s")),
+            pane("w9:p2", Harness::Codex, Some("01a0dd00-9999")),
+        ];
+        let none_declared = SeatRoots::new();
+        let resolved = resolve(&panes, SeatEvidence::DeclaredRoots(&none_declared), None);
+        assert_eq!(resolved["w9:p1"], SeatModel::Unknown);
+        assert_eq!(resolved["w9:p2"], SeatModel::Unknown);
+        // And a declaration removed from the file takes its pane back to
+        // Unknown on the next pass.
+        let home = tempfile::tempdir().unwrap();
+        let declared = BTreeMap::from([(
+            "w9:p1".to_string(),
+            SeatPaths {
+                home: Some(home.path().display().to_string()),
+                ..SeatPaths::default()
+            },
+        )]);
+        let resolved = resolve(&panes, SeatEvidence::DeclaredRoots(&declared), None);
+        assert_eq!(resolved["w9:p1"], SeatModel::Unknown);
+        assert_eq!(resolved["w9:p2"], SeatModel::Unknown);
     }
 
     #[test]
@@ -939,12 +996,12 @@ mod tests {
         // Only A is declared: B has no root, so it is Unknown and never A's
         // model, even though A holds a file with B's session id.
         let only_a = BTreeMap::from([("w9:p1".to_string(), seat_a.clone())]);
-        let resolved = resolve(&panes, Some(&BTreeMap::new()), Some(&only_a), None);
+        let resolved = resolve(&panes, SeatEvidence::DeclaredRoots(&only_a), None);
         assert_eq!(resolved["w9:p1"], SeatModel::Known("claude-opus-5".into()));
         assert_eq!(resolved["w9:p2"], SeatModel::Unknown);
         // Both declared: each pane reads its own root.
         let both = BTreeMap::from([("w9:p1".to_string(), seat_a), ("w9:p2".to_string(), seat_b)]);
-        let resolved = resolve(&panes, Some(&BTreeMap::new()), Some(&both), None);
+        let resolved = resolve(&panes, SeatEvidence::DeclaredRoots(&both), None);
         assert_eq!(resolved["w9:p1"], SeatModel::Known("claude-opus-5".into()));
         assert_eq!(
             resolved["w9:p2"],
@@ -978,7 +1035,7 @@ mod tests {
                 ..SeatPaths::default()
             },
         )]);
-        let resolved = resolve(&panes, Some(&BTreeMap::new()), Some(&declared), None);
+        let resolved = resolve(&panes, SeatEvidence::DeclaredRoots(&declared), None);
         assert_eq!(resolved["w9:p7"], SeatModel::Known("gpt-6.2-sol".into()));
     }
 

@@ -91,13 +91,24 @@ pub fn run_shell_with_deadline(
 
     let child = Arc::new(Mutex::new(Some((child, tree))));
     let timed_out = Arc::new(AtomicBool::new(false));
+    // Whichever thread ends the tree reports a failure it hit; the other one
+    // finds the child already taken and has nothing to say. Dropping this
+    // would leave a tree that was never ended looking like a clean finish
+    // (Codex g1d R2).
+    let end_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let (cancel, cancelled) = mpsc::channel();
     let watchdog_child = Arc::clone(&child);
     let watchdog_timed_out = Arc::clone(&timed_out);
+    let watchdog_end_failure = Arc::clone(&end_failure);
     let watchdog = thread::spawn(move || {
         if cancelled.recv_timeout(budget).is_err() {
             watchdog_timed_out.store(true, Ordering::Release);
-            let _ = terminate_and_reap(&watchdog_child);
+            if let Err(error) = terminate_and_reap(&watchdog_child) {
+                let mut slot = watchdog_end_failure
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *slot = Some(format!("the timed-out tree could not be ended: {error:#}"));
+            }
         }
     });
 
@@ -107,6 +118,13 @@ pub fn run_shell_with_deadline(
     let _ = cancel.send(());
     let status = terminate_and_reap(&child)?;
     let _ = watchdog.join();
+    let failure = end_failure
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if let Some(failure) = failure {
+        anyhow::bail!("{failure}");
+    }
 
     let _ = writer.join();
     read_result.context("read previous statusLine output")?;
@@ -181,6 +199,11 @@ fn terminate_and_reap(child: &Mutex<Option<(Child, Tree)>>) -> Result<Option<Exi
 pub(crate) struct Tree {
     #[cfg(windows)]
     job: Option<windows_job::Job>,
+    /// Set only by a test double, so a termination that fails can be
+    /// exercised: it travels with the value into whichever thread ends the
+    /// tree, which a thread-local could not do.
+    #[cfg(test)]
+    fails: bool,
 }
 
 impl Tree {
@@ -189,7 +212,10 @@ impl Tree {
     /// establish and nothing that can fail to.
     #[cfg(not(windows))]
     fn unconstrained() -> Self {
-        Tree {}
+        Tree {
+            #[cfg(test)]
+            fails: false,
+        }
     }
 
     /// End the child and its descendants. The child is still held and not
@@ -197,6 +223,10 @@ impl Tree {
     /// that fails is reported rather than swallowed: the caller promised the
     /// subtree is gone, and it is not.
     pub(crate) fn end(&self, child: &mut Child) -> Result<()> {
+        #[cfg(test)]
+        if self.fails {
+            anyhow::bail!("injected end failure");
+        }
         #[cfg(unix)]
         unsafe {
             let _ = libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
@@ -228,11 +258,46 @@ mod platform {
     }
 }
 
+/// Finding and resuming the one thread of a just-created process, behind a
+/// seam so the error-code handling can be exercised without a Windows box
+/// (Codex g1d R2).
+#[cfg(any(windows, test))]
+mod thread_resume {
+    use super::JobFailure;
+
+    /// The calls a resume is built from, each of which can fail on its own.
+    pub(super) trait ThreadApi {
+        type Thread;
+        /// The suspended process's only thread, or the stage that failed.
+        fn find(&self, pid: u32) -> Result<Self::Thread, JobFailure>;
+        /// Fails with the Win32 call's own name.
+        fn resume(&self, thread: &Self::Thread) -> Result<(), &'static str>;
+        /// The error code the last failing call left.
+        fn last_error(&self) -> Option<i32>;
+        fn close(&self, thread: Self::Thread);
+    }
+
+    /// Resume the thread `pid`'s process was created with.
+    ///
+    /// The error code is read *before* the handle is closed: `CloseHandle`
+    /// may replace it, and then the reported code would belong to the
+    /// cleanup rather than to `ResumeThread` (Codex g1d R2).
+    pub(super) fn resume<A: ThreadApi>(api: &A, pid: u32) -> Result<(), JobFailure> {
+        let thread = api.find(pid)?;
+        let resumed = api.resume(&thread);
+        let code = api.last_error();
+        api.close(thread);
+        resumed.map_err(|stage| JobFailure { stage, code })
+    }
+}
+
 #[cfg(windows)]
 mod platform {
-    use super::{JobFailure, Tree};
+    use super::{thread_resume, JobFailure, Tree};
     use std::process::Child;
-    use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
@@ -251,58 +316,90 @@ mod platform {
     }
 
     pub(super) fn resume(child: &Child) -> Result<(), JobFailure> {
-        let pid = child.id();
-        let tid = primary_thread(pid).ok_or_else(|| JobFailure {
-            stage: "CreateToolhelp32Snapshot",
-            code: last_error(),
-        })?;
-        // SAFETY: the handle is closed once, on every path below.
-        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, tid) };
-        if thread.is_null() {
-            return Err(JobFailure {
-                stage: "OpenThread",
-                code: last_error(),
-            });
-        }
-        let resumed = unsafe { ResumeThread(thread) };
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(thread) };
-        if resumed == u32::MAX {
-            return Err(JobFailure {
-                stage: "ResumeThread",
-                code: last_error(),
-            });
-        }
-        Ok(())
+        thread_resume::resume(&Win32Threads, child.id())
     }
 
-    /// The one thread a just-created process has. It is still suspended, so
-    /// nothing else can have resumed or replaced it.
-    fn primary_thread(pid: u32) -> Option<u32> {
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot == INVALID_HANDLE_VALUE {
-            return None;
-        }
-        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-        let mut found = None;
-        unsafe {
-            if Thread32First(snapshot, &mut entry) != 0 {
-                loop {
-                    if entry.th32OwnerProcessID == pid {
-                        found = Some(entry.th32ThreadID);
-                        break;
-                    }
-                    if Thread32Next(snapshot, &mut entry) == 0 {
-                        break;
+    struct Win32Threads;
+
+    impl thread_resume::ThreadApi for Win32Threads {
+        type Thread = HANDLE;
+
+        /// The one thread a just-created process has. It is still suspended,
+        /// so nothing else can have resumed or replaced it, and a thread
+        /// that cannot be listed, cannot be enumerated and is simply absent
+        /// are three different answers (Codex g1d R2).
+        fn find(&self, pid: u32) -> Result<HANDLE, JobFailure> {
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Err(JobFailure {
+                    stage: "CreateToolhelp32Snapshot",
+                    code: win_error(),
+                });
+            }
+            let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut found = None;
+            let mut failed = None;
+            unsafe {
+                if Thread32First(snapshot, &mut entry) == 0 {
+                    failed = Some("Thread32First");
+                } else {
+                    loop {
+                        if entry.th32OwnerProcessID == pid {
+                            found = Some(entry.th32ThreadID);
+                            break;
+                        }
+                        if Thread32Next(snapshot, &mut entry) == 0 {
+                            // Running out of entries is "no such thread";
+                            // any other code is the enumeration failing.
+                            if GetLastError() != ERROR_NO_MORE_FILES {
+                                failed = Some("Thread32Next");
+                            }
+                            break;
+                        }
                     }
                 }
+                // Read the code before the snapshot is closed: CloseHandle
+                // may replace it.
+                let code = failed.and_then(|_| win_error());
+                CloseHandle(snapshot);
+                if let Some(stage) = failed {
+                    return Err(JobFailure { stage, code });
+                }
             }
-            windows_sys::Win32::Foundation::CloseHandle(snapshot);
+            let Some(thread_id) = found else {
+                return Err(JobFailure {
+                    stage: "no thread for the new process",
+                    code: None,
+                });
+            };
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+            if thread.is_null() {
+                return Err(JobFailure {
+                    stage: "OpenThread",
+                    code: win_error(),
+                });
+            }
+            Ok(thread)
         }
-        found
+
+        fn resume(&self, thread: &HANDLE) -> Result<(), &'static str> {
+            if unsafe { ResumeThread(*thread) } == u32::MAX {
+                return Err("ResumeThread");
+            }
+            Ok(())
+        }
+
+        fn last_error(&self) -> Option<i32> {
+            win_error()
+        }
+
+        fn close(&self, thread: HANDLE) {
+            unsafe { CloseHandle(thread) };
+        }
     }
 
-    fn last_error() -> Option<i32> {
+    fn win_error() -> Option<i32> {
         Some(unsafe { GetLastError() } as i32)
     }
 }
@@ -412,6 +509,8 @@ impl Tree {
     fn contained(child: &Child) -> Result<Self, JobFailure> {
         Ok(Tree {
             job: Some(windows_job::Job::build(child)?),
+            #[cfg(test)]
+            fails: false,
         })
     }
 }
@@ -611,11 +710,123 @@ mod tests {
     fn conforming_tree(_child: &Child) -> Tree {
         #[cfg(windows)]
         {
-            Tree { job: None }
+            Tree {
+                job: None,
+                fails: false,
+            }
         }
         #[cfg(not(windows))]
         {
             Tree::unconstrained()
         }
+    }
+
+    /// A tree whose ending always fails, so the caller's reporting of a
+    /// termination error can be seen without a Windows job object.
+    fn failing_tree() -> Tree {
+        #[cfg(windows)]
+        {
+            Tree {
+                job: None,
+                fails: true,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Tree { fails: true }
+        }
+    }
+
+    /// A resume that fails the way `ResumeThread` does, and whose cleanup
+    /// then leaves a different error code behind. If the code is read after
+    /// `close`, this fixture reports 999 instead of 5 (Codex g1d R2).
+    struct FailsToResume {
+        code: Cell<Option<i32>>,
+    }
+
+    impl thread_resume::ThreadApi for FailsToResume {
+        type Thread = ();
+        fn find(&self, _pid: u32) -> Result<(), JobFailure> {
+            Ok(())
+        }
+        fn resume(&self, _thread: &()) -> Result<(), &'static str> {
+            self.code.set(Some(5));
+            Err("ResumeThread")
+        }
+        fn last_error(&self) -> Option<i32> {
+            self.code.get()
+        }
+        fn close(&self, _thread: ()) {
+            self.code.set(Some(999));
+        }
+    }
+
+    /// A resume whose thread cannot be found, at a named step.
+    struct CannotFind(&'static str);
+
+    impl thread_resume::ThreadApi for CannotFind {
+        type Thread = ();
+        fn find(&self, _pid: u32) -> Result<(), JobFailure> {
+            Err(JobFailure {
+                stage: self.0,
+                code: Some(87),
+            })
+        }
+        fn resume(&self, _thread: &()) -> Result<(), &'static str> {
+            unreachable!("nothing was found to resume")
+        }
+        fn last_error(&self) -> Option<i32> {
+            None
+        }
+        fn close(&self, _thread: ()) {}
+    }
+
+    #[test]
+    fn the_resume_failure_keeps_its_own_error_code() {
+        let api = FailsToResume {
+            code: Cell::new(None),
+        };
+        let failure = thread_resume::resume(&api, 42).unwrap_err();
+        assert_eq!(failure.stage, "ResumeThread");
+        assert_eq!(
+            failure.code,
+            Some(5),
+            "the code left behind by CloseHandle must not win"
+        );
+    }
+
+    #[test]
+    fn a_thread_that_cannot_be_found_names_the_step_that_failed() {
+        for stage in [
+            "CreateToolhelp32Snapshot",
+            "Thread32First",
+            "Thread32Next",
+            "OpenThread",
+            "no thread for the new process",
+        ] {
+            let failure = thread_resume::resume(&CannotFind(stage), 42).unwrap_err();
+            assert_eq!(failure.stage, stage);
+            assert_eq!(
+                failure.to_string(),
+                format!("{stage} failed (win32 error 87)")
+            );
+        }
+    }
+
+    #[test]
+    fn a_termination_failure_in_the_watchdog_is_reported() {
+        // The watchdog is the thread that really ends a timed-out child, and
+        // its error used to be dropped on the floor (Codex g1d R2). The
+        // child outlives the budget on its own, so the main path finds the
+        // child already taken and the failure can only come from the
+        // watchdog.
+        inject(|_child| Ok(failing_tree()));
+        let error =
+            run_shell_with_deadline("sleep 1", b"", Duration::from_millis(100)).unwrap_err();
+        clear();
+        assert!(
+            format!("{error:#}").contains("the timed-out tree could not be ended"),
+            "{error:#}"
+        );
     }
 }

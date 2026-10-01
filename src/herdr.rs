@@ -1387,12 +1387,21 @@ fn publish_pane_tokens_inner(
     .publishing(panes);
     let mut group_heads = space_group_heads(order, &grouping, &inventory, panes, tokens);
     let mut look = Look::installed(order, &grouping, &inventory, panes, tokens);
-    // One /proc sweep: the channel logo and each seat's own model files.
-    let channels = Some(crate::channel::scan());
+    // One /proc sweep: the channel logo and each seat's own model files. A
+    // system without /proc cannot read a seat's process at all, so there the
+    // declared roots are the only binding and every pane is answered — an
+    // undeclared one goes back to Unknown rather than keeping a model read
+    // under a rule that no longer exists (Codex g1d R1).
+    let channels = crate::channel::scan();
+    let roots = crate::seat_model::configured_roots().unwrap_or_default();
+    let evidence = if crate::channel::process_scan_available() {
+        crate::seat_model::SeatEvidence::Processes(&channels)
+    } else {
+        crate::seat_model::SeatEvidence::DeclaredRoots(&roots)
+    };
     let seat_models = crate::seat_model::resolve(
         panes,
-        channels.as_ref(),
-        crate::seat_model::configured_roots().as_ref(),
+        evidence,
         crate::cache::CacheStore::from_env()
             .ok()
             .map(|cache| cache.root().to_path_buf())
@@ -1424,7 +1433,7 @@ fn publish_pane_tokens_inner(
             order,
             &space_names,
         );
-        apply_logos(&mut desired, pane, look, channels.as_ref(), seat_model);
+        apply_logos(&mut desired, pane, look, Some(&channels), seat_model);
         apply_grouping(&mut desired, pane, &grouping, &space_names);
         apply_group_and_icon(
             &mut desired,
