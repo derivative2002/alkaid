@@ -718,207 +718,26 @@ fn read_rpc(output: &mut BufReader<impl std::io::Read>, expected_id: u64) -> Res
 /// — including a credential — and `message` is free text, so only a named
 /// code and a message stripped of credential-shaped runs is kept, and this
 /// string is what reaches the recorded diagnostic file (Codex g1c G2).
-fn safe_rpc_error(error: &Value) -> String {
-    // JSON-RPC 2.0 says `code` is an integer. A string code is upstream's
-    // free text like the message, and it is not quoted at all: a whitelist
-    // field name does not make a value trustworthy (Codex g1h G2).
-    let code = match error.get("code") {
-        Some(Value::Number(number)) if number.is_i64() || number.is_u64() => {
-            Some(number.to_string())
-        }
-        _ => None,
-    };
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .map(redact_secrets);
-    match (code, message) {
-        (Some(code), Some(message)) => format!("code {code}: {message}"),
-        (Some(code), None) => format!("code {code}"),
-        (None, Some(message)) => message,
-        // Nothing nameable: say only that, never the payload.
-        (None, None) => "an error with no code or message".to_string(),
-    }
-}
-
-const REDACTED: &str = "<redacted>";
-
-/// Names whose value is a credential wherever they appear, quoted or not,
-/// as `name=value`, `name: value`, `"name": "value"`. Matched without regard
-/// to case.
-const CREDENTIAL_PARAMETERS: [&str; 9] = [
-    "api_key",
-    "apikey",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "token",
-    "secret",
-    "password",
-    "authorization",
-];
-
-/// Authentication schemes: the word before the credential, not the credential.
-const AUTH_SCHEMES: [&str; 2] = ["Bearer", "Basic"];
-
-/// The end of a credential run: anything that cannot be part of one. Quotes
-/// end it too, so `api_key="value"` hides `value` and not the quote.
-fn is_value_end(character: char) -> bool {
-    character.is_whitespace()
-        || matches!(
-            character,
-            '&' | ',' | ';' | '"' | '\'' | ')' | '}' | ']' | '<' | '>' | '|'
-        )
-}
-
-fn is_uri_end(character: char) -> bool {
-    is_value_end(character) || character == '/'
-}
-
-/// Remove credential-shaped runs from free text.
+/// What is safe to quote from an app-server error: the stage, and the
+/// integer code JSON-RPC defines.
 ///
-/// Defence in depth rather than a proof: the projection above drops every
-/// field it did not name, and free upstream text is only quoted after passing
-/// through here. Every URI is handled, not just the first, and both the
-/// quoted and the header spellings are covered (Codex g1h G2).
-fn redact_secrets(text: &str) -> String {
-    let text = redact_uris(text);
-    let text = redact_auth_schemes(&text);
-    redact_parameters(&text)
-}
-
-/// `scheme://user:password@host` → `scheme://<redacted>@host`, for every URI
-/// in the text: a message can carry a plain endpoint and a credentialed
-/// proxy, or two credentialed ones.
-fn redact_uris(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while let Some(offset) = text[cursor..].find("://") {
-        let after = cursor + offset + "://".len();
-        out.push_str(&text[cursor..after]);
-        let tail = &text[after..];
-        let boundary = tail.find(is_uri_end).unwrap_or(tail.len());
-        cursor = match tail[..boundary].find('@') {
-            Some(at) => {
-                out.push_str(REDACTED);
-                out.push_str(&tail[at..boundary]);
-                after + boundary
-            }
-            // No userinfo here: keep this run and look for the next URI.
-            None => after,
-        };
-    }
-    out.push_str(&text[cursor..]);
-    out
-}
-
-/// `Bearer <token>` → `Bearer <redacted>`, for each authentication scheme.
-/// This runs before the parameter pass, which would otherwise hide the scheme
-/// word itself and leave the token behind.
-fn redact_auth_schemes(text: &str) -> String {
-    let mut out = text.to_string();
-    for scheme in AUTH_SCHEMES {
-        out = redact_after_word(&out, scheme, is_value_end);
-    }
-    out
-}
-
-/// Hide the run after every occurrence of `word`.
-fn redact_after_word(text: &str, word: &str, ends: fn(char) -> bool) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while let Some(offset) = text[cursor..].find(word) {
-        let start = cursor + offset;
-        let after = start + word.len();
-        let rest = &text[after..];
-        let spaced = rest.len().saturating_sub(rest.trim_start().len());
-        let value_at = after + spaced;
-        if spaced == 0 {
-            // Not a scheme followed by a credential.
-            out.push_str(&text[cursor..after]);
-            cursor = after;
-            continue;
+/// Nothing of upstream's own text. `data` may carry a credential, and
+/// `message` is free text whose credential shapes cannot be enumerated —
+/// three rounds of review each found more of them (a password may hold the
+/// sub-delimiters a URL allows, a quoted value may hold spaces, an
+/// authentication scheme is matched without regard to case). Rather than
+/// keep guessing at delimiters, the persistent diagnostic for an RPC failure
+/// is a fixed stage plus a validated integer code, and the message is not
+/// quoted at all (Codex g1i). The startup failure that matters most on
+/// Windows — the OS error under `start codex app-server` — does not come
+/// through here and keeps its whole chain.
+fn safe_rpc_error(error: &Value) -> String {
+    match error.get("code") {
+        Some(Value::Number(number)) if number.is_i64() || number.is_u64() => {
+            format!("code {number}")
         }
-        let tail = &text[value_at..];
-        let end = tail.find(ends).unwrap_or(tail.len());
-        out.push_str(&text[cursor..value_at]);
-        out.push_str(REDACTED);
-        cursor = value_at + end;
+        _ => "an error with no integer code".to_string(),
     }
-    out.push_str(&text[cursor..]);
-    out
-}
-
-/// Every credential parameter, one name at a time.
-fn redact_parameters(text: &str) -> String {
-    let mut text = text.to_string();
-    for name in CREDENTIAL_PARAMETERS {
-        text = redact_parameter(&text, name);
-    }
-    text
-}
-
-/// `name=value` → `name=<redacted>`, for one credential name, quoted or not.
-fn redact_parameter(text: &str, name: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for (start, _) in text.char_indices() {
-        if start < cursor {
-            continue;
-        }
-        // A quoted name, as in `{"api_key": "…"}`.
-        let name_at = if matches!(text[start..].chars().next(), Some('"') | Some('\'')) {
-            start + 1
-        } else {
-            start
-        };
-        let Some(candidate) = text.get(name_at..name_at + name.len()) else {
-            continue;
-        };
-        if !candidate.eq_ignore_ascii_case(name) {
-            continue;
-        }
-        // Only a name that is not part of a longer word counts.
-        if text[..start].chars().next_back().is_some_and(is_word) {
-            continue;
-        }
-        // After the name: an optional closing quote, spacing, then `=`/`:`.
-        let after = name_at + name.len();
-        let rest = &text[after..];
-        let quote = usize::from(matches!(rest.chars().next(), Some('"') | Some('\'')));
-        let spaced = rest[quote..]
-            .len()
-            .saturating_sub(rest[quote..].trim_start().len());
-        let separator_at = after + quote + spaced;
-        let Some(separator) = text[separator_at..].chars().next() else {
-            continue;
-        };
-        if separator != '=' && separator != ':' {
-            continue;
-        }
-        // The value may itself be quoted; either way the run ends at the
-        // first character that cannot be part of it.
-        let value_or_quote = separator_at + separator.len_utf8();
-        let trailer = &text[value_or_quote..];
-        let spaced = trailer.len() - trailer.trim_start().len();
-        let quoted_at = value_or_quote + spaced;
-        let value_at = quoted_at
-            + usize::from(matches!(
-                text[quoted_at..].chars().next(),
-                Some('"') | Some('\'')
-            ));
-        let value = &text[value_at..];
-        let end = value.find(is_value_end).unwrap_or(value.len());
-        out.push_str(&text[cursor..value_at]);
-        out.push_str(REDACTED);
-        cursor = value_at + end;
-    }
-    out.push_str(&text[cursor..]);
-    out
-}
-
-fn is_word(character: char) -> bool {
-    character.is_alphanumeric() || character == '_'
 }
 
 pub fn auth_path() -> Result<PathBuf> {
@@ -1139,21 +958,29 @@ done
         );
     }
 
-    #[test]
-    fn an_rpc_error_body_never_reaches_the_caller_verbatim() {
-        // Codex g1c G2: the error object is upstream's. Only a named code and
-        // a redacted message may be quoted, whatever `data` carries.
-        const SENTINEL: &str = "credential-sentinel-9f2c";
-        let script = format!(
+    /// Every hostile shape the three review rounds produced, in one error
+    /// frame, driven through the real RPC path.
+    const HOSTILE_MESSAGE: &str = "denied: GET https://api.example.com/v1 via https://user:pw@proxy.example.com, api_key=%s, Authorization: bearer %s, password=prefix %s end";
+    const SENTINEL: &str = "credential-sentinel-9f2c";
+
+    fn hostile_error_server() -> String {
+        format!(
             r#"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   [ -n "$id" ] || continue
-  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"denied: GET https://api.example.com/v1 via https://user:pw@proxy.example.com, api_key=%s, Authorization: Bearer %s","data":{{"access_token":"%s","nested":{{"refresh_token":"%s"}}}}}}}}\n' "$id" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}"
+  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"{HOSTILE_MESSAGE}","data":{{"access_token":"%s","nested":{{"refresh_token":"%s"}}}}}}}}\n' "$id" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}"
 done
 "#
-        );
-        let (mut input, mut output, child, tree) = contained_server(&script);
+        )
+    }
+
+    #[test]
+    fn an_rpc_error_body_never_reaches_the_caller_verbatim() {
+        // Codex g1i: upstream's message is not quoted at all. Three rounds
+        // found three more credential shapes each time, so the persistent
+        // diagnostic is the stage plus the integer code, and nothing else.
+        let (mut input, mut output, child, tree) = contained_server(&hostile_error_server());
         let error = request_quota(
             &mut input,
             &mut output,
@@ -1165,140 +992,95 @@ done
         .unwrap_err();
         let chain = format!("{error:#}");
         assert!(
-            chain.contains("Codex app-server request failed"),
-            "the stage must survive: {chain}"
+            chain.contains("Codex app-server request failed: code -32000"),
+            "the stage and the code must survive: {chain}"
         );
-        assert!(chain.contains("code -32000"), "{chain}");
         assert!(
             !chain.contains(SENTINEL),
             "a credential reached the caller: {chain}"
         );
         assert!(
-            !chain.contains("access_token") && !chain.contains("refresh_token"),
-            "the payload's own fields must not be quoted: {chain}"
-        );
-        assert!(
-            !chain.contains("user:pw@") && chain.contains(REDACTED),
-            "the URI userinfo must be redacted: {chain}"
-        );
-        assert!(
-            chain.contains("https://api.example.com/v1"),
-            "the readable part of the diagnosis must survive: {chain}"
-        );
-        assert!(
-            chain.contains("api_key=<redacted>"),
-            "the parameter's value must be hidden: {chain}"
-        );
-        assert!(
-            chain.contains("Authorization: <redacted> <redacted>"),
-            "the scheme word and its token must both be hidden: {chain}"
+            !chain.contains("denied")
+                && !chain.contains("access_token")
+                && !chain.contains("refresh_token")
+                && !chain.contains("user:pw@")
+                && !chain.contains("password"),
+            "no part of the message or the payload may be quoted: {chain}"
         );
     }
 
-    /// The shapes Codex g1h probed against the previous redactor. The first
-    /// seven used to keep the sentinel; the last three are the controls that
-    /// must stay readable (Codex g1h G2).
     #[test]
-    fn redaction_covers_every_shape_codex_g1h_probed() {
-        const S: &str = "sentinel-9f2c";
-        for (shape, input, expected) in [
-            (
-                "single_uri_control",
-                format!("GET https://user:pw@api.example.com/v1"),
-                format!("GET https://{REDACTED}@api.example.com/v1"),
-            ),
-            (
-                "plain_then_secret_uri",
-                format!("GET https://api.example.com/v1 via https://user:pw@proxy.example.com"),
-                format!("GET https://api.example.com/v1 via https://{REDACTED}@proxy.example.com"),
-            ),
-            (
-                "two_secret_uris",
-                format!("https://a:b@one.example.com https://c:d@two.example.com"),
-                format!("https://{REDACTED}@one.example.com https://{REDACTED}@two.example.com"),
-            ),
-            (
-                "quoted_equal",
-                format!("api_key=\"{S}\""),
-                format!("api_key=\"{REDACTED}\""),
-            ),
-            (
-                "quoted_json_key",
-                format!("{{\"api_key\": \"{S}\"}}"),
-                format!("{{\"api_key\": \"{REDACTED}\"}}"),
-            ),
-            (
-                "bearer_header",
-                format!("Authorization: Bearer {S}"),
-                format!("Authorization: {REDACTED} {REDACTED}"),
-            ),
-            (
-                "single_quoted",
-                format!("token='{S}'"),
-                format!("token='{REDACTED}'"),
-            ),
-            (
-                "parameter_control",
-                "token: value".to_string(),
-                format!("token: {REDACTED}"),
-            ),
-            (
-                "normal_url_control",
-                "GET https://api.example.com/v1/limits".to_string(),
-                "GET https://api.example.com/v1/limits".to_string(),
-            ),
+    fn an_error_message_is_never_quoted_however_it_is_shaped() {
+        // The boundary shapes Codex g1i listed, plus the empty and the very
+        // long message, all through the same projection.
+        let long = "x".repeat(4096);
+        for message in [
+            "",
+            " ",
+            "denied",
+            "user:prefix&sentinel@api.example.com",
+            "password=\"prefix sentinel\"",
+            "Authorization: bEaReR sentinel",
+            "Authorization: basic sentinel",
+            long.as_str(),
+            "https://user:prefix;sentinel@api.example.com/v1",
+            "https://user:prefix,sentinel@api.example.com/v1",
         ] {
-            let out = redact_secrets(&input);
-            assert_eq!(out, expected, "{shape}");
-            assert!(!out.contains(S), "{shape} kept the sentinel: {out}");
+            assert_eq!(
+                safe_rpc_error(&json!({"code": -32000, "message": message})),
+                "code -32000",
+                "{message}"
+            );
+            assert_eq!(
+                safe_rpc_error(&json!({"message": message})),
+                "an error with no integer code",
+                "{message}"
+            );
         }
     }
 
     #[test]
     fn a_string_code_is_not_quoted_but_an_integer_one_is() {
-        // Codex g1h G2: JSON-RPC's code is an integer, and a string code is
-        // upstream's free text like the message.
-        let sentinel = "sentinel-9f2c";
-        let projected = safe_rpc_error(&json!({"code": sentinel, "message": "denied"}));
-        assert_eq!(projected, "denied");
-        assert!(!projected.contains(sentinel));
+        // JSON-RPC's code is an integer, and a string code is upstream's free
+        // text like the message.
+        assert_eq!(
+            safe_rpc_error(&json!({"code": SENTINEL, "message": "denied"})),
+            "an error with no integer code"
+        );
         assert_eq!(
             safe_rpc_error(&json!({"code": -32000, "message": "denied"})),
-            "code -32000: denied"
+            "code -32000"
         );
         // An object code is as untrusted as a string one.
-        let projected = safe_rpc_error(&json!({"code": {"secret": sentinel}, "message": "denied"}));
-        assert_eq!(projected, "denied");
+        assert_eq!(
+            safe_rpc_error(&json!({"code": {"secret": SENTINEL}, "message": "denied"})),
+            "an error with no integer code"
+        );
+        // A float is not JSON-RPC's error code either.
+        assert_eq!(
+            safe_rpc_error(&json!({"code": -32000.5, "message": "denied"})),
+            "an error with no integer code"
+        );
     }
 
     #[test]
     fn redaction_keeps_what_can_be_read_and_hides_what_cannot() {
-        for (input, expected) in [
-            (
-                "denied: GET https://user:pw@api.example.com/v1?api_key=abc",
-                "denied: GET https://<redacted>@api.example.com/v1?api_key=<redacted>",
-            ),
-            ("token: sk-abc", "token: <redacted>"),
-            (
-                "no credentials in this sentence",
-                "no credentials in this sentence",
-            ),
-            (
-                "a plain https://api.example.com/v1/limits is left alone",
-                "a plain https://api.example.com/v1/limits is left alone",
-            ),
-            // A name that is part of a longer word is not a credential name.
-            ("my_token=abc is mine", "my_token=abc is mine"),
-        ] {
-            assert_eq!(redact_secrets(input), expected, "{input}");
-        }
+        // Kept as the positive control for the shapes that are ordinary
+        // text: nothing here is quoted from upstream any more, so a message
+        // that is only words changes nothing.
+        assert_eq!(
+            safe_rpc_error(&json!({"code": -32000, "message": "no credentials in this sentence"})),
+            "code -32000"
+        );
     }
 
     #[test]
     fn an_error_without_a_nameable_part_does_not_quote_the_payload() {
+        // Nothing nameable: the diagnostic is still just the fixed phrase,
+        // and the payload is never quoted.
         let error = json!({"data": {"secret": "credential-sentinel-9f2c"}});
         let projected = safe_rpc_error(&error);
-        assert_eq!(projected, "an error with no code or message");
+        assert_eq!(projected, "an error with no integer code");
         assert!(!projected.contains("credential-sentinel"));
     }
 
