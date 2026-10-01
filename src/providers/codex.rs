@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -199,22 +199,32 @@ fn request_quota(
     // tree ended, so the failure has to be kept somewhere both threads can
     // reach (Codex g1e).
     let end_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let (cancel, cancelled) = mpsc::channel();
     let watchdog = Arc::clone(&child);
     let watchdog_end_failure = Arc::clone(&end_failure);
-    thread::spawn(move || {
-        thread::sleep(timeout);
-        if let Err(error) = terminate(&watchdog) {
-            let mut slot = watchdog_end_failure
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            *slot = Some(format!(
-                "the timed-out codex app-server could not be ended: {error:#}"
-            ));
+    let watchdog = thread::spawn(move || {
+        // Sixty seconds of sleeping would be joined below, so the main
+        // thread cancels this once it has taken the child itself: the join
+        // then waits only for a watchdog that has actually timed out
+        // (Codex g1f).
+        if cancelled.recv_timeout(timeout).is_err() {
+            if let Err(error) = terminate(&watchdog) {
+                let mut slot = watchdog_end_failure
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *slot = Some(format!(
+                    "the timed-out codex app-server could not be ended: {error:#}"
+                ));
+            }
         }
     });
 
     let fetched = fetch_from_process(input, output, session_ids);
     let ended = terminate(&child);
+    let _ = cancel.send(());
+    // Read the slot only after the watchdog is done: otherwise a failure it
+    // is still recording could be missed (Codex g1f).
+    let _ = watchdog.join();
     let timed_out_without_ending = end_failure
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -786,7 +796,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A child running `command`, contained the way a real app-server is.
+    /// A child running `command`, contained the way a real app-server is:
+    /// its own process group on Unix (`setpgid`, as both production callers
+    /// do) so the group kill is really exercised, and a job object on
+    /// Windows (Codex g1f).
     fn contained_server(
         command: &str,
     ) -> (
@@ -801,6 +814,15 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(unix)]
+        unsafe {
+            server.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let (mut child, tree) = crate::process::spawn_constrained(&mut server).unwrap();
         let input = child.stdin.take().unwrap();
         let output = BufReader::new(child.stdout.take().unwrap());
@@ -874,17 +896,38 @@ while IFS= read -r line; do
 done
 "#;
         let (mut input, mut output, child, tree) = contained_server(script);
-        let snapshot = request_quota(
+        // `request_quota` reads the account from the credential root, so the
+        // test must not run against the real one: both variables point into
+        // a temporary directory for as long as it runs (Codex g1f).
+        let root = tempfile::tempdir().unwrap();
+        let _guard = crate::providers::test_support::env_guard();
+        let previous_auth = std::env::var_os("CODEX_AUTH_FILE");
+        let previous_home = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_AUTH_FILE", root.path().join("auth.json"));
+        std::env::set_var("CODEX_HOME", root.path());
+        let fetched = request_quota(
             &mut input,
             &mut output,
             child,
             tree,
             Duration::from_secs(5),
             &[],
-        )
-        .unwrap();
+        );
+        match previous_auth {
+            Some(value) => std::env::set_var("CODEX_AUTH_FILE", value),
+            None => std::env::remove_var("CODEX_AUTH_FILE"),
+        }
+        match previous_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        let snapshot = fetched.unwrap();
         assert!(snapshot.window(WindowKind::FiveHour).is_some());
         assert!(snapshot.window(WindowKind::Weekly).is_some());
+        assert!(
+            snapshot.account_id.is_none(),
+            "the test must not pick up the machine's real account"
+        );
     }
 
     #[test]
