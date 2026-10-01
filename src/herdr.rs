@@ -839,6 +839,14 @@ pub fn clear_quota_agent_view() -> Result<()> {
 ///
 /// Outside Herdr there is no socket and this is a no-op, exactly like
 /// [`crate::prefs::write`], so a direct CLI run still works.
+///
+/// **Limited entry, not a transport.** Every caller is a finite one — the
+/// `agent.view.set` and `agent.view.clear` of `configure`, `startup` and
+/// `toggle-order` — so at most a handful of exchanges happen per process, and
+/// the per-platform timeout handling is sized for that. The watch loop and
+/// the event paths do not come through here. A caller inside a long-lived
+/// process or a loop needs the bounded or cancellable I/O described on
+/// [`socket_exchange`] first (Codex g1 S2).
 fn socket_request(payload: &Value) -> Result<Option<Value>> {
     let Some(path) = std::env::var_os("HERDR_SOCKET_PATH") else {
         return Ok(None);
@@ -879,8 +887,19 @@ fn socket_exchange(path: &std::ffi::OsStr, request: &str) -> Result<String> {
 /// On Windows Herdr listens on a named pipe: `HERDR_SOCKET_PATH` holds the
 /// path form, and the pipe is `\\.\pipe\<that path>` (measured 1001 on
 /// herdr 0.9.1). A pipe opened as a file has no I/O timeout, so the exchange
-/// runs on a helper thread bounded by [`SOCKET_TIMEOUT`]; a stuck pipe leaves
-/// that thread behind for the life of this short-lived process.
+/// runs on a helper thread bounded by [`SOCKET_TIMEOUT`].
+///
+/// The bound is on the *wait*, not on the I/O: `recv_timeout` gives up on the
+/// reply while the thread stays in `open`/`write`/`read` with its handle
+/// until this process exits, and nothing here cancels that (a synchronous
+/// pipe read may block for ever; cancelling it is a race of its own).
+///
+/// That is acceptable only for the finite entries this has — see
+/// [`socket_request`] — and not as a general transport. Moved into a
+/// long-lived hook or a loop it would accumulate a thread per timeout, and a
+/// timed-out exchange could still complete later and write a reply nobody is
+/// waiting for; that would need a bounded worker or cancellable I/O first
+/// (Codex g1 S2).
 #[cfg(windows)]
 fn socket_exchange(path: &std::ffi::OsStr, request: &str) -> Result<String> {
     use std::io::{BufRead, BufReader, Write};
