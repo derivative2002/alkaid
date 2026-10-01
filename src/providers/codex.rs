@@ -187,16 +187,22 @@ const WINDOWS_CODEX_NAMES: [&str; 2] = ["codex.exe", "codex.cmd"];
 fn codex_executable() -> Result<PathBuf> {
     let configured = std::env::var_os("CODEX_BIN_PATH");
     let search = std::env::var_os("PATH");
-    // A relative PATH entry is resolved against the current directory, which
-    // is what Windows does with one.
+    // What a relative entry is resolved against: the current directory, and
+    // the current directory Windows keeps per drive.
     let base = std::env::current_dir()
         .ok()
         .and_then(|base| base.to_str().map(str::to_string));
+    let drive_cwd = |drive: char| {
+        std::env::var(format!("={drive}:"))
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
     resolve_codex(
         configured.as_deref(),
         search.as_deref(),
         cfg!(windows),
         base.as_deref(),
+        &drive_cwd,
         |path| path.is_file(),
     )
 }
@@ -206,15 +212,17 @@ fn codex_executable() -> Result<PathBuf> {
 /// [`WINDOWS_CODEX_NAMES`] found is used by its absolute path — a `.cmd` is
 /// handed to Rust's own batch-file handling, and the arguments passed to it
 /// are ours, carrying no user input. Elsewhere the bare name is kept: it is
-/// what a shell has always resolved.
+/// what `Command` has always resolved through the PATH.
 ///
-/// Pure in its inputs so the search can be tested on any platform: `search`
-/// is a PATH value, `exists` answers whether a candidate is a file.
+/// Pure in its inputs so the search can be tested on any host: `search` is a
+/// PATH value, `base` the current directory, `drive_cwd` a drive's own
+/// current directory, and `exists` answers whether a candidate is a file.
 fn resolve_codex(
     configured: Option<&OsStr>,
     search: Option<&OsStr>,
     windows: bool,
     base: Option<&str>,
+    drive_cwd: &dyn Fn(char) -> Option<String>,
     exists: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf> {
     if let Some(configured) = configured.filter(|value| !value.is_empty()) {
@@ -223,31 +231,51 @@ fn resolve_codex(
     if !windows {
         return Ok(PathBuf::from(UNIX_CODEX_NAME));
     }
-    let mut directories = Vec::new();
     let named = search
         .map(|search| windows_path_directories(&search.to_string_lossy()))
         .unwrap_or_default();
-    for directory in named {
-        if windows_absolute(&directory) {
-            directories.push(directory);
-        } else if let Some(base) = base.filter(|base| windows_absolute(base)) {
-            // Windows resolves a relative entry against the current
-            // directory. Doing it here is what keeps the promise that the
-            // program handed to `Command` is an absolute path (Codex g1k).
-            // A leading `.\` names that directory itself; anything else,
-            // `..\` included, is left for Windows to make sense of.
-            let relative = directory
-                .strip_prefix(".\\")
-                .or_else(|| directory.strip_prefix("./"))
-                .unwrap_or(directory.as_str());
-            directories.push(if relative.is_empty() || relative == "." {
-                base.to_string()
-            } else {
-                join_windows(base, relative)
-            });
+    let mut directories = Vec::new();
+    for entry in named {
+        match classify_entry(&entry) {
+            Entry::Absolute(directory) => directories.push(directory),
+            // `\bin` is `bin` under the root of the current directory's
+            // drive, not a directory called `bin` beside it.
+            Entry::RootRelative(directory) => {
+                if let Some(drive) = base.and_then(drive_of) {
+                    directories.push(format!("{drive}:{directory}"));
+                }
+            }
+            // `C:bin` is `bin` under that drive's own current directory.
+            // Windows keeps one per drive; with none to read, the entry is
+            // dropped rather than guessed at (Codex g1l).
+            Entry::DriveRelative(drive, rest) => {
+                if let Some(current) = drive_cwd(drive) {
+                    directories.push(if rest.is_empty() {
+                        current
+                    } else {
+                        join_windows(&current, &rest)
+                    });
+                }
+            }
+            Entry::Relative(directory) => {
+                if let Some(base) = base.filter(|base| windows_absolute(base)) {
+                    // A leading `.\` names that directory itself; anything
+                    // else, `..\` included, is left for Windows to make
+                    // sense of.
+                    let relative = directory
+                        .strip_prefix(".\\")
+                        .or_else(|| directory.strip_prefix("./"))
+                        .unwrap_or(directory.as_str());
+                    directories.push(if relative.is_empty() || relative == "." {
+                        base.to_string()
+                    } else {
+                        join_windows(base, relative)
+                    });
+                }
+                // With no absolute base to resolve against, a relative entry
+                // is dropped rather than handed over as a relative program.
+            }
         }
-        // With no absolute base to resolve against, a relative entry is
-        // dropped rather than handed over as a relative program.
     }
     for name in WINDOWS_CODEX_NAMES {
         for directory in &directories {
@@ -269,6 +297,49 @@ fn resolve_codex(
             directories.join("; ")
         }
     )
+}
+
+/// Where a Windows PATH entry points, by Windows' own rules.
+enum Entry {
+    /// `C:\bin`, `\\server\share`.
+    Absolute(String),
+    /// `\bin`: the root of whatever drive the current directory is on.
+    RootRelative(String),
+    /// `C:bin`: the current directory of drive `C`.
+    DriveRelative(char, String),
+    /// `bin`, `.`, `..\bin`: the current directory itself.
+    Relative(String),
+}
+
+fn classify_entry(entry: &str) -> Entry {
+    let bytes = entry.as_bytes();
+    if entry.starts_with("\\\\") {
+        return Entry::Absolute(entry.to_string());
+    }
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        return Entry::Absolute(entry.to_string());
+    }
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Entry::DriveRelative(
+            bytes[0].to_ascii_uppercase() as char,
+            entry[2..].to_string(),
+        );
+    }
+    if entry.starts_with(['\\', '/']) {
+        return Entry::RootRelative(entry.to_string());
+    }
+    Entry::Relative(entry.to_string())
+}
+
+/// The drive a path names, if it names one.
+fn drive_of(path: &str) -> Option<char> {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        .then(|| bytes[0].to_ascii_uppercase() as char)
 }
 
 /// The directories a Windows PATH names, in order.
@@ -1100,9 +1171,34 @@ done
     }
 
     fn resolve_with_base(held: &[&str], path: &str, base: Option<&str>) -> Result<PathBuf> {
-        resolve_codex(None, Some(OsStr::new(path)), true, base, |candidate| {
-            held.contains(&windows_shaped(candidate).as_str())
-        })
+        let no_drive_cwd = |_: char| None;
+        resolve_codex(
+            None,
+            Some(OsStr::new(path)),
+            true,
+            base,
+            &no_drive_cwd,
+            |candidate| held.contains(&windows_shaped(candidate).as_str()),
+        )
+    }
+
+    /// The same, with a drive's own current directory supplied — what a
+    /// `C:bin` entry needs.
+    fn resolve_with_drive_cwd(
+        held: &[&str],
+        path: &str,
+        drive: char,
+        cwd: &str,
+    ) -> Result<PathBuf> {
+        let drive_cwd = |wanted: char| (wanted == drive).then(|| cwd.to_string());
+        resolve_codex(
+            None,
+            Some(OsStr::new(path)),
+            true,
+            Some("C:\\work"),
+            &drive_cwd,
+            |candidate| held.contains(&windows_shaped(candidate).as_str()),
+        )
     }
 
     fn windows_shaped(path: &Path) -> String {
@@ -1166,6 +1262,58 @@ done
     }
 
     #[test]
+    fn a_root_relative_entry_is_the_current_drives_root() {
+        // `\\bin` is `bin` under the root of whatever drive the current
+        // directory is on, not a directory beside it (Codex g1l).
+        assert_eq!(
+            absolute(&["C:\\bin\\codex.exe"], "\\bin"),
+            "C:\\bin\\codex.exe"
+        );
+        assert_eq!(
+            absolute(&["C:\\bin\\codex.cmd"], "\\bin"),
+            "C:\\bin\\codex.cmd"
+        );
+        // No drive to take from the current directory: dropped, not guessed.
+        let error = resolve_with_base(&["C:\\bin\\codex.exe"], "\\bin", None).unwrap_err();
+        assert!(
+            error.to_string().contains("no absolute directory on PATH"),
+            "{error}"
+        );
+        let error =
+            resolve_with_base(&["codex.exe"], "\\bin", Some("\\\\server\\share")).unwrap_err();
+        assert!(
+            error.to_string().contains("no absolute directory on PATH"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_drive_relative_entry_uses_that_drives_own_current_directory() {
+        // `C:bin` is `bin` under drive C's current directory, which Windows
+        // keeps per drive.
+        assert_eq!(
+            windows_shaped(
+                &resolve_with_drive_cwd(&["D:\\work\\bin\\codex.exe"], "D:bin", 'D', "D:\\work")
+                    .unwrap()
+            ),
+            "D:\\work\\bin\\codex.exe"
+        );
+        // Nothing to read it from: dropped rather than guessed at.
+        let error = resolve_with_base(&["C:\\work\\bin\\codex.exe"], "C:bin", None).unwrap_err();
+        assert!(
+            error.to_string().contains("no absolute directory on PATH"),
+            "{error}"
+        );
+        // Another drive's current directory is not the one the entry needs.
+        let error = resolve_with_drive_cwd(&["C:\\work\\bin\\codex.exe"], "C:bin", 'D', "D:\\work")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no absolute directory on PATH"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_quoted_windows_path_entry_is_read_by_windows_rules() {
         // Codex g1k: quotes delimit an entry, and a `;` inside them is part
         // of the directory rather than a separator.
@@ -1205,9 +1353,15 @@ done
     #[test]
     fn an_empty_path_names_no_directory() {
         for search in [None, Some(""), Some(";;")] {
-            let error = resolve_codex(None, search.map(OsStr::new), true, Some("C:\\work"), |_| {
-                unreachable!("nothing can be found without a directory")
-            })
+            let no_drive_cwd = |_: char| None;
+            let error = resolve_codex(
+                None,
+                search.map(OsStr::new),
+                true,
+                Some("C:\\work"),
+                &no_drive_cwd,
+                |_| unreachable!("nothing can be found without a directory"),
+            )
             .unwrap_err();
             assert!(
                 error.to_string().contains("no absolute directory on PATH"),
@@ -1226,18 +1380,27 @@ done
                 None,
                 true,
                 None,
+                &|_: char| unreachable!("an explicit path is not searched for"),
                 |_| unreachable!("an explicit path is not searched for")
             )
             .unwrap(),
             PathBuf::from("/opt/codex")
         );
         assert_eq!(
-            resolve_codex(None, None, false, None, |_| unreachable!()).unwrap(),
+            resolve_codex(None, None, false, None, &|_: char| None, |_| unreachable!()).unwrap(),
             PathBuf::from("codex")
         );
         // An empty value is the same as none: it names nothing.
         assert_eq!(
-            resolve_codex(Some(OsStr::new("")), None, false, None, |_| unreachable!()).unwrap(),
+            resolve_codex(
+                Some(OsStr::new("")),
+                None,
+                false,
+                None,
+                &|_: char| None,
+                |_| unreachable!()
+            )
+            .unwrap(),
             PathBuf::from("codex")
         );
     }
