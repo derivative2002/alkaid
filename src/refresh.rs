@@ -954,6 +954,15 @@ fn refresh_provider(
     }
 }
 
+/// Drive one Codex refresh against whatever `CODEX_BIN_PATH` names.
+///
+/// The redaction test in the codex module has to read the recorded
+/// diagnostic file back, so it needs the real refresh path, not the seam.
+#[cfg(test)]
+pub(crate) fn refresh_codex_for_test(cache: &CacheStore) -> ProviderOutcome {
+    refresh_provider(cache, Provider::Codex, true, &[]).expect("the refresh itself must not fail")
+}
+
 /// Fetch one provider's snapshot.
 ///
 /// Behind a seam so the failure branches around it — a state directory that

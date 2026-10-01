@@ -706,10 +706,140 @@ fn read_rpc(output: &mut BufReader<impl std::io::Read>, expected_id: u64) -> Res
             continue;
         }
         if let Some(error) = value.get("error") {
-            anyhow::bail!("Codex app-server request failed: {error}");
+            anyhow::bail!("Codex app-server request failed: {}", safe_rpc_error(error));
         }
         return Ok(value);
     }
+}
+
+/// What is safe to quote from an app-server error.
+///
+/// `error` is upstream's object. `data` may carry anything the service chose
+/// — including a credential — and `message` is free text, so only a named
+/// code and a message stripped of credential-shaped runs is kept, and this
+/// string is what reaches the recorded diagnostic file (Codex g1c G2).
+fn safe_rpc_error(error: &Value) -> String {
+    let code = error.get("code").and_then(|code| match code {
+        Value::Number(number) => Some(number.to_string()),
+        Value::String(text) => Some(redact_secrets(text)),
+        _ => None,
+    });
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(redact_secrets);
+    match (code, message) {
+        (Some(code), Some(message)) => format!("code {code}: {message}"),
+        (Some(code), None) => format!("code {code}"),
+        (None, Some(message)) => message,
+        // Nothing nameable: say only that, never the payload.
+        (None, None) => "an error with no code or message".to_string(),
+    }
+}
+
+const REDACTED: &str = "<redacted>";
+
+/// Names whose value is a credential wherever they appear as `name=value`
+/// or `name: value`. Matched without regard to case.
+const CREDENTIAL_PARAMETERS: [&str; 9] = [
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "token",
+    "secret",
+    "password",
+    "authorization",
+];
+
+/// The end of a credential run: anything that cannot be part of one.
+fn is_value_end(character: char) -> bool {
+    character.is_whitespace() || matches!(character, '&' | ',' | ';' | '"' | '\'' | ')' | '}' | ']')
+}
+
+/// Remove credential-shaped runs from free text.
+///
+/// Defence in depth rather than a proof: the projection above already drops
+/// every field it did not name, and free upstream text is only quoted after
+/// passing through here. `scheme://user:password@host` keeps the host, and a
+/// named credential keeps its name but not its value (Codex g1c G2).
+fn redact_secrets(text: &str) -> String {
+    let mut text = redact_userinfo(text);
+    for name in CREDENTIAL_PARAMETERS {
+        text = redact_parameter(&text, name);
+    }
+    text
+}
+
+/// `scheme://user:password@host` → `scheme://<redacted>@host`, for the first
+/// URL in the text. A userinfo run is what sits between `://` and the first
+/// `@` before any `/` or space.
+fn redact_userinfo(text: &str) -> String {
+    let Some(scheme) = text.find("://") else {
+        return text.to_string();
+    };
+    let after = scheme + "://".len();
+    let tail = &text[after..];
+    let boundary = tail
+        .find(|character: char| character == '/' || character.is_whitespace())
+        .unwrap_or(tail.len());
+    let Some(at) = tail[..boundary].find('@') else {
+        return text.to_string();
+    };
+    format!("{}{}{}", &text[..after], REDACTED, &tail[at..])
+}
+
+/// `name=value` → `name=<redacted>`, for one credential name.
+fn redact_parameter(text: &str, name: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, _) in text.char_indices() {
+        if start < cursor {
+            continue;
+        }
+        let Some(candidate) = text.get(start..start + name.len()) else {
+            continue;
+        };
+        if !candidate.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        // Only a name that is not part of a longer word counts.
+        if text[..start].chars().next_back().is_some_and(is_word) {
+            continue;
+        }
+        let after = start + name.len();
+        let mut value_at = None;
+        for (offset, character) in text[after..].char_indices() {
+            if character.is_whitespace() {
+                continue;
+            }
+            if character == '=' || character == ':' {
+                value_at = Some(after + offset + character.len_utf8());
+            }
+            break;
+        }
+        let Some(after_separator) = value_at else {
+            continue;
+        };
+        // `name: value` is as common as `name=value`, and the run to hide
+        // starts after the spacing, not at the separator.
+        let value_at = after_separator
+            + text[after_separator..]
+                .len()
+                .saturating_sub(text[after_separator..].trim_start().len());
+        let tail = &text[value_at..];
+        let end = tail.find(is_value_end).unwrap_or(tail.len());
+        out.push_str(&text[cursor..value_at]);
+        out.push_str(REDACTED);
+        cursor = value_at + end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn is_word(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
 }
 
 pub fn auth_path() -> Result<PathBuf> {
@@ -927,6 +1057,144 @@ done
         assert!(
             snapshot.account_id.is_none(),
             "the test must not pick up the machine's real account"
+        );
+    }
+
+    #[test]
+    fn an_rpc_error_body_never_reaches_the_caller_verbatim() {
+        // Codex g1c G2: the error object is upstream's. Only a named code and
+        // a redacted message may be quoted, whatever `data` carries.
+        const SENTINEL: &str = "credential-sentinel-9f2c";
+        let script = format!(
+            r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"denied: GET https://user:pw@api.example.com/v1/limits?api_key=%s","data":{{"access_token":"%s","nested":{{"refresh_token":"%s"}}}}}}}}\n' "$id" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}"
+done
+"#
+        );
+        let (mut input, mut output, child, tree) = contained_server(&script);
+        let error = request_quota(
+            &mut input,
+            &mut output,
+            child,
+            tree,
+            Duration::from_secs(5),
+            &[],
+        )
+        .unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("Codex app-server request failed"),
+            "the stage must survive: {chain}"
+        );
+        assert!(chain.contains("code -32000"), "{chain}");
+        assert!(
+            !chain.contains(SENTINEL),
+            "a credential reached the caller: {chain}"
+        );
+        assert!(
+            !chain.contains("access_token") && !chain.contains("refresh_token"),
+            "the payload's own fields must not be quoted: {chain}"
+        );
+        assert!(
+            !chain.contains("user:pw@") && chain.contains(REDACTED),
+            "the URI userinfo must be redacted: {chain}"
+        );
+    }
+
+    #[test]
+    fn redaction_keeps_what_can_be_read_and_hides_what_cannot() {
+        for (input, expected) in [
+            (
+                "denied: GET https://user:pw@api.example.com/v1?api_key=abc",
+                "denied: GET https://<redacted>@api.example.com/v1?api_key=<redacted>",
+            ),
+            ("token: sk-abc", "token: <redacted>"),
+            (
+                "no credentials in this sentence",
+                "no credentials in this sentence",
+            ),
+            (
+                "a plain https://api.example.com/v1/limits is left alone",
+                "a plain https://api.example.com/v1/limits is left alone",
+            ),
+            // A name that is part of a longer word is not a credential name.
+            ("my_token=abc is mine", "my_token=abc is mine"),
+        ] {
+            assert_eq!(redact_secrets(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn an_error_without_a_nameable_part_does_not_quote_the_payload() {
+        let error = json!({"data": {"secret": "credential-sentinel-9f2c"}});
+        let projected = safe_rpc_error(&error);
+        assert_eq!(projected, "an error with no code or message");
+        assert!(!projected.contains("credential-sentinel"));
+    }
+
+    /// The recorded diagnostic file is written from whatever the fetch
+    /// returned, so the redaction above has to be where the text is made:
+    /// this drives the real refresh path with a real app-server stub and
+    /// reads the file back.
+    #[cfg(unix)]
+    #[test]
+    fn the_recorded_diagnostic_never_holds_a_credential_from_an_rpc_error() {
+        use std::io::Write;
+        const SENTINEL: &str = "credential-sentinel-9f2c";
+        let directory = tempfile::tempdir().unwrap();
+        let stub = directory.path().join("codex-stub");
+        let mut file = std::fs::File::create(&stub).unwrap();
+        writeln!(
+            file,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"denied","data":{{"access_token":"{SENTINEL}"}}}}}}\n' "$id"
+done"#
+        )
+        .unwrap();
+        drop(file);
+        let mut permissions = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&stub, permissions).unwrap();
+
+        let cache = crate::cache::CacheStore::new(directory.path().join("state"));
+        let _guard = crate::providers::test_support::env_guard();
+        let previous_bin = std::env::var_os("CODEX_BIN_PATH");
+        let previous_home = std::env::var_os("CODEX_HOME");
+        let previous_auth = std::env::var_os("CODEX_AUTH_FILE");
+        std::env::set_var("CODEX_BIN_PATH", &stub);
+        std::env::set_var("CODEX_HOME", directory.path().join("codex-home"));
+        std::env::set_var(
+            "CODEX_AUTH_FILE",
+            directory.path().join("codex-home/auth.json"),
+        );
+        let outcome = crate::refresh::refresh_codex_for_test(&cache);
+        for (name, previous) in [
+            ("CODEX_BIN_PATH", previous_bin),
+            ("CODEX_HOME", previous_home),
+            ("CODEX_AUTH_FILE", previous_auth),
+        ] {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let error = outcome.error.expect("the fetch must have failed");
+        assert!(!error.contains(SENTINEL), "{error}");
+        let recorded =
+            std::fs::read_to_string(cache.root().join("codex-app-server.error.json")).unwrap();
+        assert!(
+            recorded.contains("Codex app-server request failed"),
+            "{recorded}"
+        );
+        assert!(
+            !recorded.contains(SENTINEL),
+            "a credential reached the file: {recorded}"
         );
     }
 
