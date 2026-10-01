@@ -4,6 +4,10 @@
 //! `sh` stubs, and these ran on Windows too until they were moved out of it
 //! (Codex g1 S3).
 
+mod common;
+
+use common::*;
+use herdr_agent_quota::cli::AgentOrder;
 use herdr_agent_quota::configure::herdr::{add_quota_row, remove_quota_row};
 
 #[test]
@@ -380,4 +384,283 @@ fn sidebar_configuration_migrates_the_plugin_owned_gap_to_separated_panes() {
     let applied = add_quota_row(original).unwrap();
     assert!(applied.contains("row_gap = 1 # herdr-agent-quota"));
     assert!(!applied.contains("row_gap = 0"));
+}
+
+#[test]
+fn the_attention_rows_lead_with_the_action_state_and_keep_every_quota_row() {
+    let attention = managed_rows(&attention_rows(""));
+    let grouped = managed_rows(&grouped_rows(""));
+    // DESIGN-r3 head row: action state first, then the brand icon, the Space
+    // and the Tab — the Space name has no `$quota_group` header to live in.
+    assert_eq!(
+        attention[0],
+        [
+            "state_text",
+            "$quota_icon",
+            "$quota_icon_working",
+            "$quota_icon_done",
+            "workspace",
+            "tab"
+        ]
+    );
+    assert_eq!(attention[1], ["agent"]);
+    assert!(attention
+        .iter()
+        .flatten()
+        .all(|token| token != "$quota_group"));
+    // Everything below the identity rows is the grouped layout, row for row:
+    // switching order must not drop or reorder a quota row.
+    assert_eq!(grouped[0], ["$quota_group"]);
+    assert_eq!(attention[1..], grouped[2..]);
+}
+
+#[test]
+fn attention_rows_are_idempotent_and_switch_cleanly_both_ways() {
+    let attention = attention_rows("");
+    assert_eq!(attention_rows(&attention), attention);
+    assert_eq!(grouped_rows(&attention), grouped_rows(""));
+    assert_eq!(attention_rows(&grouped_rows("")), attention);
+}
+
+#[test]
+fn attention_rows_uninstall_to_herdr_stock_rows() {
+    let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
+    let applied = attention_rows(original);
+    assert!(applied.contains("state_text"), "{applied}");
+    let removed = remove_quota_row(&applied).unwrap();
+    assert!(!removed.contains("state_text"), "{removed}");
+    assert!(!removed.contains("$quota"), "{removed}");
+    assert_eq!(
+        removed,
+        "[ui]\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
+    );
+}
+
+#[test]
+fn attention_rows_keep_a_user_row_through_install_switch_and_uninstall() {
+    // A customised base layout is never taken over: the plugin's rows go to
+    // `rows_by_agent` and the user's rows stay exactly as written.
+    let original =
+        "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"], [\"terminal_title\"]]\n";
+    let applied = attention_rows(original);
+    assert_eq!(
+        managed_rows(&applied),
+        [vec!["state_icon", "agent"], vec!["terminal_title"]]
+    );
+    let document = applied.parse::<toml_edit::DocumentMut>().unwrap();
+    let claude = document["ui"]["sidebar"]["agents"]["rows_by_agent"]["claude"]
+        .as_array()
+        .unwrap();
+    let first = claude.get(0).unwrap().as_array().unwrap();
+    assert_eq!(first.iter().find_map(configured_token), Some("state_text"));
+    assert_eq!(attention_rows(&applied), applied);
+    let switched = grouped_rows(&applied);
+    assert!(!switched.contains("state_text"), "{switched}");
+    assert!(switched.contains("terminal_title"), "{switched}");
+    let removed = remove_quota_row(&applied).unwrap();
+    assert!(removed.contains("terminal_title"), "{removed}");
+    assert!(!removed.contains("state_text"), "{removed}");
+}
+
+#[test]
+fn identity_rows_show_who_each_seat_is_and_no_usage() {
+    use herdr_agent_quota::cli::AgentOrder;
+    let rows = managed_rows(&identity_rows("", AgentOrder::Quota));
+    assert_eq!(
+        rows,
+        [
+            vec!["$quota_group"],
+            // No state text: the harness icon's colour is the state (0927).
+            // Each seat row opens with a pinned seat's band (0928), empty
+            // on every other seat.
+            vec![
+                "$al_pin_head",
+                "$quota_icon",
+                "$quota_icon_working",
+                "$quota_icon_done",
+                "$al_space",
+                "tab"
+            ],
+            // Second-row logos are the default (0927).
+            vec![
+                "$al_pin_bar",
+                "$al_role",
+                "$al_channel",
+                "$al_model_mark",
+                "$al_model"
+            ],
+            vec!["$al_pin_bar", "pane"],
+        ]
+    );
+    let flat = rows.concat();
+    for usage in ["5h", "week", "month", "context", "cache", "provider_model"] {
+        assert!(
+            flat.iter().all(|token| !token.contains(usage)),
+            "{usage} leaked into identity rows: {flat:?}"
+        );
+    }
+}
+
+#[test]
+fn identity_rows_are_the_same_in_both_orders_so_a_toggle_rewrites_nothing() {
+    use herdr_agent_quota::cli::AgentOrder;
+    assert_eq!(
+        identity_rows("", AgentOrder::Quota),
+        identity_rows("", AgentOrder::Attention)
+    );
+    let applied = identity_rows("", AgentOrder::Quota);
+    assert!(applied.contains("key = \"prefix+shift+o\""), "{applied}");
+    assert!(
+        applied.contains("command = \"herdr-agent-quota.toggle-order\""),
+        "{applied}"
+    );
+}
+
+#[test]
+fn identity_rows_are_idempotent_and_switch_cleanly_with_the_usage_rows() {
+    use herdr_agent_quota::cli::AgentOrder;
+    let identity = identity_rows("", AgentOrder::Quota);
+    assert_eq!(identity_rows(&identity, AgentOrder::Quota), identity);
+    assert_eq!(grouped_rows(&identity), grouped_rows(""));
+    assert_eq!(
+        identity_rows(&grouped_rows(""), AgentOrder::Quota),
+        identity
+    );
+    assert_eq!(
+        identity_rows(&attention_rows(""), AgentOrder::Quota),
+        identity
+    );
+}
+
+#[test]
+fn identity_rows_uninstall_to_herdr_stock_rows() {
+    use herdr_agent_quota::cli::AgentOrder;
+    let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
+    let applied = identity_rows(original, AgentOrder::Attention);
+    let removed = remove_quota_row(&applied).unwrap();
+    for leftover in ["$al_", "state_text", "\"pane\"", "toggle-order", "$quota"] {
+        assert!(!removed.contains(leftover), "{leftover}: {removed}");
+    }
+    assert_eq!(
+        removed,
+        "[ui]\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
+    );
+}
+
+#[test]
+fn every_candidate_look_writes_the_rows_it_promises() {
+    use herdr_agent_quota::look::{GroupStyle, LogoLayout};
+    // The defaults are plain headers with second-row logos.
+    assert_eq!(
+        managed_rows(&looked_rows("", GroupStyle::Plain, LogoLayout::SecondRow)),
+        managed_rows(&identity_rows(
+            "",
+            herdr_agent_quota::cli::AgentOrder::Quota
+        ))
+    );
+    // Logos off keeps round two's rows minus the state text.
+    assert_eq!(
+        managed_rows(&looked_rows("", GroupStyle::Plain, LogoLayout::None)),
+        [
+            vec!["$quota_group"],
+            vec![
+                "$al_pin_head",
+                "$quota_icon",
+                "$quota_icon_working",
+                "$quota_icon_done",
+                "$al_space",
+                "tab"
+            ],
+            vec!["$al_pin_bar", "$al_role", "$al_model"],
+            vec!["$al_pin_bar", "pane"],
+        ]
+    );
+    // No identity look shows state text any more.
+    for group in EVERY_GROUP {
+        for logos in EVERY_LOGO {
+            let rows = managed_rows(&looked_rows("", group, logos));
+            assert!(
+                !rows.concat().contains(&"state_text".to_string()),
+                "{group:?} {logos:?}"
+            );
+        }
+    }
+
+    let rule = managed_rows(&looked_rows("", GroupStyle::Rule, LogoLayout::Inline));
+    assert_eq!(rule[0], ["$quota_group"]);
+    // Codex's two candidates have no gap row; only the count candidate does.
+    assert_ne!(rule.last().unwrap(), &["$al_gap"]);
+    let count = managed_rows(&looked_rows("", GroupStyle::Count, LogoLayout::None));
+    assert_eq!(count.last().unwrap(), &["$al_gap"]);
+    assert_eq!(
+        rule[1],
+        [
+            "$al_pin_head",
+            "$quota_icon",
+            "$quota_icon_working",
+            "$quota_icon_done",
+            "$al_channel",
+            "$al_model_mark",
+            "$al_space",
+            "tab"
+        ]
+    );
+    assert!(looked_rows("", GroupStyle::Rule, LogoLayout::None).contains("fg = \"#89b4fa\""));
+    // Only the harness mark carries status colour: channel and model marks
+    // are the neutral grey in every layout.
+    for logos in [LogoLayout::Inline, LogoLayout::SecondRow] {
+        let rendered = looked_rows("", GroupStyle::Plain, logos);
+        for token in ["$al_channel", "$al_model_mark"] {
+            let styled = format!("token = \"{token}\", fg = \"#a6adc8\"");
+            assert!(rendered.contains(&styled), "{logos:?} {token}: {rendered}");
+        }
+    }
+
+    let second = managed_rows(&looked_rows("", GroupStyle::Bar, LogoLayout::SecondRow));
+    assert_eq!(second[0], ["$quota_group"]);
+    assert_eq!(
+        second[2],
+        [
+            "$al_pin_bar",
+            "$al_role",
+            "$al_channel",
+            "$al_model_mark",
+            "$al_model"
+        ]
+    );
+}
+
+#[test]
+fn every_candidate_look_is_idempotent_and_uninstalls_to_stock_rows() {
+    let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
+    for group in EVERY_GROUP {
+        for logos in EVERY_LOGO {
+            let applied = looked_rows(original, group, logos);
+            assert_eq!(
+                looked_rows(&applied, group, logos),
+                applied,
+                "{group:?}/{logos:?}"
+            );
+            // Switching to another look rewrites cleanly.
+            assert_eq!(
+                looked_rows(
+                    &applied,
+                    herdr_agent_quota::look::GroupStyle::Plain,
+                    herdr_agent_quota::look::LogoLayout::None
+                ),
+                looked_rows(
+                    original,
+                    herdr_agent_quota::look::GroupStyle::Plain,
+                    herdr_agent_quota::look::LogoLayout::None
+                ),
+                "{group:?}/{logos:?}"
+            );
+            let removed = remove_quota_row(&applied).unwrap();
+            assert_eq!(
+                removed,
+                "[ui]\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n",
+                "{group:?}/{logos:?}"
+            );
+        }
+    }
 }
