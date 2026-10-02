@@ -123,9 +123,17 @@ pub fn run_shell_with_deadline(
     // tree only once its own status is settled. The watchdog is still the
     // bound: a command that outstays the budget is ended there, which
     // empties this slot and leaves no status to report.
-    let status = reap_after_eof(&child)?;
+    //
+    // The failure is held rather than returned through `?`. Every return
+    // has to pass the cancellation and the join below: dropping the cancel
+    // sender instead makes the watchdog read a disconnect as a timeout and
+    // end the tree a second time, after the caller already has its error
+    // (Codex R2). One side collects the slot — whichever takes it first —
+    // and the budget still covers the wait after EOF.
+    let status = reap_after_eof(&child);
     let _ = cancel.send(());
     let _ = watchdog.join();
+    let status = status?;
     let failure = end_failure
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -201,8 +209,7 @@ fn end_and_reap(child: &Mutex<Option<(Child, Tree)>>) -> Result<Option<ExitStatu
 }
 
 /// How long to leave a command alone between two looks at whether it has
-/// exited. Small, because a command that is exiting on its own does so in
-/// microseconds once its stdout is closed.
+/// exited.
 const REAP_POLL: Duration = Duration::from_millis(5);
 
 /// Collect a command whose output has already reached EOF, keeping the exit
@@ -216,12 +223,10 @@ const REAP_POLL: Duration = Duration::from_millis(5);
 /// already-exited command — it only collects whatever the command left
 /// running behind it, which is what the grandchild cases need.
 ///
-/// A command that has closed its stdout is not necessarily gone: on Windows
-/// it is the MSYS shell that lingers, which is why the wrong order was
-/// visible there and not on Unix. Waiting here is bounded by the watchdog
-/// thread — a command still running when the budget runs out is ended by
-/// the watchdog, which empties this slot, and this then returns `None` with
-/// `timed_out` set.
+/// EOF is not proof that the command has exited, so this waits for the
+/// command to say so. That wait is bounded by the watchdog thread: the tree
+/// is ended there when the budget runs out, which empties this slot, and
+/// this then returns `None` with `timed_out` set.
 fn reap_after_eof(child: &Mutex<Option<(Child, Tree)>>) -> Result<Option<ExitStatus>> {
     loop {
         let mut slot = child.lock().unwrap_or_else(|error| error.into_inner());
@@ -229,18 +234,70 @@ fn reap_after_eof(child: &Mutex<Option<(Child, Tree)>>) -> Result<Option<ExitSta
             // The watchdog ended and collected it: the run timed out.
             return Ok(None);
         };
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                tree.end(child).context("end previous statusLine tree")?;
-                let _ = slot.take();
-                return Ok(Some(status));
-            }
-            Ok(None) => {}
-            Err(error) => return Err(error).context("look at previous statusLine"),
+        if has_exited(child)? {
+            // The root is still an unreaped child here — that is what
+            // `has_exited` is for — so ending the tree cannot signal a pid
+            // that has been reused (R1).
+            tree.end(child).context("end previous statusLine tree")?;
+            let status = child.wait().context("reap previous statusLine")?;
+            let _ = slot.take();
+            return Ok(Some(status));
         }
         drop(slot);
         thread::sleep(REAP_POLL);
     }
+}
+
+/// Whether the command has exited, asked *without* giving up the root's
+/// identity.
+///
+/// The tree is ended by signalling the process group named after the root's
+/// pid, so the root has to still be this process's unreaped child when
+/// `end` runs: a reaped pid can be reused, and the signal would then land
+/// on a stranger (Codex R1). `waitid` with `WNOWAIT` reports the exit and
+/// leaves the child a zombie, so `end` still runs while the pid is ours.
+/// (`waitpid` rejects `WNOWAIT` outright — `EINVAL` — so it cannot be asked
+/// this question at all.)
+///
+/// Windows has no such window: its tree is ended through the job handle,
+/// not through a pid.
+#[cfg(unix)]
+fn has_exited(child: &mut Child) -> Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error()).context("look at previous statusLine");
+    }
+    // `si_pid` is set only when a state change was reported; `WNOWAIT`
+    // means it can be asked again, and the child is still ours either way.
+    Ok(reported_pid(&info) != 0)
+}
+
+/// The pid a `waitid` report names. Linux and the BSDs spell the same field
+/// two ways in `libc`: an accessor there, a public field here.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "emscripten"))]
+fn reported_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    unsafe { info.si_pid() }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))]
+fn reported_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    info.si_pid
+}
+
+#[cfg(windows)]
+fn has_exited(child: &mut Child) -> Result<bool> {
+    child
+        .try_wait()
+        .map(|status| status.is_some())
+        .context("look at previous statusLine")
 }
 
 /// Everything a child we started went on to start, so it can be ended as
@@ -258,6 +315,11 @@ pub(crate) struct Tree {
     /// tree, which a thread-local could not do.
     #[cfg(test)]
     fails: bool,
+    /// What a test double gets to look at when the tree is ended, and how
+    /// often: the root's state at that instant, and the number of endings.
+    /// Carried on the value for the same reason `fails` is.
+    #[cfg(test)]
+    on_end: Option<Arc<dyn Fn(&mut Child) + Send + Sync>>,
 }
 
 impl Tree {
@@ -269,6 +331,8 @@ impl Tree {
         Tree {
             #[cfg(test)]
             fails: false,
+            #[cfg(test)]
+            on_end: None,
         }
     }
 
@@ -277,6 +341,10 @@ impl Tree {
     /// that fails is reported rather than swallowed: the caller promised the
     /// subtree is gone, and it is not.
     pub(crate) fn end(&self, child: &mut Child) -> Result<()> {
+        #[cfg(test)]
+        if let Some(on_end) = &self.on_end {
+            on_end(child);
+        }
         #[cfg(test)]
         if self.fails {
             // A stage and a code, like a real Win32 failure, so a caller's
@@ -573,6 +641,8 @@ impl Tree {
             job: Some(windows_job::Job::build(child)?),
             #[cfg(test)]
             fails: false,
+            #[cfg(test)]
+            on_end: None,
         })
     }
 }
@@ -592,6 +662,7 @@ pub(crate) mod testing {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
     /// How a test replaces containment for the duration of its own thread.
@@ -616,6 +687,17 @@ mod tests {
     fn clear() {
         INJECTED_CONTAIN.with(|slot| slot.set(None));
     }
+
+    /// What the last tree ending saw when it probed the root. Process-wide
+    /// rather than thread-local on purpose: the ending under test can run on
+    /// the watchdog's thread. Only the injection above reaches it, and an
+    /// injection is thread-local, so no other test touches it.
+    #[cfg(unix)]
+    static ROOT_AT_END: Mutex<Option<Result<libc::pid_t, i32>>> = Mutex::new(None);
+
+    /// How many times a tree has been ended since the last reset, for the
+    /// same reason.
+    static TREE_ENDINGS: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn captures_a_completed_command() {
@@ -654,6 +736,89 @@ mod tests {
             "the command was ended before it had finished its own work"
         );
         let _ = std::fs::remove_file(marker);
+    }
+
+    /// The negative control for R1. The tree is ended by signalling the
+    /// process group named after the root's pid, so the root must still be
+    /// this process's unreaped child when `end` runs. Looking at the exit
+    /// with `try_wait` first would collect it and release the pid, and a
+    /// recycled pid can belong to anything. The probe asks `waitid` with
+    /// `WNOWAIT` — the one question that reports the exit and keeps the
+    /// child a zombie — so it sees what `end` sees.
+    #[cfg(unix)]
+    #[test]
+    fn the_root_is_still_a_child_when_its_tree_is_ended() {
+        *ROOT_AT_END
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        inject(|_child| {
+            Ok(conforming_tree_watching(Some(Arc::new(
+                |child: &mut Child| {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let result = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            child.id() as libc::id_t,
+                            &mut info,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    };
+                    let report = if result == -1 {
+                        Err(std::io::Error::last_os_error()
+                            .raw_os_error()
+                            .unwrap_or_default())
+                    } else {
+                        Ok(reported_pid(&info))
+                    };
+                    *ROOT_AT_END
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(report);
+                },
+            ))))
+        });
+        let result =
+            run_shell_with_deadline("printf done; exit 0", b"", Duration::from_secs(2)).unwrap();
+        clear();
+        assert_eq!(result.exit_code, Some(0));
+        let report = ROOT_AT_END
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        match report {
+            Some(Ok(pid)) if pid != 0 => {}
+            other => panic!(
+                "the tree was ended after the root had already been collected, \
+                 so its pid was free to be reused: {other:?}"
+            ),
+        }
+    }
+
+    /// The negative control for R2. A failure on the EOF path must still
+    /// take the cancellation and the join: returning through `?` drops the
+    /// cancel sender, the watchdog reads that disconnect as a timeout, and
+    /// the tree is ended a second time after the caller already has its
+    /// error. The counting double makes that second ending visible.
+    #[test]
+    fn a_failure_after_eof_does_not_end_the_tree_a_second_time() {
+        TREE_ENDINGS.store(0, Ordering::SeqCst);
+        inject(|_child| {
+            Ok(failing_tree_watching(Some(Arc::new(
+                |_child: &mut Child| {
+                    TREE_ENDINGS.fetch_add(1, Ordering::SeqCst);
+                },
+            ))))
+        });
+        let error = run_shell_with_deadline("printf x", b"", Duration::from_secs(2)).unwrap_err();
+        clear();
+        assert!(
+            format!("{error:#}").contains("TerminateJobObject"),
+            "the EOF path's own failure is the one reported: {error:#}"
+        );
+        assert_eq!(
+            TREE_ENDINGS.load(Ordering::SeqCst),
+            1,
+            "the tree is ended once, by the EOF path's own failure, not again by the watchdog"
+        );
     }
 
     #[test]
@@ -819,32 +984,35 @@ mod tests {
     /// handling, while the two shell tests above go through the platform's
     /// real containment.
     fn conforming_tree(_child: &Child) -> Tree {
-        #[cfg(windows)]
-        {
-            Tree {
-                job: None,
-                fails: false,
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            Tree::unconstrained()
+        conforming_tree_watching(None)
+    }
+
+    /// What `conforming_tree` gives, with a double that is told each time
+    /// the tree is ended, so a caller that ends it twice is visible.
+    fn conforming_tree_watching(on_end: Option<Arc<dyn Fn(&mut Child) + Send + Sync>>) -> Tree {
+        Tree {
+            #[cfg(windows)]
+            job: None,
+            fails: false,
+            on_end,
         }
     }
 
     /// A tree whose ending always fails, so the caller's reporting of a
     /// termination error can be seen without a Windows job object.
     pub(super) fn failing_tree() -> Tree {
-        #[cfg(windows)]
-        {
-            Tree {
-                job: None,
-                fails: true,
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            Tree { fails: true }
+        failing_tree_watching(None)
+    }
+
+    /// The same failing tree, with a double that is told each time the tree
+    /// is ended. The ending still fails, so a caller that acts on the tree
+    /// after the command is finished shows up as a second call.
+    fn failing_tree_watching(on_end: Option<Arc<dyn Fn(&mut Child) + Send + Sync>>) -> Tree {
+        Tree {
+            #[cfg(windows)]
+            job: None,
+            fails: true,
+            on_end,
         }
     }
 
