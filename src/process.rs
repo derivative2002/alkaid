@@ -103,7 +103,7 @@ pub fn run_shell_with_deadline(
     let watchdog = thread::spawn(move || {
         if cancelled.recv_timeout(budget).is_err() {
             watchdog_timed_out.store(true, Ordering::Release);
-            if let Err(error) = terminate_and_reap(&watchdog_child) {
+            if let Err(error) = end_and_reap(&watchdog_child) {
                 let mut slot = watchdog_end_failure
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
@@ -115,8 +115,16 @@ pub fn run_shell_with_deadline(
     let mut stdout = stdout;
     let mut output = Vec::new();
     let read_result = stdout.read_to_end(&mut output);
+    // The command has closed its stdout, and the caller is owed the status
+    // *it* exited with. Ending the tree before collecting it replaces that
+    // status with the termination's — on Windows a hard-coded 1 — so a
+    // statusLine that had finished writing was reported as a failure and
+    // Claude Code dropped the HUD (1003). Wait for the command, and end the
+    // tree only once its own status is settled. The watchdog is still the
+    // bound: a command that outstays the budget is ended there, which
+    // empties this slot and leaves no status to report.
+    let status = reap_after_eof(&child)?;
     let _ = cancel.send(());
-    let status = terminate_and_reap(&child)?;
     let _ = watchdog.join();
     let failure = end_failure
         .lock()
@@ -177,7 +185,10 @@ fn contain(child: &Child) -> Result<Tree, JobFailure> {
     platform::contain(child)
 }
 
-fn terminate_and_reap(child: &Mutex<Option<(Child, Tree)>>) -> Result<Option<ExitStatus>> {
+/// End a child's tree and collect it, for a caller that has already decided
+/// the child must die. The status reported is the termination's, which is
+/// what a timed-out run deserves and nothing a finished command does.
+fn end_and_reap(child: &Mutex<Option<(Child, Tree)>>) -> Result<Option<ExitStatus>> {
     let mut slot = child
         .lock()
         .map_err(|_| anyhow::anyhow!("lock previous statusLine child"))?;
@@ -187,6 +198,49 @@ fn terminate_and_reap(child: &Mutex<Option<(Child, Tree)>>) -> Result<Option<Exi
     tree.end(&mut child)
         .context("end previous statusLine tree")?;
     child.wait().map(Some).context("reap previous statusLine")
+}
+
+/// How long to leave a command alone between two looks at whether it has
+/// exited. Small, because a command that is exiting on its own does so in
+/// microseconds once its stdout is closed.
+const REAP_POLL: Duration = Duration::from_millis(5);
+
+/// Collect a command whose output has already reached EOF, keeping the exit
+/// status the command itself produced.
+///
+/// The status is taken *before* the tree is ended, because ending first is
+/// exactly what turned a successful statusLine into a failure on Windows:
+/// `TerminateJobObject` finishes the child with a hard-coded 1, and the
+/// reaped status was that 1 rather than the 0 the command exited with
+/// (1003, HUD gone). Ending the tree afterwards changes nothing about an
+/// already-exited command — it only collects whatever the command left
+/// running behind it, which is what the grandchild cases need.
+///
+/// A command that has closed its stdout is not necessarily gone: on Windows
+/// it is the MSYS shell that lingers, which is why the wrong order was
+/// visible there and not on Unix. Waiting here is bounded by the watchdog
+/// thread — a command still running when the budget runs out is ended by
+/// the watchdog, which empties this slot, and this then returns `None` with
+/// `timed_out` set.
+fn reap_after_eof(child: &Mutex<Option<(Child, Tree)>>) -> Result<Option<ExitStatus>> {
+    loop {
+        let mut slot = child.lock().unwrap_or_else(|error| error.into_inner());
+        let Some((child, tree)) = slot.as_mut() else {
+            // The watchdog ended and collected it: the run timed out.
+            return Ok(None);
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                tree.end(child).context("end previous statusLine tree")?;
+                let _ = slot.take();
+                return Ok(Some(status));
+            }
+            Ok(None) => {}
+            Err(error) => return Err(error).context("look at previous statusLine"),
+        }
+        drop(slot);
+        thread::sleep(REAP_POLL);
+    }
 }
 
 /// Everything a child we started went on to start, so it can be ended as
@@ -570,6 +624,36 @@ mod tests {
         assert_eq!(result.stdout, b"done");
         assert_eq!(result.exit_code, Some(0));
         assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn a_command_that_closes_stdout_is_kept_until_it_exits() {
+        // The negative control for 1003. A command that closes its stdout
+        // and then finishes on its own must not be ended at the moment its
+        // output reaches EOF: on Windows ending it there replaced its status
+        // with a hard-coded 1 and the HUD disappeared, though the output was
+        // complete. The marker is what the command does after the EOF, and
+        // the status is what it exited with; ending it early loses both.
+        let marker = std::path::Path::new("alkaid-closed-stdout-finished.marker");
+        let _ = std::fs::remove_file(marker);
+        let result = run_shell_with_deadline(
+            "printf done; exec 1>&-; sleep 1; : > alkaid-closed-stdout-finished.marker; exit 0",
+            b"",
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(result.stdout, b"done");
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "the command's own status, not the status of ending it"
+        );
+        assert!(!result.timed_out);
+        assert!(
+            marker.exists(),
+            "the command was ended before it had finished its own work"
+        );
+        let _ = std::fs::remove_file(marker);
     }
 
     #[test]
