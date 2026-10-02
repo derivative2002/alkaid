@@ -277,19 +277,11 @@ fn has_exited(child: &mut Child) -> Result<bool> {
     }
     // `si_pid` is set only when a state change was reported; `WNOWAIT`
     // means it can be asked again, and the child is still ours either way.
-    Ok(reported_pid(&info) != 0)
-}
-
-/// The pid a `waitid` report names. Linux and the BSDs spell the same field
-/// two ways in `libc`: an accessor there, a public field here.
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "emscripten"))]
-fn reported_pid(info: &libc::siginfo_t) -> libc::pid_t {
-    unsafe { info.si_pid() }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "emscripten")))]
-fn reported_pid(info: &libc::siginfo_t) -> libc::pid_t {
-    info.si_pid
+    // The accessor is the spelling `libc` offers on every Unix: on the Apple
+    // targets it simply reads the public field back (0.2.189
+    // apple/mod.rs). Its name must not appear outside `#[cfg(unix)]` — this
+    // file's only handle on `libc` is that gate.
+    Ok(unsafe { info.si_pid() } != 0)
 }
 
 #[cfg(windows)]
@@ -699,6 +691,77 @@ mod tests {
     /// same reason.
     static TREE_ENDINGS: AtomicUsize = AtomicUsize::new(0);
 
+    /// Whether a line starts an item, which ends the search for the
+    /// attributes that gate the line under test.
+    fn is_item_header(line: &str) -> bool {
+        let line = ["pub(crate) ", "pub(super) ", "pub "]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+            .unwrap_or(line);
+        [
+            "fn ", "struct ", "enum ", "impl ", "mod ", "static ", "const ", "trait ",
+        ]
+        .iter()
+        .any(|start| line.starts_with(start))
+    }
+
+    /// Whether a `#[cfg(...)]` keeps a line off every target that has no
+    /// `libc` — the gate spelled the two ways this file uses.
+    fn gates_off_libc_less_targets(attribute: &str) -> bool {
+        let compact: String = attribute.chars().filter(|c| !c.is_whitespace()).collect();
+        compact.contains("cfg(unix)")
+            || compact.contains("cfg(all(unix")
+            || compact == "#[cfg(not(windows))]"
+    }
+
+    /// `libc` is declared for `unix` only (`Cargo.toml`), so an item that
+    /// names it while being reachable from Windows is a Windows build break
+    /// and nothing else — the shape `reported_pid` had when its `#[cfg]` was
+    /// written as everything-but-Linux (Codex R3). No Windows target is
+    /// installed on this machine to compile, so this reads the gate out of
+    /// the source; the Windows build remains the authority. A source scan
+    /// cannot see through a gate written some third way — it only has to
+    /// catch this file's own spellings.
+    #[test]
+    fn nothing_that_names_libc_escapes_the_unix_gate() {
+        // Spelled in two pieces so the needle below is not itself a hit.
+        const NEEDLE: &str = concat!("lib", "c::");
+        let source = include_str!("process.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut ungated = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains(NEEDLE) {
+                continue;
+            }
+            // Walking up: inside the item, every line belongs to it; the
+            // first item header is this line's own, and the `#[...]` block
+            // right above that header is its gate.
+            let mut gates = Vec::new();
+            let mut left_item = false;
+            for above in lines.iter().take(index + 1).rev() {
+                let trimmed = above.trim();
+                if trimmed.starts_with("#[") {
+                    gates.push(trimmed);
+                } else if is_item_header(trimmed) {
+                    if left_item {
+                        break;
+                    }
+                    left_item = true;
+                } else if left_item {
+                    break;
+                }
+            }
+            if !gates.iter().any(|gate| gates_off_libc_less_targets(gate)) {
+                ungated.push(format!("{}: {}", index + 1, line.trim()));
+            }
+        }
+        assert!(
+            ungated.is_empty(),
+            "these lines name `libc`, which does not exist off Unix:\n{}",
+            ungated.join("\n")
+        );
+    }
+
     #[test]
     fn captures_a_completed_command() {
         let result =
@@ -768,7 +831,7 @@ mod tests {
                             .raw_os_error()
                             .unwrap_or_default())
                     } else {
-                        Ok(reported_pid(&info))
+                        Ok(unsafe { info.si_pid() })
                     };
                     *ROOT_AT_END
                         .lock()
@@ -810,6 +873,15 @@ mod tests {
         });
         let error = run_shell_with_deadline("printf x", b"", Duration::from_secs(2)).unwrap_err();
         clear();
+        // The second ending, when the defect is present, comes from the
+        // watchdog thread and cannot be waited on from here — the defective
+        // ordering never joins it. Poll a generous budget for it instead of
+        // looking once: a single look races the watchdog and would call a
+        // second ending "one ending" whenever the thread had not run yet.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while TREE_ENDINGS.load(Ordering::SeqCst) == 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(
             format!("{error:#}").contains("TerminateJobObject"),
             "the EOF path's own failure is the one reported: {error:#}"
