@@ -33,6 +33,10 @@ fn main() -> Result<()> {
             brand_colors,
             agent_order,
             low_quota_alert,
+            sidebar_rows,
+            icon_style,
+            group_style,
+            logo_layout,
         } => herdr_agent_quota::configure::run(
             check,
             apply,
@@ -47,8 +51,14 @@ fn main() -> Result<()> {
                 brand_colors,
                 agent_order,
                 low_quota_alert,
+                sidebar_rows,
+                icon_style,
+                group_style,
+                logo_layout,
             },
         ),
+        Command::ToggleOrder => herdr_agent_quota::refresh::toggle_order(),
+        Command::Groups { file } => herdr_agent_quota::groups::check(file.as_deref()),
         Command::ClaudeStatusline => herdr_agent_quota::configure::claude::run_statusline_hook(),
     }
 }

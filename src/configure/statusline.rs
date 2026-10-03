@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Set on the previous statusLine this hook runs, so a chain that leads
+/// back to the hook stops after one level.
+pub(crate) const CHAIN_GUARD_ENV: &str = "HERDR_AGENT_QUOTA_STATUSLINE_CHAINED";
 const WRAPPER_STATE_MARKER: &str = "HERDR_PLUGIN_STATE_DIR='";
 
 pub(crate) struct Adapter {
@@ -208,10 +211,19 @@ impl Adapter {
     }
 
     pub(crate) fn run_previous(&self, state: &Path, input: &[u8]) -> Result<Option<CommandOutput>> {
+        // Already inside a chained call: the previous command led back to
+        // this hook (0928 sb7: a saved "previous" pointed at the plugin
+        // through a symlink the wrapper check could not see). Chaining again
+        // recurses without end — each level in its own process group, so the
+        // deadline kill never reaches the grandchildren.
+        if std::env::var_os(CHAIN_GUARD_ENV).is_some() {
+            return Ok(None);
+        }
         let Some(command) = self.previous_command(state)? else {
             return Ok(None);
         };
-        run_shell_with_deadline(&command, input, STATUSLINE_COMMAND_BUDGET).map(Some)
+        let guarded = format!("{CHAIN_GUARD_ENV}=1; export {CHAIN_GUARD_ENV}; {command}");
+        run_shell_with_deadline(&guarded, input, STATUSLINE_COMMAND_BUDGET).map(Some)
     }
 
     pub(crate) fn settings_path(&self) -> Result<PathBuf> {

@@ -197,4 +197,14 @@ printf '%s\n' '{"result":{"agents":[{"pane_id":"w1:p1","agent":"codex","agent_st
             60
         )
         .unwrap());
+    // Startup left its detached watcher running in this tempdir. Stop it and
+    // wait for its lease before the tempdir drops: a watcher that writes
+    // while remove_dir_all runs makes the removal fail silently, and the
+    // survivor then polls a deleted stub Herdr for up to an hour (0927).
+    cache.stop_turn_watchers().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while cache.try_lock_named("turn.lock").unwrap().is_none() {
+        assert!(Instant::now() < deadline, "startup watcher did not stop");
+        thread::sleep(Duration::from_millis(10));
+    }
 }

@@ -1,6 +1,9 @@
 pub mod cache;
+pub mod channel;
 pub mod cli;
 pub mod icons;
+pub mod identity;
+pub mod look;
 pub mod model;
 pub mod prefs;
 pub mod presentation;
@@ -8,8 +11,10 @@ pub mod process;
 
 pub mod configure;
 pub mod dashboard;
+pub mod groups;
 pub mod herdr;
 pub mod providers;
 pub mod refresh;
 pub mod route;
+pub mod seat_model;
 pub mod settings;

@@ -13,6 +13,7 @@ fn integration_id(harness: Harness) -> Option<&'static str> {
     match harness {
         Harness::Claude => Some("claude"),
         Harness::Codex => Some("codex"),
+        Harness::Cursor => Some("cursor"),
     }
 }
 

@@ -7,7 +7,7 @@ mod statusline;
 use crate::cache::CacheStore;
 use crate::cli::{
     AgentOrder, AgentSelection, BrandColors, ConfigureOptions, FieldSet, LowQuotaAlert,
-    PercentStyle, SidebarLayout, SidebarRowGap,
+    PercentStyle, SidebarLayout, SidebarRowGap, SidebarRows,
 };
 use crate::model::Harness;
 use crate::prefs;
@@ -120,7 +120,29 @@ pub fn run(
         }
         cache.set_low_quota_alert(alert)?;
         prefs::write(prefs::LOW_QUOTA_ALERT, &alert.to_string())?;
-        herdr::apply(agents, layout, gap, fields, brand)?;
+        // Resolved before the rows: the attention order writes its own
+        // identity row, so the rows and the Agent view must agree.
+        let order = resolved_agent_order(options.agent_order, Some(&cache));
+        let rows = resolved_sidebar_rows(options.sidebar_rows);
+        prefs::write(prefs::SIDEBAR_ROWS, rows.as_str())?;
+        let style = options
+            .icon_style
+            .or_else(|| {
+                prefs::read(prefs::ICON_STYLE).and_then(|v| crate::icons::IconStyle::parse(&v))
+            })
+            .unwrap_or_default();
+        prefs::write(prefs::ICON_STYLE, style.as_str())?;
+        let look = resolved_row_look(&options);
+        prefs::write(prefs::GROUP_STYLE, look.group.as_str())?;
+        prefs::write(prefs::LOGO_LAYOUT, look.logos.as_str())?;
+        println!(
+            "Sidebar rows: {}; vendor marks: {}; Space headers: {}; logos: {}.",
+            rows.as_str(),
+            style.as_str(),
+            look.group.as_str(),
+            look.logos.as_str()
+        );
+        herdr::apply(agents, layout, gap, fields, brand, order, rows, look)?;
         for note in font::install(cache.root())? {
             println!("{note}");
         }
@@ -129,7 +151,6 @@ pub fn run(
         // sends it alongside whatever agent selection the user happens to
         // have. Gating it would silently drop the setting for anyone not
         // running every supported agent.
-        let order = resolved_agent_order(options.agent_order, Some(&cache));
         cache.set_agent_order(order)?;
         prefs::write(prefs::AGENT_ORDER, order.as_str())?;
         apply_agent_order(order);
@@ -146,7 +167,18 @@ pub fn run(
         let brand = resolved_brand_colors(options.brand_colors, cache.as_ref());
         let order = resolved_agent_order(options.agent_order, cache.as_ref());
         let alert = resolved_low_quota_alert(options.low_quota_alert, cache.as_ref());
-        herdr::check(agents, layout, gap, fields, brand)?;
+        let rows = resolved_sidebar_rows(options.sidebar_rows);
+        herdr::check(
+            agents,
+            layout,
+            gap,
+            fields,
+            brand,
+            order,
+            rows,
+            resolved_row_look(&options),
+        )?;
+        println!("Sidebar rows: {}.", rows.as_str());
         println!("Quota percentages show {} quota.", percent.suffix());
         println!("Agent panel order: {}.", order.as_str());
         println!("Low quota alert: {alert}.");
@@ -207,6 +239,40 @@ pub(crate) fn resolved_agent_order(
         .unwrap_or_default()
 }
 
+/// Header style and logo layout: flag, then environment, then the stored
+/// preference, then round two's look.
+pub(crate) fn resolved_row_look(options: &ConfigureOptions) -> herdr::RowLook {
+    use crate::look::{GroupStyle, LogoLayout};
+    herdr::RowLook {
+        group: options
+            .group_style
+            .or_else(|| {
+                std::env::var(GroupStyle::ENV)
+                    .ok()
+                    .as_deref()
+                    .and_then(GroupStyle::parse)
+            })
+            .or_else(|| prefs::read(prefs::GROUP_STYLE).and_then(|v| GroupStyle::parse(&v)))
+            .unwrap_or_default(),
+        logos: options
+            .logo_layout
+            .or_else(|| {
+                std::env::var(LogoLayout::ENV)
+                    .ok()
+                    .as_deref()
+                    .and_then(LogoLayout::parse)
+            })
+            .or_else(|| prefs::read(prefs::LOGO_LAYOUT).and_then(|v| LogoLayout::parse(&v)))
+            .unwrap_or_default(),
+    }
+}
+
+pub(crate) fn resolved_sidebar_rows(explicit: Option<SidebarRows>) -> SidebarRows {
+    SidebarRows::from_arg_or_env(explicit)
+        .or_else(|| prefs::read(prefs::SIDEBAR_ROWS).and_then(|value| SidebarRows::parse(&value)))
+        .unwrap_or_default()
+}
+
 pub(crate) fn resolved_low_quota_alert(
     explicit: Option<LowQuotaAlert>,
     cache: Option<&CacheStore>,
@@ -225,8 +291,8 @@ pub(crate) fn resolved_low_quota_alert(
 /// runs, and a panel that kept its old ordering is a cosmetic disagreement —
 /// failing the whole `--apply` over it would be worse than reporting it.
 pub(crate) fn apply_agent_order(order: AgentOrder) {
-    let result = if order.is_quota() {
-        crate::herdr::set_quota_agent_view()
+    let result = if order.owns_view() {
+        crate::herdr::set_agent_view(order)
     } else {
         crate::herdr::clear_quota_agent_view()
     };

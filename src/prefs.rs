@@ -25,9 +25,18 @@ pub const FIELDS: &str = "fields";
 pub const BRAND_COLORS: &str = "brand-colors";
 pub const AGENT_ORDER: &str = "agent-order";
 pub const LOW_QUOTA_ALERT: &str = "low-quota-alert";
+/// Which sidebar rows to write: `identity` (default) or `quota`.
+pub const SIDEBAR_ROWS: &str = "sidebar-rows";
+/// Vendor mark style: `glyph` (default) or `letter`.
+pub const ICON_STYLE: &str = "icon-style";
+/// Space header style: `plain` (default), `rule`, `count` or `bar`.
+pub const GROUP_STYLE: &str = "group-style";
+/// Where harness / channel / model marks sit: `none` (default), `inline`,
+/// `second-row`.
+pub const LOGO_LAYOUT: &str = "logo-layout";
 
 /// Every preference a full uninstall must forget.
-pub const ALL: [&str; 9] = [
+pub const ALL: [&str; 13] = [
     AGENTS,
     WATCH_INTERVAL_SECONDS,
     SIDEBAR_LAYOUT,
@@ -37,6 +46,10 @@ pub const ALL: [&str; 9] = [
     BRAND_COLORS,
     AGENT_ORDER,
     LOW_QUOTA_ALERT,
+    SIDEBAR_ROWS,
+    ICON_STYLE,
+    GROUP_STYLE,
+    LOGO_LAYOUT,
 ];
 
 fn directory() -> Option<PathBuf> {

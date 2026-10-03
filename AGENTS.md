@@ -259,6 +259,77 @@ one, and setting it replaces the user's own `ui.agent_panel_sort`. Rules:
    switch may not emit `pane.focused`; resolve its pane from that location's
    layout in `herdr api snapshot`. Ignore a delayed event whose workspace or
    Tab is no longer focused.
+4a. **Custom groups and the role order (round five).** A `groups` file in
+   the plugin config directory (`src/groups.rs`; user data, not in
+   `prefs::ALL`) names groups by label selectors: `role:` / `line:` /
+   `task:` / `label:`, comma for or, `&` for and. Every seat carries
+   `al_grp` — `C000`… for a custom group, `Z` for its Space — so leaving a
+   group replaces a value instead of leaving a token behind, and the value
+   never follows the order, so toggling writes nothing. Grouped views sort
+   `al_grp`, `workspace_order`, [`al_role_rank` under `role`], `al_sort`.
+   A custom group's head is chosen by what Herdr compares: the workspace
+   `number` from `workspace list`, role rank, `al_sort`. Only a pane the pass
+   labels is regrouped; any other keeps the `al_grp` it carries. A file with
+   any bad line does not take effect (the last clean copy in the state
+   directory stays in force); `herdr-agent-quota groups` checks it. Known
+   window: dragging a workspace reorders the view at once but moves a custom
+   group's head only on the next full pass — `workspace.moved` is not a
+   plugin hook event in 0.9.1 (sb7, 0928). View labels stay ASCII: Herdr
+   0.9.1 overprints a CJK panel title. The toggle cycles quota → role →
+   attention; `tightest` (flat by `al_sort`) is settings-only.
+5. **Attention order is flat on purpose, and only it.** `--agent-order
+   attention` sorts Herdr's built-in `attention` descending (measured on
+   0.9.1: blocked, unseen done, working, idle, then unknown), then
+   `quota_headroom` ascending; a pane without the token sorts last in its
+   band. The Space header cannot work there, so under this order
+   `$quota_group` is not published (siblings get it cleared), no member
+   indent is added, and the identity row names the Space with Herdr's
+   `workspace`. Its first cell is Herdr's `state_text`; the plugin writes the
+   five Chinese labels in `herdr::ATTENTION_STATE_LABELS` once per pane,
+   riding on a quota report, and compares them against `state_labels` from
+   `agent list` so a refresh never re-sends them. Herdr replaces the whole
+   label set on every write, so always send all five. Leaving the order
+   clears the label set only when it is exactly ours. There is no `[待拍N]`:
+   no per-pane source exists, so nothing prints a count.
+
+6. **Identity rows are the default, and one template serves both orders.**
+   `--sidebar-rows identity` writes `$quota_group`; the brand icon twins,
+   `state_text`, `$al_space`, `tab`; `$al_role`, `$al_model`; `pane`. Icons
+   stay first because a Space member's indent rides on the icon value. The
+   order changes what is *published* (`$quota_group` only when grouped,
+   `$al_space` only when not), never the rows, because Herdr reads rows from
+   the client's local config and a `--remote` client's config is not on this
+   machine. `toggle-order` (prefix+shift+o) flips the order, sets the view and
+   republishes from cache; it fetches nothing and writes no config.
+   `--sidebar-rows quota` restores the usage rows; the collectors never stop.
+   State labels are written in every order: Herdr rejects an empty label and a
+   zero-width one leaves a stray ` · `, so they cannot be hidden cleanly.
+7. **Role comes from the pane label; the model from the seat's own files**
+   (owner 0930, replacing 0927's "session statusLine or nothing"). Role:
+   naming-spec §5 `<role>.<container>.<task>.<gen>[.<model>][@<machine>]`,
+   统筹/秘书 from the task segment; an off-spec label publishes no role, a
+   failed `pane list` read preserves it. The label read is one metadata-only
+   call per publish pass and is skipped when the pass has no pane. Model
+   (`src/seat_model.rs`): the pane's agent process, found by the one `/proc`
+   sweep per pass (`channel::scan`, no longer gated on a logo layout), names
+   its `CLAUDE_CONFIG_DIR`/`HOME`/`CODEX_HOME`; Claude reads the last
+   non-`<synthetic>` assistant `message.model` of
+   `projects/*/<session>.jsonl`, Codex the last `turn_context` model of its
+   rollout (session from Herdr, else argv `resume <id>`), Cursor
+   `~/.cursor/cli-config.json` `model.modelId`. Reads are newest-first,
+   bounded to 8 MiB, and cached per file length and mtime in
+   `seat-models.json`. `$al_model` is the naming-spec short name
+   (`look::seat_short_name`, by family prefix; an unlisted id is compacted,
+   not hidden). A broken evidence chain shows `?`; an empty scan or a read
+   error preserves what the pane shows. Never the label's model segment,
+   never `quota_provider_model`. The model mark uses the same evidence. A DS
+   base (`$al_model` starts with `ds`) shows the whale U+E1AD; icon-only
+   passes take the model from the pane's own `$al_model` so they never swap
+   it back.
+8. **Cursor is display-only.** `Harness::Cursor` has no collector
+   (`billing()` is `None`), is not in `AgentSelection::SUPPORTED`, and is
+   never read for a topic: `refresh_pane_topic` checks the harness *before*
+   `pane read`. `refresh::shown` lets such a harness into publish passes.
 
 **`quota_headroom`** is the token that view sorts on: the remaining percent of
 the tightest of the pane's 5h, 7d, and 30d windows, zero-padded to three digits
@@ -288,6 +359,14 @@ reach the action. Measured with a temporary `printenv` action: of 61 variables,
 the only Herdr-related ones present were `HERDR_PLUGIN_STATE_DIR` and
 `HERDR_PLUGIN_CONFIG_DIR`, both injected by Herdr; neither the probe marker nor
 `HERDR_AGENT_QUOTA_AGENTS` survived.
+
+Herdr 0.9.1 injects more of its own: an action now also sees
+`HERDR_SOCKET_PATH`, `HERDR_BIN_PATH`, `HERDR_PLUGIN_ROOT` / `_ID` /
+`_ACTION_ID`, and `HERDR_PLUGIN_CONTEXT_JSON` (the focused workspace, Tab and
+pane), even when the server itself was started without a socket variable
+(measured 0926 in a sandbox server started that way). That is what lets the
+`toggle-order` action set the Agent view directly. The caller's own variables
+still do not arrive.
 
 So `src/prefs.rs` — small files under `HERDR_PLUGIN_CONFIG_DIR` — is the only
 channel an installer has for passing a choice to `configure`. Environment

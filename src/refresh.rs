@@ -85,7 +85,7 @@ pub fn run(providers: &[Provider], force: bool, json: bool) -> Result<()> {
 pub fn startup(providers: &[Provider]) -> Result<()> {
     if let Ok(cache) = CacheStore::from_env() {
         let order = crate::configure::resolved_agent_order(None, Some(&cache));
-        if order.is_quota() {
+        if order.owns_view() {
             crate::configure::apply_agent_order(order);
         }
     }
@@ -157,7 +157,7 @@ pub fn watch(providers: &[Provider], interval_seconds: Option<u64>, defer: bool)
             continue;
         };
         let enabled = AgentSelection::from_args_or_env(&[]);
-        state.panes.retain(|pane| enabled.contains(&pane.harness));
+        state.panes.retain(|pane| shown(&enabled, pane.harness));
         let active = state
             .working_pane_ids
             .iter()
@@ -399,7 +399,7 @@ fn run_internal(
     let panes = list_agent_panes().ok().map(|panes| {
         panes
             .into_iter()
-            .filter(|pane| enabled.contains(&pane.harness))
+            .filter(|pane| shown(&enabled, pane.harness))
             .collect::<Vec<_>>()
     });
     let session_panes = panes.as_deref().unwrap_or_default();
@@ -420,6 +420,38 @@ fn run_internal(
     if json {
         println!("{}", serde_json::to_string_pretty(&outcomes)?);
     }
+    Ok(())
+}
+
+/// Is this harness's pane published at all?
+///
+/// Installed agents are; so is a display-only harness (Cursor): it has no
+/// collector to install or uninstall, only its brand icon and identity rows,
+/// and without this it would never reach a publish pass.
+fn shown(enabled: &[Harness], harness: Harness) -> bool {
+    enabled.contains(&harness) || harness.billing().is_none()
+}
+
+/// Flip the Agent panel between Space grouping and the attention order.
+///
+/// Stores the new order the way configure does, sets the Agent view over the
+/// socket Herdr injects into plugin actions (0.9.1), then republishes every
+/// pane from what is already cached: the Space header, `$al_space` and the
+/// member indent change with the order. No provider is fetched, no Herdr
+/// config is written, so the identity rows need no client-side edit.
+pub fn toggle_order() -> Result<()> {
+    let cache = CacheStore::from_env()?;
+    let next = crate::configure::resolved_agent_order(None, Some(&cache)).next();
+    cache.set_agent_order(next)?;
+    crate::prefs::write(crate::prefs::AGENT_ORDER, next.as_str())?;
+    crate::configure::apply_agent_order(next);
+    let enabled = AgentSelection::from_args_or_env(&[]);
+    let mut panes = list_agent_panes()?
+        .into_iter()
+        .filter(|pane| shown(&enabled, pane.harness))
+        .collect::<Vec<_>>();
+    publish_resolved(&cache, &mut panes, None, false, false)?;
+    println!("Agent panel order: {}.", next.as_str());
     Ok(())
 }
 
@@ -619,7 +651,7 @@ fn paint_focus_icons(cache: &CacheStore, force_idle_id: Option<&str>) -> Result<
         ids.push(previous);
     }
     let mut panes = find_agent_icon_panes(&ids)?;
-    panes.retain(|pane| enabled.contains(&pane.harness));
+    panes.retain(|pane| shown(&enabled, pane.harness));
     apply_icon_attention(&mut panes, cache, Some(pane_id), false, false)?;
     publish_icon_tokens(&panes, CacheStore::now_millis())
 }
@@ -644,7 +676,7 @@ fn handle_named_pane(
     topic_pane: Option<&str>,
     working_event: bool,
 ) -> Result<()> {
-    if !AgentSelection::from_args_or_env(&[]).contains(&pane.harness) {
+    if !shown(&AgentSelection::from_args_or_env(&[]), pane.harness) {
         return Ok(());
     }
     WatchHerdrEnvironment::current().save(cache)?;
@@ -865,10 +897,7 @@ fn refresh_provider(
         .collect::<Vec<_>>();
     let (account_id, _) = current_account_gate(provider);
     cache.mark_refresh_account(provider, now, account_id.as_deref())?;
-    let fetched = match provider {
-        Provider::Codex => codex::fetch_for_sessions(&session_ids).map(FetchedSnapshot::direct),
-        Provider::Claude => load_statusline_snapshot(cache, provider),
-    };
+    let fetched = fetch_provider(provider, &session_ids, cache);
     match fetched {
         Ok(fetched) => {
             let FetchedSnapshot {
@@ -888,6 +917,11 @@ fn refresh_provider(
             } else {
                 cache.save(&snapshot)?;
             }
+            // Cleared only after the new snapshot is in the cache, and only
+            // because this file means "the last fetch failed": a fetch that
+            // succeeded must not be blocked, or reported as failed, by a
+            // cleanup that could not run (Codex g1c G1).
+            let _ = cache.clear_provider_error(provider);
             Ok(ProviderOutcome {
                 provider,
                 available: true,
@@ -895,12 +929,56 @@ fn refresh_provider(
                 error: None,
             })
         }
-        Err(error) => Ok(ProviderOutcome {
-            provider,
-            available: load_usable_snapshot(cache, provider)?.is_some(),
-            from_cache: true,
-            error: Some(error.to_string()),
-        }),
+        Err(error) => {
+            // The whole chain, not just its top context: on Windows the
+            // diagnosis of a missing Codex quota is the OS error under
+            // "start codex app-server", and `error.to_string()` drops it.
+            // Recorded because the watch and event paths drop this outcome
+            // and the watcher's stderr is null.
+            let detail = format!("{error:#}");
+            // Best effort: the diagnostic is not the fetch. A state
+            // directory that cannot take the file must not replace the
+            // result, stop the other providers, or stop the publish pass —
+            // and it must not be reported as recorded either (Codex g1c G1).
+            let detail = match cache.record_provider_error(provider, &detail) {
+                Ok(()) => detail,
+                Err(error) => format!("{detail} (not recorded: {error:#})"),
+            };
+            Ok(ProviderOutcome {
+                provider,
+                available: load_usable_snapshot(cache, provider)?.is_some(),
+                from_cache: true,
+                error: Some(detail),
+            })
+        }
+    }
+}
+
+/// Drive one Codex refresh against whatever `CODEX_BIN_PATH` names.
+///
+/// The redaction test in the codex module has to read the recorded
+/// diagnostic file back, so it needs the real refresh path, not the seam.
+#[cfg(test)]
+pub(crate) fn refresh_codex_for_test(cache: &CacheStore) -> ProviderOutcome {
+    refresh_provider(cache, Provider::Codex, true, &[]).expect("the refresh itself must not fail")
+}
+
+/// Fetch one provider's snapshot.
+///
+/// Behind a seam so the failure branches around it — a state directory that
+/// cannot take the diagnostic file — can be driven offline (Codex g1c G1).
+fn fetch_provider(
+    provider: Provider,
+    session_ids: &[String],
+    cache: &CacheStore,
+) -> Result<FetchedSnapshot> {
+    #[cfg(test)]
+    if let Some(injected) = tests::injected_fetch() {
+        return injected(provider, session_ids, cache);
+    }
+    match provider {
+        Provider::Codex => codex::fetch_for_sessions(session_ids).map(FetchedSnapshot::direct),
+        Provider::Claude => load_statusline_snapshot(cache, provider),
     }
 }
 
@@ -1248,8 +1326,166 @@ fn spawn_watch(defer: bool) -> Result<()> {
             Ok(())
         });
     }
+    #[cfg(windows)]
+    detach_on_windows(&mut command)?;
     command.spawn().context("start active-turn quota watcher")?;
     Ok(())
+}
+
+/// Windows passes every inheritable handle to a child, whatever its own
+/// stdio is set to. Herdr hands a hook or action its output pipe as this
+/// process's standard handles, so a watcher started from there would hold
+/// that pipe open and Herdr would show the action as running for as long as
+/// the watcher lives (measured 1001: configure stayed "running"). This marks
+/// this process's standard handles non-inheritable, and gives the watcher no
+/// console window and its own process group.
+///
+/// A handle that cannot be read or marked fails the spawn rather than being
+/// reported as detached: a watcher that inherited the pipe is the bug this
+/// exists to prevent, and starting one anyway would leave Herdr waiting on
+/// an action that has already finished (Codex g1 S1). A handle that is
+/// simply absent is not a failure — a hook may run with no console at all.
+#[cfg(windows)]
+fn detach_on_windows(command: &mut Command) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::Foundation::{
+        GetLastError, SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    let queried: Vec<(&'static str, _, StandardHandle)> = [
+        ("stdin", STD_INPUT_HANDLE),
+        ("stdout", STD_OUTPUT_HANDLE),
+        ("stderr", STD_ERROR_HANDLE),
+    ]
+    .into_iter()
+    .map(|(name, id)| {
+        let handle = unsafe { GetStdHandle(id) };
+        let answer = if handle.is_null() {
+            StandardHandle::Absent
+        } else if handle == INVALID_HANDLE_VALUE {
+            StandardHandle::Failed(unsafe { GetLastError() } as i32)
+        } else {
+            StandardHandle::Present
+        };
+        (name, handle, answer)
+    })
+    .collect();
+    let answers: Vec<(&'static str, StandardHandle)> = queried
+        .iter()
+        .map(|(name, _, answer)| (*name, *answer))
+        .collect();
+    let to_mark = handles_to_mark(&answers)?;
+
+    let mut failed = Vec::new();
+    // The handles are this process's own, borrowed from it rather than
+    // opened here: they are marked and left alone.
+    for (name, handle, answer) in queried {
+        if answer != StandardHandle::Present || !to_mark.contains(&name) {
+            continue;
+        }
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            failed.push(format!("{name} (win32 error {})", unsafe {
+                GetLastError()
+            }));
+        }
+    }
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "could not mark this process's standard handles non-inheritable: {}",
+            failed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// What `GetStdHandle` answered for one standard handle.
+///
+/// The two kinds of "nothing" differ: `NULL` means the process has no such
+/// handle, which a hook with no console legitimately has, while
+/// `INVALID_HANDLE_VALUE` means the call itself failed (Codex g1o).
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandardHandle {
+    /// The process has one: it must be marked.
+    Present,
+    /// No such handle: normal, and nothing to mark.
+    Absent,
+    /// The call failed, with its win32 error.
+    Failed(i32),
+}
+
+/// Which of the three standard handles a watcher spawn needs marked.
+///
+/// Pure, so both answers can be exercised where Windows is not: a failure
+/// refuses the spawn exactly as a failed `SetHandleInformation` does, while
+/// an absent handle is passed over (Codex g1o S1).
+#[cfg(any(windows, test))]
+fn handles_to_mark(answers: &[(&'static str, StandardHandle)]) -> Result<Vec<&'static str>> {
+    let failed: Vec<String> = answers
+        .iter()
+        .filter_map(|(name, answer)| match answer {
+            StandardHandle::Failed(code) => Some(format!("{name} (win32 error {code})")),
+            _ => None,
+        })
+        .collect();
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "could not read this process's standard handles: {}",
+            failed.join(", ")
+        );
+    }
+    Ok(answers
+        .iter()
+        .filter(|(_, answer)| *answer == StandardHandle::Present)
+        .map(|(name, _)| *name)
+        .collect())
+}
+
+/// What `GetStdHandle` answers decides whether a watcher may be started:
+/// a handle that cannot be read is a failure, one that is simply absent is
+/// not (Codex g1o S1). Pure, so both answers are exercised here rather than
+/// on Windows.
+#[cfg(test)]
+mod standard_handle_tests {
+    use super::{handles_to_mark, StandardHandle};
+
+    #[test]
+    fn a_handle_that_cannot_be_read_refuses_the_spawn() {
+        let error = handles_to_mark(&[
+            ("stdin", StandardHandle::Present),
+            ("stdout", StandardHandle::Failed(6)),
+            ("stderr", StandardHandle::Absent),
+        ])
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("stdout (win32 error 6)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_absent_handle_is_not_a_failure_and_is_not_marked() {
+        let marked = handles_to_mark(&[
+            ("stdin", StandardHandle::Absent),
+            ("stdout", StandardHandle::Present),
+            ("stderr", StandardHandle::Present),
+        ])
+        .unwrap();
+        assert_eq!(marked, vec!["stdout", "stderr"]);
+        // Nothing present at all is nothing to mark, not an error.
+        assert!(handles_to_mark(&[
+            ("stdin", StandardHandle::Absent),
+            ("stdout", StandardHandle::Absent),
+            ("stderr", StandardHandle::Absent),
+        ])
+        .unwrap()
+        .is_empty());
+    }
 }
 
 // Event payloads are nested and their shape differs per event, so look the
@@ -1313,10 +1549,169 @@ fn tokens_for_loaded_snapshot(
 
 #[cfg(test)]
 mod tests {
+    /// The success path, on a real process: the handles this test binary
+    /// holds can be marked, so a watcher started from here is detached. The
+    /// failing branches cannot be made to happen on demand — a real
+    /// `GetStdHandle` does not fail and `SetHandleInformation` does not fail
+    /// on request — and are covered by `standard_handle_tests` and by the
+    /// code that reports them.
+    #[cfg(windows)]
+    #[test]
+    fn the_standard_handles_of_this_process_can_be_marked_non_inheritable() {
+        let mut command = Command::new("cmd");
+        detach_on_windows(&mut command).unwrap();
+    }
+
     use super::*;
     use crate::cli::{PercentStyle, SidebarLayout};
     use crate::model::{ProviderSnapshot, ResetAt, UsageWindow, WindowKind};
+    use std::cell::Cell;
     use tempfile::tempdir;
+
+    pub(super) type Fetch = fn(Provider, &[String], &CacheStore) -> Result<FetchedSnapshot>;
+
+    thread_local! {
+        static INJECTED_FETCH: Cell<Option<Fetch>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn injected_fetch() -> Option<Fetch> {
+        INJECTED_FETCH.with(Cell::get)
+    }
+
+    fn inject(fetch: Fetch) {
+        INJECTED_FETCH.with(|slot| slot.set(Some(fetch)));
+    }
+
+    fn clear_injection() {
+        INJECTED_FETCH.with(|slot| slot.set(None));
+    }
+
+    /// Point the credential roots at a temporary directory for the length of
+    /// `body`, so no test here reads the machine's own login.
+    fn with_isolated_credentials(body: impl FnOnce()) {
+        let root = tempdir().unwrap();
+        let _guard = crate::providers::test_support::env_guard();
+        // Held to the end, and dropped before the lock: a body that panics
+        // must not leave the redirect behind for the tests beside it
+        // (Codex g1h, suggestion).
+        let _restore = EnvRestore(vec![
+            ("CODEX_AUTH_FILE", std::env::var_os("CODEX_AUTH_FILE")),
+            ("CODEX_HOME", std::env::var_os("CODEX_HOME")),
+        ]);
+        std::env::set_var("CODEX_AUTH_FILE", root.path().join("auth.json"));
+        std::env::set_var("CODEX_HOME", root.path());
+        body();
+    }
+
+    /// Puts back the environment variables it was given when it goes out of
+    /// scope, panic or not.
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, previous) in self.0.drain(..) {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn a_snapshot() -> FetchedSnapshot {
+        FetchedSnapshot::direct(ProviderSnapshot::new(
+            Provider::Codex,
+            vec![UsageWindow::new(WindowKind::Weekly, 42.5, None).unwrap()],
+            1,
+        ))
+    }
+
+    fn failing_fetch(_: Provider, _: &[String], _: &CacheStore) -> Result<FetchedSnapshot> {
+        anyhow::bail!("start codex app-server: program not found");
+    }
+
+    fn succeeding_fetch(_: Provider, _: &[String], _: &CacheStore) -> Result<FetchedSnapshot> {
+        Ok(a_snapshot())
+    }
+
+    /// Make the diagnostic file impossible to write or remove: a directory
+    /// stands where the file would be.
+    fn break_the_diagnostic_file(cache: &CacheStore) {
+        std::fs::create_dir_all(cache.root().join("codex-app-server.error.json")).unwrap();
+    }
+
+    #[test]
+    fn a_diagnostic_that_cannot_be_written_does_not_replace_the_fetch_result() {
+        // Codex g1c G1: the file is a diagnostic. A state directory that
+        // cannot take it must leave the fetch's own outcome alone, say so,
+        // and not stop the other providers or the publish pass.
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        with_isolated_credentials(|| {
+            break_the_diagnostic_file(&cache);
+            inject(failing_fetch);
+            let outcome = refresh_provider(&cache, Provider::Codex, true, &[]).unwrap();
+            clear_injection();
+            assert!(!outcome.available);
+            assert!(outcome.from_cache);
+            let error = outcome.error.expect("the fetch error must survive");
+            assert!(
+                error.contains("start codex app-server: program not found"),
+                "{error}"
+            );
+            assert!(
+                error.contains("not recorded"),
+                "a file that was not written must not be reported as written: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_diagnostic_that_cannot_be_cleared_does_not_stop_a_successful_fetch() {
+        // The other direction: the snapshot has already been saved by the
+        // time the clearing is attempted, so a failure there cannot make a
+        // successful fetch look like a failed one.
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        with_isolated_credentials(|| {
+            break_the_diagnostic_file(&cache);
+            inject(succeeding_fetch);
+            let outcome = refresh_provider(&cache, Provider::Codex, true, &[]).unwrap();
+            clear_injection();
+            assert!(outcome.available);
+            assert!(!outcome.from_cache);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            assert!(
+                cache.load(Provider::Codex).unwrap().is_some(),
+                "the new snapshot must still be in the cache"
+            );
+        });
+    }
+
+    #[test]
+    fn the_diagnostic_file_still_records_a_failure_and_goes_on_success() {
+        // Normal root: the file appears with the fetch's chain and is gone
+        // again once a fetch succeeds.
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let path = directory.path().join("codex-app-server.error.json");
+        with_isolated_credentials(|| {
+            inject(failing_fetch);
+            let outcome = refresh_provider(&cache, Provider::Codex, true, &[]).unwrap();
+            clear_injection();
+            assert!(!outcome.error.unwrap().contains("not recorded"));
+            let recorded: String = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                recorded.contains("start codex app-server: program not found"),
+                "{recorded}"
+            );
+
+            inject(succeeding_fetch);
+            refresh_provider(&cache, Provider::Codex, true, &[]).unwrap();
+            clear_injection();
+            assert!(!path.exists(), "a successful fetch clears the record");
+        });
+    }
 
     fn test_pane(id: &str, harness: Harness) -> AgentPane {
         AgentPane {
@@ -1329,6 +1724,7 @@ mod tests {
             tokens: BTreeMap::new(),
             status: AgentStatus::Idle,
             focused: false,
+            state_labels: BTreeMap::new(),
         }
     }
 
@@ -1622,58 +2018,70 @@ mod tests {
     }
 
     #[test]
+    fn a_display_only_harness_is_published_whatever_the_selection() {
+        assert!(shown(&[Harness::Claude], Harness::Cursor));
+        assert!(shown(&[Harness::Claude], Harness::Claude));
+        assert!(!shown(&[Harness::Claude], Harness::Codex));
+    }
+
+    #[test]
     fn an_idle_pane_already_showing_the_cached_windows_stays_out_of_the_pass() {
-        let directory = tempdir().unwrap();
-        let cache = CacheStore::new(directory.path());
-        let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 900).session_local();
-        snapshot.session_windows.insert(
-            "s1".to_string(),
-            vec![
-                window(WindowKind::FiveHour, 40.0, 9_000),
-                window(WindowKind::Weekly, 20.0, 90_000),
-            ],
-        );
-        cache.save(&snapshot).unwrap();
+        // The row style is read twice — here and inside the watch pass — and
+        // both read the sidebar width from the environment. Hold the one env
+        // lock so a width test cannot swap it between the two reads.
+        crate::prefs::testing::with_env(&[], || {
+            let directory = tempdir().unwrap();
+            let cache = CacheStore::new(directory.path());
+            let mut snapshot = ProviderSnapshot::new(Provider::Claude, vec![], 900).session_local();
+            snapshot.session_windows.insert(
+                "s1".to_string(),
+                vec![
+                    window(WindowKind::FiveHour, 40.0, 9_000),
+                    window(WindowKind::Weekly, 20.0, 90_000),
+                ],
+            );
+            cache.save(&snapshot).unwrap();
 
-        let row = publish_row(&cache);
-        let values = MetadataTokens::from_snapshot_for_pane(
-            &snapshot,
-            1_001,
-            Some("s1"),
-            row.percent,
-            row.shape,
-        );
-        assert_eq!(
-            values.quota_5h_severity,
-            Some(crate::model::Severity::Normal)
-        );
-        assert_eq!(
-            values.quota_week_severity,
-            Some(crate::model::Severity::Normal)
-        );
-        let mut idle = test_pane_with_session("claude-idle", Harness::Claude, "s1");
-        idle.tokens
-            .insert("quota_5h_normal".to_string(), values.quota_5h.clone());
-        idle.tokens
-            .insert("quota_week_normal".to_string(), values.quota_week.clone());
-        idle.tokens.insert(
-            "quota_headroom".to_string(),
-            format!("{:03}", values.quota_headroom.unwrap()),
-        );
-        let panes = [idle, test_pane("other-working", Harness::Claude)];
-        let other = "other-working".to_string();
-        let mut settling = BTreeMap::new();
+            let row = publish_row(&cache);
+            let values = MetadataTokens::from_snapshot_for_pane(
+                &snapshot,
+                1_001,
+                Some("s1"),
+                row.percent,
+                row.shape,
+            );
+            assert_eq!(
+                values.quota_5h_severity,
+                Some(crate::model::Severity::Normal)
+            );
+            assert_eq!(
+                values.quota_week_severity,
+                Some(crate::model::Severity::Normal)
+            );
+            let mut idle = test_pane_with_session("claude-idle", Harness::Claude, "s1");
+            idle.tokens
+                .insert("quota_5h_normal".to_string(), values.quota_5h.clone());
+            idle.tokens
+                .insert("quota_week_normal".to_string(), values.quota_week.clone());
+            idle.tokens.insert(
+                "quota_headroom".to_string(),
+                format!("{:03}", values.quota_headroom.unwrap()),
+            );
+            let panes = [idle, test_pane("other-working", Harness::Claude)];
+            let other = "other-working".to_string();
+            let mut settling = BTreeMap::new();
 
-        let affected = watch_pass_ids(
-            &cache,
-            &panes,
-            &Provider::ALL,
-            std::slice::from_ref(&other),
-            std::slice::from_ref(&other),
-            &mut settling,
-            1_001,
-        );
-        assert_eq!(affected, vec![other]);
+            let affected = watch_pass_ids(
+                &cache,
+                &panes,
+                &Provider::ALL,
+                std::slice::from_ref(&other),
+                std::slice::from_ref(&other),
+                &mut settling,
+                1_001,
+            );
+            assert_eq!(affected, vec![other]);
+        });
     }
 
     #[test]

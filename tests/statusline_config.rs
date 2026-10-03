@@ -131,10 +131,16 @@ fn repair_migrates_a_previous_backup_from_the_old_state_directory() {
     .unwrap();
     fs::write(
         &settings,
-        format!(
-            r#"{{"statusLine":{{"type":"command","command":"HERDR_PLUGIN_STATE_DIR='{}' '/old/herdr-agent-quota' claude-statusline"}}}}"#,
-            old_state.display()
-        ),
+        serde_json::json!({
+            "statusLine": {
+                "type": "command",
+                "command": format!(
+                    "HERDR_PLUGIN_STATE_DIR='{}' '/old/herdr-agent-quota' claude-statusline",
+                    old_state.display()
+                ),
+            }
+        })
+        .to_string(),
     )
     .unwrap();
 
@@ -273,10 +279,16 @@ fn a_legacy_single_name_backup_is_migrated_to_the_settings_specific_name() {
     .unwrap();
     fs::write(
         &settings,
-        format!(
-            r#"{{"statusLine":{{"type":"command","command":"HERDR_PLUGIN_STATE_DIR='{}' '/old/herdr-agent-quota' claude-statusline"}}}}"#,
-            state.display()
-        ),
+        serde_json::json!({
+            "statusLine": {
+                "type": "command",
+                "command": format!(
+                    "HERDR_PLUGIN_STATE_DIR='{}' '/old/herdr-agent-quota' claude-statusline",
+                    state.display()
+                ),
+            }
+        })
+        .to_string(),
     )
     .unwrap();
 

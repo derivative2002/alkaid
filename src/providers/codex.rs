@@ -8,11 +8,12 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -23,18 +24,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const FIVE_HOUR_WINDOW_MINUTES: u64 = 5 * 60;
 const WEEKLY_WINDOW_MINUTES: u64 = 7 * 24 * 60;
 const ROLLOUT_TAIL_BYTES: u64 = 256 * 1024;
-/// How far back from EOF to look for the latest `turn_context` when the tail
-/// has none. Codex writes that event at turn start, then tool calls and
-/// `token_count` lines; a long turn can push the model several megabytes
-/// behind EOF. The previous 256 KB *head* fallback returned the session-start
-/// model instead. Chunked reverse reads stay within this budget so a 40 MB
-/// rollout is not scanned on every watch pulse. Observed live threads put the
-/// latest model 1–4 MB from EOF.
-const ROLLOUT_MODEL_SCAN_BYTES: u64 = 8 * 1024 * 1024;
-/// Extra bytes kept from the newer chunk so a `turn_context` line that
-/// straddles a 256 KB boundary is complete in the older window. Live
-/// `turn_context` records are about 2 KB.
-const ROLLOUT_LINE_OVERLAP_BYTES: u64 = 8 * 1024;
 const CODEX_CONTEXT_BASELINE_TOKENS: u64 = 12_000;
 /// Prompt cache lifetime assumed for a Codex request.
 ///
@@ -153,8 +142,7 @@ fn parse_reset(value: &Value) -> Option<ResetAt> {
 /// the refresh path supplies pane session ids so an older pane is not lost
 /// behind the bounded `thread/list` page.
 pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
-    let executable = std::env::var_os("CODEX_BIN_PATH").unwrap_or_else(|| "codex".into());
-    let mut command = Command::new(executable);
+    let mut command = Command::new(codex_executable()?);
     command
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
@@ -169,7 +157,8 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
             Ok(())
         });
     }
-    let mut child = command.spawn().context("start codex app-server")?;
+    let (mut child, tree) =
+        crate::process::spawn_constrained(&mut command).context("start codex app-server")?;
     let mut input = child.stdin.take().context("open codex app-server stdin")?;
     let stdout = child
         .stdout
@@ -177,40 +166,328 @@ pub fn fetch_for_sessions(session_ids: &[String]) -> Result<ProviderSnapshot> {
         .context("open codex app-server stdout")?;
     let mut output = BufReader::new(stdout);
 
+    request_quota(
+        &mut input,
+        &mut output,
+        child,
+        tree,
+        REQUEST_TIMEOUT,
+        session_ids,
+    )
+}
+
+/// The names a Windows PATH is searched for, in the order they win.
+///
+/// npm installs Codex as a `codex.cmd` shim next to a shell script, and
+/// `CreateProcess` resolves neither for the bare name, so a Windows seat
+/// showed a model but no quota (measured 1001).
+const WINDOWS_CODEX_NAMES: [&str; 2] = ["codex.exe", "codex.cmd"];
+
+/// The executable to start.
+fn codex_executable() -> Result<PathBuf> {
+    let configured = std::env::var_os("CODEX_BIN_PATH");
+    let search = std::env::var_os("PATH");
+    // What a relative entry is resolved against: the current directory, and
+    // the current directory Windows keeps per drive.
+    let base = std::env::current_dir()
+        .ok()
+        .and_then(|base| base.to_str().map(str::to_string));
+    let drive_cwd = |drive: char| {
+        std::env::var(format!("={drive}:"))
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    resolve_codex(
+        configured.as_deref(),
+        search.as_deref(),
+        cfg!(windows),
+        base.as_deref(),
+        &drive_cwd,
+        |path| path.is_file(),
+    )
+}
+
+/// `CODEX_BIN_PATH` wins when it is set, as it always has. On Windows the
+/// bare name is not enough, so the PATH is searched and the first of
+/// [`WINDOWS_CODEX_NAMES`] found is used by its absolute path — a `.cmd` is
+/// handed to Rust's own batch-file handling, and the arguments passed to it
+/// are ours, carrying no user input. Elsewhere the bare name is kept: it is
+/// what `Command` has always resolved through the PATH.
+///
+/// Pure in its inputs so the search can be tested on any host: `search` is a
+/// PATH value, `base` the current directory, `drive_cwd` a drive's own
+/// current directory, and `exists` answers whether a candidate is a file.
+fn resolve_codex(
+    configured: Option<&OsStr>,
+    search: Option<&OsStr>,
+    windows: bool,
+    base: Option<&str>,
+    drive_cwd: &dyn Fn(char) -> Option<String>,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<PathBuf> {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(configured));
+    }
+    if !windows {
+        return Ok(PathBuf::from(UNIX_CODEX_NAME));
+    }
+    let named = search
+        .map(|search| windows_path_directories(&search.to_string_lossy()))
+        .unwrap_or_default();
+    let mut directories = Vec::new();
+    for entry in named {
+        match classify_entry(&entry) {
+            Entry::Absolute(directory) => directories.push(directory),
+            // `\bin` is `bin` under the root of the current directory's
+            // drive, not a directory called `bin` beside it.
+            Entry::RootRelative(directory) => {
+                if let Some(drive) = base.and_then(drive_of) {
+                    directories.push(format!("{drive}:{directory}"));
+                }
+            }
+            // `C:bin` is `bin` under that drive's own current directory.
+            // Windows keeps one per drive; with none to read, the entry is
+            // dropped rather than guessed at (Codex g1l).
+            Entry::DriveRelative(drive, rest) => {
+                // The current drive's own current directory is this pass's
+                // base when the two are the same drive: the environment's
+                // `=X:` entry can be stale, and the base is what the process
+                // is actually running from (Codex g1n).
+                let current = if base.and_then(drive_of) == Some(drive) {
+                    base.filter(|base| windows_absolute(base))
+                        .map(str::to_string)
+                } else {
+                    // Another drive's saved context, kept per drive by
+                    // Windows — and only when it really is an absolute
+                    // directory of the drive that was asked for.
+                    drive_cwd(drive)
+                        .filter(|saved| drive_of(saved) == Some(drive) && windows_absolute(saved))
+                };
+                if let Some(current) = current {
+                    directories.push(if rest.is_empty() {
+                        current
+                    } else {
+                        join_windows(&current, &rest)
+                    });
+                }
+            }
+            Entry::Relative(directory) => {
+                if let Some(base) = base.filter(|base| windows_absolute(base)) {
+                    // A leading `.\` names that directory itself; anything
+                    // else, `..\` included, is left for Windows to make
+                    // sense of.
+                    let relative = directory
+                        .strip_prefix(".\\")
+                        .or_else(|| directory.strip_prefix("./"))
+                        .unwrap_or(directory.as_str());
+                    directories.push(if relative.is_empty() || relative == "." {
+                        base.to_string()
+                    } else {
+                        join_windows(base, relative)
+                    });
+                }
+                // With no absolute base to resolve against, a relative entry
+                // is dropped rather than handed over as a relative program.
+            }
+        }
+    }
+    for name in WINDOWS_CODEX_NAMES {
+        for directory in &directories {
+            let candidate = PathBuf::from(join_windows(directory, name));
+            if exists(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    // The names and the directories are the whole diagnosis of a Windows
+    // seat with no quota, so they are what the caller gets (and what the
+    // recorded provider error says).
+    anyhow::bail!(
+        "no codex executable: looked for {} in {}",
+        WINDOWS_CODEX_NAMES.join(", "),
+        if directories.is_empty() {
+            "no absolute directory on PATH".to_string()
+        } else {
+            directories.join("; ")
+        }
+    )
+}
+
+/// Where a Windows PATH entry points, by Windows' own rules.
+enum Entry {
+    /// `C:\bin`, `\\server\share`.
+    Absolute(String),
+    /// `\bin`: the root of whatever drive the current directory is on.
+    RootRelative(String),
+    /// `C:bin`: the current directory of drive `C`.
+    DriveRelative(char, String),
+    /// `bin`, `.`, `..\bin`: the current directory itself.
+    Relative(String),
+}
+
+fn classify_entry(entry: &str) -> Entry {
+    let bytes = entry.as_bytes();
+    if entry.starts_with("\\\\") {
+        return Entry::Absolute(entry.to_string());
+    }
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        return Entry::Absolute(entry.to_string());
+    }
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Entry::DriveRelative(
+            bytes[0].to_ascii_uppercase() as char,
+            entry[2..].to_string(),
+        );
+    }
+    if entry.starts_with(['\\', '/']) {
+        return Entry::RootRelative(entry.to_string());
+    }
+    Entry::Relative(entry.to_string())
+}
+
+/// The drive a path names, if it names one.
+fn drive_of(path: &str) -> Option<char> {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        .then(|| bytes[0].to_ascii_uppercase() as char)
+}
+
+/// The directories a Windows PATH names, in order.
+///
+/// Windows separates them with `;`, and one that contains a `;` of its own is
+/// quoted — `"C:\Tools;Codex";C:\bin` — so the quotes delimit a directory
+/// rather than being part of it. The rule is implemented here, instead of
+/// calling `std::env::split_paths`, because the host running this code need
+/// not be the Windows the search is for: the host's own rules would split the
+/// example wrongly. The result is what that function returns for a Windows
+/// target.
+fn windows_path_directories(search: &str) -> Vec<String> {
+    let mut directories = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in search.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            ';' if !quoted => directories.push(std::mem::take(&mut current)),
+            _ => current.push(character),
+        }
+    }
+    directories.push(current);
+    directories
+        .into_iter()
+        .map(|directory| directory.trim().to_string())
+        .filter(|directory| !directory.is_empty())
+        .collect()
+}
+
+/// A Windows path that names a drive (`C:\…`) or a UNC share (`\\…`).
+fn windows_absolute(directory: &str) -> bool {
+    let bytes = directory.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    drive || directory.starts_with("\\\\")
+}
+
+/// `directory\name`, the way Windows joins, on any host.
+fn join_windows(directory: &str, name: &str) -> String {
+    format!("{}\\{name}", directory.trim_end_matches(['\\', '/']))
+}
+
+/// What a Unix-like system runs: the name the shell resolves.
+const UNIX_CODEX_NAME: &str = "codex";
+
+/// Ask the app-server, ending its tree if the request runs past `timeout`.
+///
+/// `timeout` is a parameter so the entry point can be exercised without
+/// waiting the real fifteen seconds, and so the timeout branch — where the
+/// watchdog, not this thread, is the one that ends the tree — can be run
+/// (Codex g1e).
+fn request_quota(
+    input: &mut ChildStdin,
+    output: &mut BufReader<impl std::io::Read>,
+    child: Child,
+    tree: crate::process::Tree,
+    timeout: Duration,
+    session_ids: &[String],
+) -> Result<ProviderSnapshot> {
     // The watchdog and this thread share the child, so it can only ever be
     // signalled while it is still unreaped. Signalling a bare pid after
     // `wait` would race with the operating system recycling that pid.
-    let child = Arc::new(Mutex::new(Some(child)));
+    let child = Arc::new(Mutex::new(Some((child, tree))));
+    // Whoever ends the tree reports its own failure here; the other thread
+    // finds the child already taken. An empty slot is not proof that the
+    // tree ended, so the failure has to be kept somewhere both threads can
+    // reach (Codex g1e).
+    let end_failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let (cancel, cancelled) = mpsc::channel();
     let watchdog = Arc::clone(&child);
-    thread::spawn(move || {
-        thread::sleep(REQUEST_TIMEOUT);
-        terminate(&watchdog);
+    let watchdog_end_failure = Arc::clone(&end_failure);
+    let watchdog = thread::spawn(move || {
+        // Sixty seconds of sleeping would be joined below, so the main
+        // thread cancels this once it has taken the child itself: the join
+        // then waits only for a watchdog that has actually timed out
+        // (Codex g1f).
+        if cancelled.recv_timeout(timeout).is_err() {
+            if let Err(error) = terminate(&watchdog) {
+                let mut slot = watchdog_end_failure
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *slot = Some(format!(
+                    "the timed-out codex app-server could not be ended: {error:#}"
+                ));
+            }
+        }
     });
 
-    let result = fetch_from_process(&mut input, &mut output, session_ids);
-    terminate(&child);
-    result
+    let fetched = fetch_from_process(input, output, session_ids);
+    let ended = terminate(&child);
+    let _ = cancel.send(());
+    // Read the slot only after the watchdog is done: otherwise a failure it
+    // is still recording could be missed (Codex g1f).
+    let _ = watchdog.join();
+    let timed_out_without_ending = end_failure
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    let end_failure = match (ended, timed_out_without_ending) {
+        (Err(error), _) => Some(format!("{error:#}")),
+        (Ok(()), failure) => failure,
+    };
+    match (fetched, end_failure) {
+        (Ok(snapshot), None) => Ok(snapshot),
+        // The fetch's own error stays the one the caller recovers from; the
+        // termination failure rides along in its chain rather than replacing
+        // it.
+        (Err(error), failure) => Err(match failure {
+            Some(failure) => error.context(failure),
+            None => error,
+        }),
+        (Ok(_), Some(failure)) => Err(anyhow::anyhow!(failure)),
+    }
 }
 
 /// Kill the app-server's process group and reap it, at most once.
 ///
 /// Whichever of the request thread and the watchdog gets here first takes the
 /// child; the other one finds an empty slot and does nothing.
-fn terminate(child: &Mutex<Option<Child>>) {
+fn terminate(child: &Mutex<Option<(Child, crate::process::Tree)>>) -> Result<()> {
     let Ok(mut slot) = child.lock() else {
-        return;
+        anyhow::bail!("lock codex app-server child");
     };
-    let Some(mut child) = slot.take() else {
-        return;
+    let Some((mut child, tree)) = slot.take() else {
+        return Ok(());
     };
-    // `pre_exec` put the app-server in its own process group, so this also
-    // collects any helper it spawned.
-    #[cfg(unix)]
-    unsafe {
-        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-    }
-    let _ = child.kill();
+    // `pre_exec` put the app-server in its own process group (a job object
+    // on Windows), so this also collects any helper it spawned.
+    tree.end(&mut child)?;
     let _ = child.wait();
+    Ok(())
 }
 
 fn fetch_from_process(
@@ -342,17 +619,47 @@ fn enrich_local_sessions_at(snapshot: &mut ProviderSnapshot, home: &Path, sessio
     }
 }
 
-fn find_rollout_paths(home: &Path, session_ids: &[String]) -> BTreeMap<String, PathBuf> {
+pub(crate) fn find_rollout_paths(home: &Path, session_ids: &[String]) -> BTreeMap<String, PathBuf> {
+    walk_rollouts(home, session_ids, false).unwrap_or_default()
+}
+
+/// [`find_rollout_paths`], but a directory or entry that cannot be read is an
+/// error instead of being skipped, so a caller can tell "no rollout" from
+/// "could not look". A missing `sessions` / `archived_sessions` is not an
+/// error.
+pub(crate) fn find_rollout_paths_strict(
+    home: &Path,
+    session_ids: &[String],
+) -> std::io::Result<BTreeMap<String, PathBuf>> {
+    walk_rollouts(home, session_ids, true)
+}
+
+fn walk_rollouts(
+    home: &Path,
+    session_ids: &[String],
+    strict: bool,
+) -> std::io::Result<BTreeMap<String, PathBuf>> {
     let mut directories = vec![home.join("sessions"), home.join("archived_sessions")];
     let mut newest = BTreeMap::<String, (u64, PathBuf)>::new();
     while let Some(directory) = directories.pop() {
-        let Ok(entries) = fs::read_dir(directory) else {
-            continue;
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if strict && error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error);
+            }
+            Err(_) => continue,
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if strict => return Err(error),
+                Err(_) => continue,
+            };
             let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if strict => return Err(error),
+                Err(_) => continue,
             };
             if file_type.is_dir() {
                 directories.push(path);
@@ -384,10 +691,10 @@ fn find_rollout_paths(home: &Path, session_ids: &[String]) -> BTreeMap<String, P
             }
         }
     }
-    newest
+    Ok(newest
         .into_iter()
         .map(|(session_id, (_, path))| (session_id, path))
-        .collect()
+        .collect())
 }
 
 struct RolloutObservation {
@@ -418,59 +725,13 @@ fn read_rollout_observation(path: &Path, session_id: &str) -> Option<RolloutObse
     Some(observation)
 }
 
-/// Walk the rollout newest-first in tail-sized chunks until a `turn_context`
-/// model is found, stopping at [`ROLLOUT_MODEL_SCAN_BYTES`]. Adjacent chunks
-/// overlap so a `turn_context` that straddles a boundary is still parsed.
+/// The latest `turn_context` model, newest-first (see
+/// [`crate::seat_model::newest_match`]). Never the file head: that is the
+/// first turn's model, not the current one.
 fn read_latest_rollout_model(path: &Path) -> Option<String> {
-    let mut file = fs::File::open(path).ok()?;
-    let length = file.metadata().ok()?.len();
-    if length == 0 {
-        return None;
-    }
-    let floor = length.saturating_sub(ROLLOUT_MODEL_SCAN_BYTES);
-    let mut cursor = length;
-    while cursor > floor {
-        let start = cursor.saturating_sub(ROLLOUT_TAIL_BYTES).max(floor);
-        file.seek(SeekFrom::Start(start)).ok()?;
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(cursor.saturating_sub(start))
-            .read_to_end(&mut bytes)
-            .ok()?;
-        let text = String::from_utf8_lossy(&bytes);
-        let mut slice = text.as_ref();
-        if start > 0 {
-            slice = match slice.split_once('\n') {
-                Some((_, rest)) => rest,
-                None => {
-                    let Some(next) = next_reverse_cursor(start, cursor, floor) else {
-                        break;
-                    };
-                    cursor = next;
-                    continue;
-                }
-            };
-        }
-        if cursor < length && !slice.is_empty() && !slice.ends_with('\n') {
-            slice = slice.rsplit_once('\n').map(|(rest, _)| rest).unwrap_or("");
-        }
-        if let Some(model) = parse_rollout_model(slice) {
-            return Some(model);
-        }
-        let Some(next) = next_reverse_cursor(start, cursor, floor) else {
-            break;
-        };
-        cursor = next;
-    }
-    None
-}
-
-fn next_reverse_cursor(start: u64, cursor: u64, floor: u64) -> Option<u64> {
-    if start <= floor {
-        return None;
-    }
-    let next = start.saturating_add(ROLLOUT_LINE_OVERLAP_BYTES);
-    (next < cursor).then_some(next)
+    crate::seat_model::newest_match(path, parse_rollout_model)
+        .ok()
+        .flatten()
 }
 
 fn parse_rollout_observation(text: &str, session_id: &str) -> Option<RolloutObservation> {
@@ -554,7 +815,7 @@ fn parse_rollout_timestamp(entry: &Value) -> Option<u64> {
         .map(ResetAt::unix_seconds)
 }
 
-fn parse_rollout_model(text: &str) -> Option<String> {
+pub(crate) fn parse_rollout_model(text: &str) -> Option<String> {
     text.lines().rev().find_map(|line| {
         let entry = serde_json::from_str::<Value>(line).ok()?;
         (entry.get("type").and_then(Value::as_str) == Some("turn_context"))
@@ -671,9 +932,31 @@ fn read_rpc(output: &mut BufReader<impl std::io::Read>, expected_id: u64) -> Res
             continue;
         }
         if let Some(error) = value.get("error") {
-            anyhow::bail!("Codex app-server request failed: {error}");
+            anyhow::bail!("Codex app-server request failed: {}", safe_rpc_error(error));
         }
         return Ok(value);
+    }
+}
+
+/// What is safe to quote from an app-server error: the stage, and the
+/// integer code JSON-RPC defines.
+///
+/// Nothing of upstream's own text. `data` may carry a credential, and
+/// `message` is free text whose credential shapes cannot be enumerated —
+/// three rounds of review each found more of them (a password may hold the
+/// sub-delimiters a URL allows, a quoted value may hold spaces, an
+/// authentication scheme is matched without regard to case). Rather than
+/// keep guessing at delimiters, the persistent diagnostic for an RPC failure
+/// is a fixed stage plus a validated integer code, and the message is not
+/// quoted at all (Codex g1i). The startup failure that matters most on
+/// Windows — the OS error under `start codex app-server` — does not come
+/// through here and keeps its whole chain.
+fn safe_rpc_error(error: &Value) -> String {
+    match error.get("code") {
+        Some(Value::Number(number)) if number.is_i64() || number.is_u64() => {
+            format!("code {number}")
+        }
+        _ => "an error with no integer code".to_string(),
     }
 }
 
@@ -760,6 +1043,647 @@ pub fn account_is_chatgpt(value: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A child running `command`, contained the way a real app-server is:
+    /// its own process group on Unix (`setpgid`, as both production callers
+    /// do) so the group kill is really exercised, and a job object on
+    /// Windows (Codex g1f).
+    fn contained_server(
+        command: &str,
+    ) -> (
+        ChildStdin,
+        BufReader<std::process::ChildStdout>,
+        Child,
+        crate::process::Tree,
+    ) {
+        let mut server = Command::new("sh");
+        server
+            .args(["-c", command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        unsafe {
+            server.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let (mut child, tree) = crate::process::spawn_constrained(&mut server).unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = BufReader::new(child.stdout.take().unwrap());
+        (input, output, child, tree)
+    }
+
+    #[test]
+    fn a_timeout_whose_tree_cannot_be_ended_is_reported_to_the_caller() {
+        // Codex g1e: the watchdog, not this thread, is the one that ends a
+        // timed-out app-server's tree, so its failure has to be kept where
+        // the caller can find it. No network, no credentials: the child is
+        // `sh -c 'sleep 1'`, which outlives the 50 ms timeout and answers
+        // nothing, so the request thread is still blocked when the watchdog
+        // takes the child.
+        let (mut input, mut output, child, real_tree) = contained_server("sleep 0.5");
+        let error = request_quota(
+            &mut input,
+            &mut output,
+            child,
+            crate::process::testing::failing_tree(),
+            Duration::from_millis(50),
+            &[],
+        )
+        .unwrap_err();
+        drop(real_tree);
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("the timed-out codex app-server could not be ended"),
+            "only the watchdog writes this line: {chain}"
+        );
+        assert!(
+            chain.contains("TerminateJobObject failed (win32 error 1234)"),
+            "the stage and the code must reach the caller: {chain}"
+        );
+    }
+
+    #[test]
+    fn a_timeout_whose_tree_ends_cleanly_reports_no_termination_failure() {
+        // The positive side of the same entry: the watchdog ends the tree
+        // for real, and the caller sees only the fetch's own error.
+        let (mut input, mut output, child, tree) = contained_server("sleep 0.5");
+        let error = request_quota(
+            &mut input,
+            &mut output,
+            child,
+            tree,
+            Duration::from_millis(50),
+            &[],
+        )
+        .unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(!chain.contains("could not be ended"), "{chain}");
+    }
+
+    #[test]
+    fn a_fake_app_server_yields_the_subscription_windows() {
+        // The happy path through the same entry, end to end and offline: the
+        // "app-server" is a shell loop that answers each request line with
+        // the id it was given.
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) inner='{}' ;;
+    *account/read*) inner='{"account":{"type":"chatgpt"}}' ;;
+    *rateLimits/read*) inner='{"rateLimits":{"primary":{"usedPercent":12.0,"windowDurationMins":300,"resetsAt":1786795200},"secondary":{"usedPercent":24.0,"windowDurationMins":10080,"resetsAt":1787400000}}}' ;;
+    *thread/list*) inner='{"data":[]}' ;;
+    *) continue ;;
+  esac
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$inner"
+done
+"#;
+        let (mut input, mut output, child, tree) = contained_server(script);
+        // `request_quota` reads the account from the credential root, so the
+        // test must not run against the real one: both variables point into
+        // a temporary directory for as long as it runs (Codex g1f).
+        let root = tempfile::tempdir().unwrap();
+        let _guard = crate::providers::test_support::env_guard();
+        let previous_auth = std::env::var_os("CODEX_AUTH_FILE");
+        let previous_home = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_AUTH_FILE", root.path().join("auth.json"));
+        std::env::set_var("CODEX_HOME", root.path());
+        let fetched = request_quota(
+            &mut input,
+            &mut output,
+            child,
+            tree,
+            Duration::from_secs(5),
+            &[],
+        );
+        match previous_auth {
+            Some(value) => std::env::set_var("CODEX_AUTH_FILE", value),
+            None => std::env::remove_var("CODEX_AUTH_FILE"),
+        }
+        match previous_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        let snapshot = fetched.unwrap();
+        assert!(snapshot.window(WindowKind::FiveHour).is_some());
+        assert!(snapshot.window(WindowKind::Weekly).is_some());
+        assert!(
+            snapshot.account_id.is_none(),
+            "the test must not pick up the machine's real account"
+        );
+    }
+
+    /// The PATH search on Windows, offline: `held` is the fake filesystem,
+    /// `base` the directory a relative entry resolves against.
+    fn resolve_with(held: &[&str], path: &str) -> Result<PathBuf> {
+        resolve_with_base(held, path, Some("C:\\work"))
+    }
+
+    fn resolve_with_base(held: &[&str], path: &str, base: Option<&str>) -> Result<PathBuf> {
+        let no_drive_cwd = |_: char| None;
+        resolve_codex(
+            None,
+            Some(OsStr::new(path)),
+            true,
+            base,
+            &no_drive_cwd,
+            |candidate| held.contains(&windows_shaped(candidate).as_str()),
+        )
+    }
+
+    /// The same, with a base and a drive's own current directory supplied —
+    /// what a `C:bin` entry needs.
+    fn resolve_at(
+        held: &[&str],
+        path: &str,
+        base: Option<&str>,
+        saved: Option<(char, &str)>,
+    ) -> Result<PathBuf> {
+        let drive_cwd = |wanted: char| match saved {
+            Some((drive, directory)) if drive == wanted => Some(directory.to_string()),
+            _ => None,
+        };
+        resolve_codex(
+            None,
+            Some(OsStr::new(path)),
+            true,
+            base,
+            &drive_cwd,
+            |candidate| held.contains(&windows_shaped(candidate).as_str()),
+        )
+    }
+
+    fn resolve_with_drive_cwd(
+        held: &[&str],
+        path: &str,
+        drive: char,
+        cwd: &str,
+    ) -> Result<PathBuf> {
+        resolve_at(held, path, Some("C:\\work"), Some((drive, cwd)))
+    }
+
+    fn windows_shaped(path: &Path) -> String {
+        path.to_string_lossy().replace('/', "\\")
+    }
+
+    fn absolute(held: &[&str], path: &str) -> String {
+        let selected = windows_shaped(&resolve_with(held, path).unwrap());
+        assert!(windows_absolute(&selected), "not absolute: {selected}");
+        selected
+    }
+
+    #[test]
+    fn the_windows_search_prefers_the_executable_and_accepts_the_shim() {
+        let path = "C:\\npm;C:\\bin";
+        for (held, expected) in [
+            (vec!["C:\\npm\\codex.exe"], "C:\\npm\\codex.exe"),
+            (vec!["C:\\npm\\codex.cmd"], "C:\\npm\\codex.cmd"),
+            // Both present: the executable wins, wherever it is.
+            (
+                vec!["C:\\npm\\codex.exe", "C:\\bin\\codex.cmd"],
+                "C:\\npm\\codex.exe",
+            ),
+            (
+                vec!["C:\\bin\\codex.exe", "C:\\npm\\codex.cmd"],
+                "C:\\bin\\codex.exe",
+            ),
+        ] {
+            assert_eq!(absolute(&held, path), expected, "{held:?}");
+        }
+    }
+
+    #[test]
+    fn a_relative_path_entry_is_resolved_to_an_absolute_program() {
+        // Codex g1k: what is handed to `Command` has to be absolute, so a
+        // relative entry is resolved against the current directory — the
+        // same thing Windows would search.
+        assert_eq!(
+            absolute(&["C:\\work\\codex.exe"], "."),
+            "C:\\work\\codex.exe"
+        );
+        assert_eq!(
+            absolute(&["C:\\work\\codex.cmd"], "."),
+            "C:\\work\\codex.cmd"
+        );
+        assert_eq!(
+            absolute(&["C:\\work\\bin\\codex.exe"], "bin;C:\\fallback"),
+            "C:\\work\\bin\\codex.exe"
+        );
+        assert_eq!(
+            absolute(&["C:\\work\\bin\\codex.cmd"], "bin;C:\\fallback"),
+            "C:\\work\\bin\\codex.cmd"
+        );
+        // With nothing absolute to resolve against, a relative entry is
+        // dropped rather than handed over relative.
+        let error = resolve_with_base(&["codex.exe"], ".", None).unwrap_err();
+        assert!(
+            error.to_string().contains("no absolute directory on PATH"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_root_relative_entry_is_the_current_drives_root() {
+        // `\\bin` is `bin` under the root of whatever drive the current
+        // directory is on, not a directory beside it (Codex g1l).
+        assert_eq!(
+            absolute(&["C:\\bin\\codex.exe"], "\\bin"),
+            "C:\\bin\\codex.exe"
+        );
+        assert_eq!(
+            absolute(&["C:\\bin\\codex.cmd"], "\\bin"),
+            "C:\\bin\\codex.cmd"
+        );
+        // No drive to take from the current directory: dropped, not guessed.
+        let error = resolve_with_base(&["C:\\bin\\codex.exe"], "\\bin", None).unwrap_err();
+        assert!(
+            error.to_string().contains("no absolute directory on PATH"),
+            "{error}"
+        );
+        let error =
+            resolve_with_base(&["codex.exe"], "\\bin", Some("\\\\server\\share")).unwrap_err();
+        assert!(
+            error.to_string().contains("no absolute directory on PATH"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_drive_relative_entry_uses_that_drives_own_current_directory() {
+        // `C:bin` is `bin` under drive C's current directory, which Windows
+        // keeps per drive.
+        assert_eq!(
+            windows_shaped(
+                &resolve_with_drive_cwd(&["D:\\work\\bin\\codex.exe"], "D:bin", 'D', "D:\\work")
+                    .unwrap()
+            ),
+            "D:\\work\\bin\\codex.exe"
+        );
+        // Nothing to read it from: dropped rather than guessed at.
+        let error = resolve_with_base(&["C:\\work\\bin\\codex.exe"], "C:bin", None).unwrap_err();
+        assert!(
+            error.to_string().contains("no absolute directory on PATH"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_current_drive_uses_this_pass_base_not_a_stale_environment_entry() {
+        // Codex g1n: the current drive's current directory is where the
+        // process is running from, so the live base wins over a saved `=C:`
+        // — and over the other drive's context entirely.
+        let held = ["C:\\live\\bin\\codex.exe", "C:\\old\\bin\\codex.exe"];
+        for saved in [Some(('C', "C:\\old")), Some(('D', "D:\\work")), None] {
+            assert_eq!(
+                windows_shaped(&resolve_at(&held, "C:bin", Some("C:\\live"), saved).unwrap()),
+                "C:\\live\\bin\\codex.exe",
+                "{saved:?}"
+            );
+        }
+        // A base that is not the entry's drive is not used for it.
+        let error = resolve_at(
+            &["C:\\live\\bin\\codex.exe"],
+            "D:bin",
+            Some("C:\\live"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("no absolute directory on PATH"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_saved_drive_directory_must_be_that_drives_absolute_path() {
+        // Codex g1n: what the `=X:` entry holds goes into the search only
+        // when it really is an absolute directory of the drive asked for.
+        let held = [
+            "relative-base\\bin\\codex.exe",
+            "C:\\other\\bin\\codex.exe",
+            "D:relative\\bin\\codex.exe",
+            "\\\\server\\share\\bin\\codex.exe",
+        ];
+        for saved in [
+            "relative-base",
+            "C:\\other",
+            "D:relative",
+            "\\\\server\\share",
+        ] {
+            let error =
+                resolve_at(&held, "D:bin", Some("C:\\work"), Some(('D', saved))).unwrap_err();
+            assert!(
+                error.to_string().contains("no absolute directory on PATH"),
+                "{saved}: {error}"
+            );
+        }
+        // The right shape still works, for both names.
+        for (name, expected) in [
+            ("codex.exe", "D:\\work\\bin\\codex.exe"),
+            ("codex.cmd", "D:\\work\\bin\\codex.cmd"),
+        ] {
+            assert_eq!(
+                windows_shaped(
+                    &resolve_at(
+                        &[expected],
+                        "D:bin",
+                        Some("C:\\work"),
+                        Some(('D', "D:\\work"))
+                    )
+                    .unwrap()
+                ),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_windows_path_entry_is_read_by_windows_rules() {
+        // Codex g1k: quotes delimit an entry, and a `;` inside them is part
+        // of the directory rather than a separator.
+        let path = "\"C:\\Program Files\\Codex\";C:\\bin";
+        assert_eq!(
+            absolute(&["C:\\Program Files\\Codex\\codex.exe"], path),
+            "C:\\Program Files\\Codex\\codex.exe"
+        );
+        assert_eq!(
+            absolute(&["C:\\Program Files\\Codex\\codex.cmd"], path),
+            "C:\\Program Files\\Codex\\codex.cmd"
+        );
+        let path = "\"C:\\Tools;Codex\";C:\\bin";
+        assert_eq!(
+            absolute(&["C:\\Tools;Codex\\codex.exe"], path),
+            "C:\\Tools;Codex\\codex.exe"
+        );
+        assert_eq!(
+            absolute(&["C:\\Tools;Codex\\codex.cmd"], path),
+            "C:\\Tools;Codex\\codex.cmd"
+        );
+        // The separator still separates outside the quotes.
+        assert_eq!(
+            absolute(&["C:\\bin\\codex.exe"], path),
+            "C:\\bin\\codex.exe"
+        );
+    }
+
+    #[test]
+    fn the_windows_search_says_what_it_looked_for_and_where() {
+        let error = resolve_with(&[], "C:\\npm;C:\\bin").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("codex.exe, codex.cmd"), "{message}");
+        assert!(message.contains("C:\\npm; C:\\bin"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_path_names_no_directory() {
+        for search in [None, Some(""), Some(";;")] {
+            let no_drive_cwd = |_: char| None;
+            let error = resolve_codex(
+                None,
+                search.map(OsStr::new),
+                true,
+                Some("C:\\work"),
+                &no_drive_cwd,
+                |_| unreachable!("nothing can be found without a directory"),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("no absolute directory on PATH"),
+                "{search:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_binary_wins_and_other_systems_keep_the_bare_name() {
+        // `CODEX_BIN_PATH` has always won, and a Unix-like system runs the
+        // name its shell resolves.
+        assert_eq!(
+            resolve_codex(
+                Some(OsStr::new("/opt/codex")),
+                None,
+                true,
+                None,
+                &|_: char| unreachable!("an explicit path is not searched for"),
+                |_| unreachable!("an explicit path is not searched for")
+            )
+            .unwrap(),
+            PathBuf::from("/opt/codex")
+        );
+        assert_eq!(
+            resolve_codex(None, None, false, None, &|_: char| None, |_| unreachable!()).unwrap(),
+            PathBuf::from("codex")
+        );
+        // An empty value is the same as none: it names nothing.
+        assert_eq!(
+            resolve_codex(
+                Some(OsStr::new("")),
+                None,
+                false,
+                None,
+                &|_: char| None,
+                |_| unreachable!()
+            )
+            .unwrap(),
+            PathBuf::from("codex")
+        );
+    }
+
+    /// Every hostile shape the three review rounds produced, in one error
+    /// frame, driven through the real RPC path.
+    const HOSTILE_MESSAGE: &str = "denied: GET https://api.example.com/v1 via https://user:pw@proxy.example.com, api_key=%s, Authorization: bearer %s, password=prefix %s end";
+    const SENTINEL: &str = "credential-sentinel-9f2c";
+
+    fn hostile_error_server() -> String {
+        format!(
+            r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"{HOSTILE_MESSAGE}","data":{{"access_token":"%s","nested":{{"refresh_token":"%s"}}}}}}}}\n' "$id" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}" "{SENTINEL}"
+done
+"#
+        )
+    }
+
+    #[test]
+    fn an_rpc_error_body_never_reaches_the_caller_verbatim() {
+        // Codex g1i: upstream's message is not quoted at all. Three rounds
+        // found three more credential shapes each time, so the persistent
+        // diagnostic is the stage plus the integer code, and nothing else.
+        // The frame carries a sentinel in the message's own fields and in
+        // both of the payload's values.
+        let (mut input, mut output, child, tree) = contained_server(&hostile_error_server());
+        let error = request_quota(
+            &mut input,
+            &mut output,
+            child,
+            tree,
+            Duration::from_secs(5),
+            &[],
+        )
+        .unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("Codex app-server request failed: code -32000"),
+            "the stage and the code must survive: {chain}"
+        );
+        assert!(
+            !chain.contains(SENTINEL),
+            "a credential reached the caller: {chain}"
+        );
+        assert!(
+            !chain.contains("denied")
+                && !chain.contains("access_token")
+                && !chain.contains("refresh_token")
+                && !chain.contains("user:pw@")
+                && !chain.contains("password"),
+            "no part of the message or the payload may be quoted: {chain}"
+        );
+    }
+
+    #[test]
+    fn an_error_message_is_never_quoted_however_it_is_shaped() {
+        // The boundary shapes Codex g1i listed, plus the empty and the very
+        // long message, all through the same projection.
+        let long = "x".repeat(4096);
+        for message in [
+            "",
+            " ",
+            "denied",
+            "user:prefix&sentinel@api.example.com",
+            "password=\"prefix sentinel\"",
+            "Authorization: bEaReR sentinel",
+            "Authorization: basic sentinel",
+            long.as_str(),
+            "https://user:prefix;sentinel@api.example.com/v1",
+            "https://user:prefix,sentinel@api.example.com/v1",
+        ] {
+            assert_eq!(
+                safe_rpc_error(&json!({"code": -32000, "message": message})),
+                "code -32000",
+                "{message}"
+            );
+            assert_eq!(
+                safe_rpc_error(&json!({"message": message})),
+                "an error with no integer code",
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_string_code_is_not_quoted_but_an_integer_one_is() {
+        // JSON-RPC's code is an integer, and a string code is upstream's free
+        // text like the message.
+        assert_eq!(
+            safe_rpc_error(&json!({"code": SENTINEL, "message": "denied"})),
+            "an error with no integer code"
+        );
+        assert_eq!(
+            safe_rpc_error(&json!({"code": -32000, "message": "denied"})),
+            "code -32000"
+        );
+        // An object code is as untrusted as a string one.
+        assert_eq!(
+            safe_rpc_error(&json!({"code": {"secret": SENTINEL}, "message": "denied"})),
+            "an error with no integer code"
+        );
+        // A float is not JSON-RPC's error code either.
+        assert_eq!(
+            safe_rpc_error(&json!({"code": -32000.5, "message": "denied"})),
+            "an error with no integer code"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_message_changes_nothing_about_the_projection() {
+        // The positive control: a message that is only words is not quoted
+        // either — the projection no longer looks at it at all.
+        assert_eq!(
+            safe_rpc_error(&json!({"code": -32000, "message": "no credentials in this sentence"})),
+            "code -32000"
+        );
+    }
+
+    #[test]
+    fn an_error_without_a_nameable_part_does_not_quote_the_payload() {
+        // Nothing nameable: the diagnostic is still just the fixed phrase,
+        // and the payload is never quoted.
+        let error = json!({"data": {"secret": "credential-sentinel-9f2c"}});
+        let projected = safe_rpc_error(&error);
+        assert_eq!(projected, "an error with no integer code");
+        assert!(!projected.contains("credential-sentinel"));
+    }
+
+    /// The recorded diagnostic file is written from whatever the fetch
+    /// returned, so the projection above has to be what the text is made
+    /// from: this drives the real refresh path with a real app-server stub
+    /// and reads the file back.
+    #[cfg(unix)]
+    #[test]
+    fn the_recorded_diagnostic_never_holds_a_credential_from_an_rpc_error() {
+        use std::io::Write;
+        const SENTINEL: &str = "credential-sentinel-9f2c";
+        let directory = tempfile::tempdir().unwrap();
+        let stub = directory.path().join("codex-stub");
+        let mut file = std::fs::File::create(&stub).unwrap();
+        writeln!(
+            file,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":"{SENTINEL}","message":"denied for api_key=\\"{SENTINEL}\" and Authorization: Bearer {SENTINEL} via https://user:pw@proxy.example.com","data":{{"access_token":"{SENTINEL}"}}}}}}\n' "$id"
+done"#
+        )
+        .unwrap();
+        drop(file);
+        let mut permissions = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&stub, permissions).unwrap();
+
+        let cache = crate::cache::CacheStore::new(directory.path().join("state"));
+        let _guard = crate::providers::test_support::env_guard();
+        let previous_bin = std::env::var_os("CODEX_BIN_PATH");
+        let previous_home = std::env::var_os("CODEX_HOME");
+        let previous_auth = std::env::var_os("CODEX_AUTH_FILE");
+        std::env::set_var("CODEX_BIN_PATH", &stub);
+        std::env::set_var("CODEX_HOME", directory.path().join("codex-home"));
+        std::env::set_var(
+            "CODEX_AUTH_FILE",
+            directory.path().join("codex-home/auth.json"),
+        );
+        let outcome = crate::refresh::refresh_codex_for_test(&cache);
+        for (name, previous) in [
+            ("CODEX_BIN_PATH", previous_bin),
+            ("CODEX_HOME", previous_home),
+            ("CODEX_AUTH_FILE", previous_auth),
+        ] {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        let error = outcome.error.expect("the fetch must have failed");
+        assert!(!error.contains(SENTINEL), "{error}");
+        let recorded =
+            std::fs::read_to_string(cache.root().join("codex-app-server.error.json")).unwrap();
+        assert!(
+            recorded.contains("Codex app-server request failed"),
+            "{recorded}"
+        );
+        assert!(
+            !recorded.contains(SENTINEL),
+            "a credential reached the file: {recorded}"
+        );
+    }
 
     #[test]
     fn selects_codex_windows_by_duration_not_position() {

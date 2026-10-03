@@ -36,7 +36,10 @@
 #
 # --agent-order quota (default) keeps each Space contiguous and ranks by
 # least quota left inside the space; it replaces the panel's sort until it
-# is set back to default. default leaves Herdr's own agent panel ordering
+# is set back to default. attention lists every agent across Spaces with the
+# ones that need you first (blocked, unseen completion), then working, then
+# idle, least quota left first inside each band, and leads each identity row
+# with the action state. default leaves Herdr's own agent panel ordering
 # alone (also Space-grouped unless the user set priority).
 #
 # --low-quota-alert off (default) never notifies. A percentage notifies once,
@@ -148,8 +151,8 @@ case "$QUOTA_PERCENT" in
   *) die "quota-percent must be remaining or used" ;;
 esac
 case "$AGENT_ORDER" in
-  ""|default|quota) ;;
-  *) die "agent-order must be default or quota" ;;
+  ""|default|quota|attention) ;;
+  *) die "agent-order must be default, quota or attention" ;;
 esac
 # `0` is accepted as a spelling of off, the same as configure reads it.
 case "$LOW_QUOTA_ALERT" in

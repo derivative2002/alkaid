@@ -1,3 +1,8 @@
+#![cfg(unix)]
+
+mod common;
+
+use common::*;
 use herdr_agent_quota::cache::CacheStore;
 use herdr_agent_quota::cli::AgentSelection;
 use herdr_agent_quota::configure::herdr::{add_quota_row, remove_quota_row};
@@ -11,10 +16,50 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
+/// Tests in this binary run as threads, write shell stubs and then run the
+/// plugin, which executes them. A thread that forks while another thread
+/// still has a stub open for writing hands the child that write handle until
+/// the child execs; executing the stub in that window fails with ETXTBSY
+/// ("Text file busy", seen 0927 about one run in five). Writes take this lock
+/// exclusively, spawns take it shared, so no fork overlaps an open write.
+static EXEC_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn exec_write_guard() -> std::sync::RwLockWriteGuard<'static, ()> {
+    EXEC_LOCK.write().unwrap_or_else(|error| error.into_inner())
+}
+
+fn locked_write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let _guard = exec_write_guard();
+    fs::write(path, contents)
+}
+
+trait LockedCommand {
+    fn locked_output(&mut self) -> std::io::Result<std::process::Output>;
+    fn locked_status(&mut self) -> std::io::Result<std::process::ExitStatus>;
+    fn locked_spawn(&mut self) -> std::io::Result<std::process::Child>;
+}
+
+impl LockedCommand for Command {
+    fn locked_output(&mut self) -> std::io::Result<std::process::Output> {
+        let _guard = EXEC_LOCK.read().unwrap_or_else(|error| error.into_inner());
+        self.output()
+    }
+
+    fn locked_status(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let _guard = EXEC_LOCK.read().unwrap_or_else(|error| error.into_inner());
+        self.status()
+    }
+
+    fn locked_spawn(&mut self) -> std::io::Result<std::process::Child> {
+        let _guard = EXEC_LOCK.read().unwrap_or_else(|error| error.into_inner());
+        self.spawn()
+    }
+}
+
 fn install_herdr_stub(state: &Path, agent_list: &str) -> (PathBuf, PathBuf) {
     let log = state.join("herdr.log");
     let executable = state.join("herdr");
-    fs::write(
+    locked_write(
         &executable,
         format!(
             "#!/bin/sh\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane read\" ]; then\n  printf '%s\\n' \"$*\" >> '{}'\nelif [ \"$1 $2\" = \"pane report-metadata\" ]; then\n  printf '%s\\n' \"$*\" >> '{}'\nelif [ \"$1 $2\" = \"notification show\" ]; then\n  printf '%s\\n' \"$*\" >> '{}'\nfi\n",
@@ -75,7 +120,7 @@ fn run_claude_collector_with_config_dir(
     if let Some(config_dir) = config_dir {
         command.env("CLAUDE_CONFIG_DIR", config_dir);
     }
-    let mut child = command.spawn().unwrap();
+    let mut child = command.locked_spawn().unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     assert!(child.wait_with_output().unwrap().status.success());
 }
@@ -87,7 +132,7 @@ fn run_claude_collector_with_timeout(state: &Path, input: &[u8], timeout: Durati
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .locked_spawn()
         .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     let deadline = Instant::now() + timeout;
@@ -116,7 +161,7 @@ fn hold_refresh_lock_in_child(state: &Path) -> std::process::Child {
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .locked_spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while !ready_path.exists() {
@@ -141,385 +186,9 @@ fn run_claude_refresh(state: &Path, herdr: &Path) {
         .args(["refresh", "--provider", "claude", "--force"])
         .env("HERDR_PLUGIN_STATE_DIR", state)
         .env("HERDR_BIN_PATH", herdr)
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
-}
-
-#[test]
-fn sidebar_configuration_is_idempotent_and_removes_plugin_rows() {
-    let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n";
-    let applied = add_quota_row(original).unwrap();
-    assert!(applied.contains("key = \"prefix+shift+r\""));
-    assert!(applied.contains("type = \"plugin_action\""));
-    assert!(applied.contains("command = \"herdr-agent-quota.refresh\""));
-    assert!(applied.contains("key = \"prefix+shift+q\""));
-    assert!(applied.contains("command = \"herdr-agent-quota.open-settings\""));
-    assert!(applied.contains("agent_panel_sort = \"spaces\" # herdr-agent-quota"));
-    assert_eq!(add_quota_row(&applied).unwrap(), applied);
-    assert_eq!(
-        remove_quota_row(&applied).unwrap(),
-        "[ui]\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
-    );
-}
-
-#[test]
-fn sidebar_configuration_preserves_a_conflicting_refresh_key() {
-    let original = concat!(
-        "[[keys.command]]\n",
-        "key = \"prefix+shift+r\"\n",
-        "type = \"shell\"\n",
-        "command = \"echo user-owned\"\n",
-        "description = \"user refresh\"\n\n",
-        "[ui.sidebar.agents]\n",
-        "rows = [[\"state_icon\", \"agent\"]]\n"
-    );
-    let applied = add_quota_row(original).unwrap();
-    assert_eq!(applied.matches("key = \"prefix+shift+r\"").count(), 1);
-    assert!(applied.contains("command = \"echo user-owned\""));
-    assert!(!applied.contains("command = \"herdr-agent-quota.refresh\""));
-    assert_eq!(
-        remove_quota_row(&applied).unwrap(),
-        "[[keys.command]]\nkey = \"prefix+shift+r\"\ntype = \"shell\"\ncommand = \"echo user-owned\"\ndescription = \"user refresh\"\n\n[ui]\n\n[ui.sidebar.agents]\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
-    );
-}
-
-#[test]
-fn sidebar_configuration_preserves_a_conflicting_settings_key() {
-    let original = concat!(
-        "[[keys.command]]\n",
-        "key = \"prefix+shift+q\"\n",
-        "type = \"shell\"\n",
-        "command = \"echo user-owned\"\n",
-        "description = \"user settings\"\n\n",
-        "[ui.sidebar.agents]\n",
-        "rows = [[\"state_icon\", \"agent\"]]\n"
-    );
-    let applied = add_quota_row(original).unwrap();
-    assert_eq!(applied.matches("key = \"prefix+shift+q\"").count(), 1);
-    assert!(applied.contains("command = \"echo user-owned\""));
-    assert!(!applied.contains("command = \"herdr-agent-quota.open-settings\""));
-    assert!(applied.contains("command = \"herdr-agent-quota.refresh\""));
-    let removed = remove_quota_row(&applied).unwrap();
-    assert!(removed.contains("command = \"echo user-owned\""));
-    assert!(!removed.contains("herdr-agent-quota.refresh"));
-}
-
-#[test]
-fn default_herdr_rows_become_plane_provider_usage_and_topic_lines() {
-    let original = concat!(
-        "[ui.sidebar.agents]\n",
-        "rows = [[\"state_icon\", \"workspace\", \"tab\"], [\"agent\"]]\n"
-    );
-    let applied = add_quota_row(original).unwrap();
-    assert!(applied.contains("$quota_provider_model"));
-    assert!(applied.contains("bold = true"));
-    for base in ["$quota_5h", "$quota_week", "$quota_week_inline"] {
-        for band in ["normal", "warning", "danger", "unknown"] {
-            assert!(applied.contains(&format!("{base}_{band}")), "{base}_{band}");
-        }
-        // `Severity` has no caution band, so no token can ever fill this row.
-        assert!(
-            !applied.contains(&format!("{base}_caution")),
-            "{base}_caution is unreachable and must not be configured"
-        );
-    }
-    assert!(!applied.contains("[\"$quota_summary\"]"));
-    assert!(applied.contains("$quota_topic"));
-    assert!(applied.contains("$quota_context"));
-    assert!(applied.contains("$quota_provider_model"));
-    assert!(!applied.contains("fg = \"#969eae\""));
-    assert!(applied.find("$quota_provider_model").unwrap() < applied.find("$quota_topic").unwrap());
-    assert!(applied.contains("$quota_cache"));
-    assert!(applied.contains("$quota_cache_ttl"));
-    assert!(applied.contains("$quota_cache_state"));
-    assert!(!applied.contains("$quota_5h_label"));
-    assert!(!applied.contains("$quota_5h_eta"));
-    assert!(!applied.contains("fg = \"#c8cdd6\""));
-    assert!(applied.contains("row_gap = 1 # herdr-agent-quota"));
-    assert!(applied.find("$quota_topic").unwrap() < applied.find("$quota_5h_normal").unwrap());
-    assert!(applied.contains("fg = \"#82d978\""));
-    assert!(applied.contains("fg = \"#e4b957\""));
-    assert!(!applied.contains("fg = \"#c6d768\""));
-    assert!(!applied.contains("fg = \"#e2bd58\""));
-    assert!(applied.contains("fg = \"#f16f7e\""));
-    assert!(!applied.contains("fg = \"#eceef2\""));
-    assert!(!applied.contains("selection_bg"));
-    assert!(!applied.contains("active_row_bg"));
-    assert!(!applied.contains("[ui.sidebar.agents.rows_by_agent]"));
-    assert!(applied.contains("$quota_icon"));
-    assert!(applied.contains("$quota_icon_working"));
-    assert!(applied.contains("$quota_icon_done"));
-    assert!(applied.contains("fg = \"#e9e9f0\""));
-    assert!(applied.contains("fg = \"#f9e2af\""));
-    assert!(applied.contains("fg = \"#94e2d5\""));
-}
-
-#[test]
-fn non_semantic_text_inherits_the_active_herdr_theme() {
-    let applied =
-        add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"tab\", \"agent\"]]\n")
-            .unwrap();
-    let document = applied.parse::<toml_edit::DocumentMut>().unwrap();
-    let rows = document["ui"]["sidebar"]["agents"]["rows"]
-        .as_array()
-        .unwrap();
-    let inherited = [
-        "$quota_topic",
-        "$quota_cache",
-        "$quota_cache_ttl",
-        "$quota_5h_unknown",
-        "$quota_week_unknown",
-        "$quota_week_inline_unknown",
-    ];
-
-    for token in inherited {
-        let style = rows
-            .iter()
-            .filter_map(toml_edit::Value::as_array)
-            .flat_map(|row| row.iter())
-            .find(|item| configured_token(item) == Some(token))
-            .and_then(toml_edit::Value::as_inline_table)
-            .unwrap_or_else(|| panic!("missing styled token {token}"));
-        assert!(
-            !style.contains_key("fg"),
-            "{token} must inherit Herdr's foreground: {style}"
-        );
-    }
-}
-
-#[test]
-fn context_precedes_the_window_rows_and_identity_keeps_tab_and_agent() {
-    let applied =
-        add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
-    let document = applied.parse::<toml_edit::DocumentMut>().unwrap();
-    let agents = &document["ui"]["sidebar"]["agents"];
-    let rows = agents["rows"].as_array().unwrap();
-    let index_of = |token: &str| {
-        rows.iter()
-            .position(|row| row_contains_token(row, token))
-            .unwrap_or_else(|| panic!("missing {token}:\n{applied}"))
-    };
-    let context = index_of("$quota_context_normal");
-    let five = index_of("$quota_5h_normal");
-    let week = index_of("$quota_week_normal");
-    let month = index_of("$quota_month_normal");
-    assert_eq!(context + 1, five, "context precedes 5h");
-    assert_eq!(five + 1, week, "5h precedes 7d");
-    assert_eq!(week + 1, month, "7d precedes 30d");
-    assert_eq!(month + 1, rows.len(), "30d is the last quota row");
-
-    let identity = rows
-        .iter()
-        .find(|row| row_contains_token(row, "$quota_icon"))
-        .and_then(toml_edit::Value::as_array)
-        .unwrap();
-    assert!(!identity
-        .iter()
-        .any(|item| item.as_str() == Some("state_icon")));
-    assert!(identity
-        .iter()
-        .any(|item| configured_token(item) == Some("tab")));
-    assert!(identity
-        .iter()
-        .any(|item| configured_token(item) == Some("$quota_icon_working")));
-    assert!(identity
-        .iter()
-        .any(|item| configured_token(item) == Some("$quota_icon_done")));
-    assert!(
-        rows.iter().any(agent_only_row),
-        "the native agent row is kept:\n{applied}"
-    );
-    for token in ["$quota_icon", "$quota_provider_model"] {
-        assert_eq!(
-            token_fg(&applied, token).as_deref(),
-            Some("#e9e9f0"),
-            "{token}"
-        );
-    }
-    assert!(agents.get("rows_by_agent").is_none(), "{applied}");
-}
-
-#[test]
-fn provider_model_is_its_own_row_and_week_inline_folds_onto_the_limits_row() {
-    let applied =
-        add_quota_row("[ui.sidebar.agents]\nrows = [[\"state_icon\", \"agent\"]]\n").unwrap();
-    let document = applied.parse::<toml_edit::DocumentMut>().unwrap();
-    let agents = &document["ui"]["sidebar"]["agents"];
-    let rows = agents["rows"].as_array().unwrap();
-    let identity_row = rows
-        .iter()
-        .find(|row| row_contains_token(row, "$quota_provider_model"))
-        .unwrap();
-    let identity_tokens = identity_row.as_array().unwrap();
-    // Provider/model now stands alone rather than sharing the brand-icon row.
-    assert_eq!(identity_tokens.len(), 1, "{identity_row}");
-    assert!(!identity_tokens.iter().any(|item| {
-        matches!(
-            configured_token(item),
-            Some("$quota_provider") | Some("$quota_model")
-        ) || item.as_str() == Some("state_icon")
-    }));
-
-    // Herdr's `tab` rides the brand-icon row.
-    let icon_row = rows
-        .iter()
-        .find(|row| row_contains_token(row, "$quota_icon"))
-        .and_then(toml_edit::Value::as_array)
-        .unwrap();
-    assert!(icon_row
-        .iter()
-        .any(|item| configured_token(item) == Some("tab")));
-    assert!(icon_row
-        .iter()
-        .any(|item| configured_token(item) == Some("$quota_icon_working")));
-    assert!(icon_row
-        .iter()
-        .any(|item| configured_token(item) == Some("$quota_icon_done")));
-
-    // Week fold lives on the shared 7d rows — there are no per-agent copies.
-    assert!(agents.get("rows_by_agent").is_none(), "{applied}");
-    let week_row = rows
-        .iter()
-        .find(|row| row_contains_token(row, "$quota_week_normal"))
-        .and_then(toml_edit::Value::as_array)
-        .unwrap();
-    assert!(
-        week_row
-            .iter()
-            .any(|item| configured_token(item) == Some("$quota_week_inline_normal")),
-        "shared rows should fold 7d onto the 7d limits row"
-    );
-    assert!(
-        week_row
-            .iter()
-            .all(|item| configured_token(item) != Some("$quota_5h_normal")),
-        "5h must not sit on the 7d row"
-    );
-    assert!(
-        !rows.iter().any(|row| {
-            row_contains_token(row, "$quota_5h_normal")
-                && row_contains_token(row, "$quota_week_normal")
-        }),
-        "5h and 7d each own a row now"
-    );
-}
-
-#[test]
-fn existing_provider_and_model_tokens_are_migrated_to_one_identity_token() {
-    let applied = add_quota_row(
-        r#"[ui.sidebar.agents]
-rows = [["state_icon", "tab", { token = "$quota_provider" }, { token = "$quota_model" }]]
-"#,
-    )
-    .unwrap();
-    let document = applied.parse::<toml_edit::DocumentMut>().unwrap();
-    let rows = document["ui"]["sidebar"]["agents"]["rows"]
-        .as_array()
-        .unwrap();
-    let identity_row = rows
-        .iter()
-        .find(|row| row_contains_token(row, "$quota_provider_model"))
-        .unwrap()
-        .as_array()
-        .unwrap();
-    assert_eq!(
-        identity_row
-            .iter()
-            .filter(|item| configured_token(item) == Some("$quota_provider_model"))
-            .count(),
-        1
-    );
-    assert!(!identity_row.iter().any(|item| {
-        matches!(
-            configured_token(item),
-            Some("$quota_provider") | Some("$quota_model")
-        )
-    }));
-}
-
-fn configured_token(value: &toml_edit::Value) -> Option<&str> {
-    value
-        .as_str()
-        .or_else(|| value.as_inline_table()?.get("token")?.as_str())
-}
-
-fn row_contains_token(row: &toml_edit::Value, token: &str) -> bool {
-    row.as_array().is_some_and(|items| {
-        items
-            .iter()
-            .any(|item| configured_token(item) == Some(token))
-    })
-}
-
-/// A row that carries only Herdr's native `agent` token.
-fn agent_only_row(row: &toml_edit::Value) -> bool {
-    row.as_array().is_some_and(|items| {
-        items.len() == 1
-            && items
-                .iter()
-                .next()
-                .is_some_and(|item| configured_token(item) == Some("agent"))
-    })
-}
-
-/// The `fg` a named token carries in `ui.sidebar.agents.rows`, if any.
-fn token_fg(sidebar: &str, token: &str) -> Option<String> {
-    let document = sidebar.parse::<toml_edit::DocumentMut>().unwrap();
-    for row in document["ui"]["sidebar"]["agents"]["rows"].as_array()? {
-        let Some(items) = row.as_array() else {
-            continue;
-        };
-        for item in items {
-            if configured_token(item) == Some(token) {
-                return item
-                    .as_inline_table()
-                    .and_then(|table| table.get("fg"))
-                    .and_then(toml_edit::Value::as_str)
-                    .map(str::to_string);
-            }
-        }
-    }
-    None
-}
-
-#[test]
-fn configuration_removes_obsolete_session_summary_rows() {
-    let original = concat!(
-        "[ui.sidebar.agents]\n",
-        "rows = [[\"state_icon\", \"agent\"], [\"$quota_topic\"], [\"$quota_session\"]]\n"
-    );
-    let applied = add_quota_row(original).unwrap();
-    assert!(applied.contains("$quota_context"));
-    assert!(!applied.contains("$quota_session"));
-}
-
-#[test]
-fn sidebar_configuration_preserves_an_explicit_row_gap() {
-    let original = concat!(
-        "[ui.sidebar.agents]\n",
-        "row_gap = 2\n",
-        "rows = [[\"state_icon\", \"agent\"]]\n"
-    );
-    let applied = add_quota_row(original).unwrap();
-    assert!(applied.contains("row_gap = 2"));
-    assert!(!applied.contains("row_gap = 1"));
-    assert_eq!(
-        remove_quota_row(&applied).unwrap(),
-        "[ui]\n[ui.sidebar.agents]\nrow_gap = 2\nrows = [[\"state_icon\", \"machine\", \"workspace\", \"tab\"], [\"agent\"]]\n"
-    );
-}
-
-#[test]
-fn sidebar_configuration_migrates_the_plugin_owned_gap_to_separated_panes() {
-    let original = concat!(
-        "[ui.sidebar.agents]\n",
-        "row_gap = 0 # herdr-agent-quota\n",
-        "rows = [[\"state_icon\", \"agent\"]]\n"
-    );
-    let applied = add_quota_row(original).unwrap();
-    assert!(applied.contains("row_gap = 1 # herdr-agent-quota"));
-    assert!(!applied.contains("row_gap = 0"));
 }
 
 #[test]
@@ -530,7 +199,7 @@ fn claude_collector_is_silent_without_a_previous_statusline() {
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()
+        .locked_spawn()
         .unwrap();
     child
         .stdin
@@ -564,7 +233,7 @@ fn claude_collector_does_not_wait_for_a_refresh_lock() {
 #[test]
 fn claude_collector_bounds_a_hanging_previous_statusline() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("claude-statusline.original.json"),
         r#"{"type":"command","command":"sleep 20"}"#,
     )
@@ -577,6 +246,37 @@ fn claude_collector_bounds_a_hanging_previous_statusline() {
         Duration::from_secs(4),
     ));
     assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+#[test]
+fn a_previous_statusline_that_leads_back_to_the_hook_runs_once() {
+    // 0928 sb7: the saved "previous" statusLine was this plugin's own hook
+    // behind a symlink, so every call chained into itself and forked without
+    // end. The chained call must not chain again.
+    let state = tempdir().unwrap();
+    let calls = state.path().join("calls");
+    let command = format!(
+        "echo x >> '{}'; HERDR_PLUGIN_STATE_DIR='{}' '{}' claude-statusline",
+        calls.display(),
+        state.path().display(),
+        env!("CARGO_BIN_EXE_herdr-agent-quota"),
+    );
+    locked_write(
+        state.path().join("claude-statusline.original.json"),
+        serde_json::json!({"type": "command", "command": command}).to_string(),
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    assert!(run_claude_collector_with_timeout(
+        state.path(),
+        include_bytes!("fixtures/claude/statusline-both.json"),
+        Duration::from_secs(4),
+    ));
+    assert!(started.elapsed() < Duration::from_secs(4));
+    // Give a runaway chain time to show itself before counting.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
 }
 
 #[test]
@@ -884,7 +584,7 @@ fn quota_refresh_does_not_report_metadata_to_a_scrolled_pane() {
     let state = tempdir().unwrap();
     let log = state.path().join("herdr.log");
     let herdr = state.path().join("herdr");
-    fs::write(
+    locked_write(
         &herdr,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
@@ -914,7 +614,7 @@ fn a_scrolled_pane_completion_reports_only_icon_tokens() {
     let state = tempdir().unwrap();
     let log = state.path().join("herdr.log");
     let herdr = state.path().join("herdr");
-    fs::write(
+    locked_write(
         &herdr,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
@@ -933,7 +633,7 @@ fn a_scrolled_pane_completion_reports_only_icon_tokens() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p1","agent":"claude","status":"idle"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(log).unwrap();
@@ -951,7 +651,7 @@ fn focus_paints_icons_without_reading_the_pane_or_collectors() {
     let state = tempdir().unwrap();
     let log = state.path().join("herdr.log");
     let herdr = state.path().join("herdr");
-    fs::write(
+    locked_write(
         &herdr,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"pane current\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
@@ -971,7 +671,7 @@ fn focus_paints_icons_without_reading_the_pane_or_collectors() {
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .env("HERDR_BIN_PATH", &herdr)
         .env_remove("HERDR_PLUGIN_EVENT_JSON")
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(log).unwrap();
@@ -1003,7 +703,7 @@ fn agent_event_refreshes_and_reads_topics_only_for_its_provider() {
     let codex_log = state.path().join("codex.log");
     let herdr = state.path().join("herdr");
     let codex = state.path().join("codex");
-    fs::write(
+    locked_write(
         &herdr,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{}'\nelif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{}'\nfi\n",
@@ -1013,7 +713,7 @@ fn agent_event_refreshes_and_reads_topics_only_for_its_provider() {
         ),
     )
     .unwrap();
-    fs::write(
+    locked_write(
         &codex,
         format!("#!/bin/sh\nprintf called > '{}'\n", codex_log.display()),
     )
@@ -1039,7 +739,7 @@ fn agent_event_refreshes_and_reads_topics_only_for_its_provider() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":{"pane":{"agent":"claude","pane_id":"w1:p1"}}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     assert!(!codex_log.exists());
@@ -1072,7 +772,7 @@ fn install_logged_herdr_and_codex(
             format!("elif [ \"$1 $2\" = \"pane current\" ]; then\n  printf '%s\\n' '{json}'\n")
         })
         .unwrap_or_default();
-    fs::write(
+    locked_write(
         &herdr,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1 $2\" = \"agent list\" ]; then\n  printf '%s\\n' '{agents}'\n{pane_current}elif [ \"$1 $2\" = \"pane get\" ]; then\n  printf '%s\\n' '{scroll}'\nfi\n",
@@ -1083,7 +783,7 @@ fn install_logged_herdr_and_codex(
         ),
     )
     .unwrap();
-    fs::write(
+    locked_write(
         &codex,
         format!("#!/bin/sh\nprintf called > '{}'\n", codex_log.display()),
     )
@@ -1127,7 +827,7 @@ fn run_event_binary_with_xdg(
         .env_remove("GROK_AUTH_FILE")
         .env_remove("OPENCODE_API_KEY")
         .env("HERDR_PLUGIN_EVENT_JSON", event_json)
-        .output()
+        .locked_output()
         .unwrap()
 }
 
@@ -1304,7 +1004,7 @@ fn focus_event_uses_its_pane_even_when_the_current_focus_differs() {
             .env("HERDR_PLUGIN_EVENT_JSON", format!(
                 r#"{{"event":"pane_focused","data":{{"type":"pane_focused","pane_id":"{pane_id}","workspace_id":"w1"}}}}"#
             ))
-            .output()
+            .locked_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -1328,7 +1028,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
     let state = tempdir().unwrap();
     let initial_attention =
         r#"{"working":["w5:pB"],"unseen":["w9:p1","w9:p6"],"last_focused":"w5:pB"}"#;
-    fs::write(state.path().join("icon-attention.json"), initial_attention).unwrap();
+    locked_write(state.path().join("icon-attention.json"), initial_attention).unwrap();
     let inventory = r#"{"result":{"agents":[
         {"agent":"codex","pane_id":"w5:pB","agent_status":"working","focused":true,
          "tokens":{"quota_icon_working":"YELLOW","quota_provider":"Codex","quota_provider_model":"Codex"}},
@@ -1343,6 +1043,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
         Some(r#"{"result":{"pane":{"agent":"codex","pane_id":"w5:pB"}}}"#),
     );
     let snapshot = r#"{"result":{"snapshot":{"focused_workspace_id":"w9","focused_tab_id":"w9:t1","focused_pane_id":"w9:p1","workspaces":[{"workspace_id":"w9","active_tab_id":"w9:t1"}],"layouts":[{"workspace_id":"w9","tab_id":"w9:t1","focused_pane_id":"w9:p1"}]}}}"#;
+    let exec_guard = exec_write_guard();
     let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
     writeln!(
         script,
@@ -1350,6 +1051,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
     )
     .unwrap();
     drop(script);
+    drop(exec_guard);
 
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
@@ -1361,7 +1063,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"workspace_focused","data":{"type":"workspace_focused","workspace_id":"w9"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1386,7 +1088,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
         "w9:p1"
     );
 
-    fs::write(state.path().join("icon-attention.json"), initial_attention).unwrap();
+    locked_write(state.path().join("icon-attention.json"), initial_attention).unwrap();
     fs::remove_file(&herdr_log).unwrap();
     let tab_output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
@@ -1398,7 +1100,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"tab_focused","data":{"type":"tab_focused","tab_id":"w9:t1","workspace_id":"w9"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         tab_output.status.success(),
@@ -1416,7 +1118,7 @@ fn workspace_focus_uses_that_workspaces_layout_and_keeps_other_green_panes() {
 #[test]
 fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"unseen":["w9:p1"],"last_focused":"w5:pB"}"#,
     )
@@ -1431,6 +1133,7 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
         Some(r#"{"result":{"pane":{"agent":"codex","pane_id":"w9:p1"}}}"#),
     );
     let snapshot = r#"{"result":{"snapshot":{"focused_workspace_id":"w5","focused_tab_id":"w5:t1","workspaces":[{"workspace_id":"w9","active_tab_id":"w9:t1"}],"layouts":[{"tab_id":"w9:t1","focused_pane_id":"w9:p1"}]}}}"#;
+    let exec_guard = exec_write_guard();
     let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
     writeln!(
         script,
@@ -1438,6 +1141,7 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
     )
     .unwrap();
     drop(script);
+    drop(exec_guard);
     let output = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .arg("focus")
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
@@ -1448,7 +1152,7 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"workspace_focused","data":{"workspace_id":"w9"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(&herdr_log).unwrap_or_default();
@@ -1463,7 +1167,7 @@ fn delayed_workspace_focus_does_not_repaint_a_green_pane() {
 #[test]
 fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"unseen":["w1:p1","w1:p3"],"last_focused":"w1:p1"}"#,
     )
@@ -1479,6 +1183,7 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
     let (herdr, herdr_log, codex, _) =
         install_logged_herdr_and_codex(state.path(), inventory, None);
     let snapshot = r#"{"result":{"snapshot":{"focused_workspace_id":"w1","focused_tab_id":"w1:t1","focused_pane_id":"w1:p2"}}}"#;
+    let exec_guard = exec_write_guard();
     let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
     writeln!(
         script,
@@ -1486,6 +1191,7 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
     )
     .unwrap();
     drop(script);
+    drop(exec_guard);
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .args([
             "watch",
@@ -1501,7 +1207,7 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
+        .locked_spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut calls = String::new();
@@ -1532,7 +1238,7 @@ fn watcher_acknowledges_focus_change_even_without_a_focus_event() {
 #[test]
 fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"unseen":["w1:p1"],"last_focused":"w1:p1"}"#,
     )
@@ -1546,11 +1252,12 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
     let (herdr, herdr_log, codex, _) =
         install_logged_herdr_and_codex(state.path(), inventory, None);
     let snapshot_path = state.path().join("snapshot.json");
-    fs::write(
+    locked_write(
         &snapshot_path,
         r#"{"result":{"snapshot":{"focused_pane_id":"w1:p1"}}}"#,
     )
     .unwrap();
+    let exec_guard = exec_write_guard();
     let mut script = fs::OpenOptions::new().append(true).open(&herdr).unwrap();
     writeln!(
         script,
@@ -1559,6 +1266,7 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
     )
     .unwrap();
     drop(script);
+    drop(exec_guard);
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"))
         .args([
             "watch",
@@ -1574,7 +1282,7 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
         .env("XDG_DATA_HOME", state.path().join("xdg-data"))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .spawn()
+        .locked_spawn()
         .unwrap();
     let first_poll_deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < first_poll_deadline {
@@ -1591,7 +1299,7 @@ fn watcher_keeps_a_focused_completion_green_until_focus_moves() {
     }
     thread::sleep(Duration::from_millis(1100));
     let before = fs::read_to_string(&herdr_log).unwrap_or_default();
-    fs::write(
+    locked_write(
         &snapshot_path,
         r#"{"result":{"snapshot":{"focused_pane_id":"w1:p2"}}}"#,
     )
@@ -1647,7 +1355,7 @@ fn focusing_a_done_pane_clears_the_teal_icon_immediately() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p1","workspace_id":"w1"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1680,7 +1388,7 @@ fn focusing_a_done_pane_clears_the_teal_icon_immediately() {
 #[test]
 fn focusing_a_green_pane_clears_it_even_if_inventory_still_says_working() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"unseen":["w1:p1"]}"#,
     )
@@ -1704,7 +1412,7 @@ fn focusing_a_green_pane_clears_it_even_if_inventory_still_says_working() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p1","workspace_id":"w1"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1730,7 +1438,7 @@ fn focusing_a_green_pane_clears_it_even_if_inventory_still_says_working() {
 #[test]
 fn focus_change_clears_only_the_previous_green_pane() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"last_focused":"w1:p1"}"#,
     )
@@ -1762,7 +1470,7 @@ fn focus_change_clears_only_the_previous_green_pane() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_focused","data":{"type":"pane_focused","pane_id":"w1:p2","workspace_id":"w1"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1809,7 +1517,7 @@ fn focus_change_clears_only_the_previous_green_pane() {
 #[test]
 fn focus_to_a_non_agent_pane_acknowledges_the_previous_agent() {
     let state = tempdir().unwrap();
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"unseen":["w1:p1"],"last_focused":"w1:p1"}"#,
     )
@@ -1827,7 +1535,7 @@ fn focus_to_a_non_agent_pane_acknowledges_the_previous_agent() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_focused","data":{"pane_id":"w1:p9","workspace_id":"w1"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(herdr_log).unwrap_or_default();
@@ -1870,7 +1578,7 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"codex","agent_status":"idle"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1916,7 +1624,7 @@ fn completion_stays_teal_even_when_the_pane_was_already_focused() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p1","agent":"codex","agent_status":"idle"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -1952,7 +1660,7 @@ fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
     let state = tempdir().unwrap();
     // Watch often paints idle-white and clears `$quota_icon_working` before
     // the completion event runs. The working set must still force teal.
-    fs::write(
+    locked_write(
         state.path().join("icon-attention.json"),
         r#"{"working":["w1:p2"]}"#,
     )
@@ -1980,7 +1688,7 @@ fn unfocused_idle_uses_working_set_when_the_yellow_icon_is_gone() {
             "HERDR_PLUGIN_EVENT_JSON",
             r#"{"event":"pane_agent_status_changed","data":{"pane_id":"w1:p2","agent":"codex","agent_status":"idle"}}"#,
         )
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -2014,7 +1722,7 @@ fn a_low_quota_notifies_once_and_re_arms_only_after_recovering() {
         r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"test-session"},"tokens":{}}]}}"#,
     );
     fs::create_dir_all(state.path()).unwrap();
-    fs::write(state.path().join("low-quota-alert"), "20%").unwrap();
+    locked_write(state.path().join("low-quota-alert"), "20%").unwrap();
 
     let notifications = || {
         fs::read_to_string(&herdr_log)
@@ -2083,7 +1791,7 @@ fn claude_collector_does_not_republish_unchanged_quota() {
     let (herdr_stub, herdr_log) = install_herdr_stub(
         state.path(),
         &format!(
-            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042"}}}}]}}}}"#,
+            r#"{{"result":{{"agents":[{{"agent":"claude","pane_id":"w1:p1","agent_session":{{"value":"test-session"}},"tokens":{{"quota_group":"w1","quota_icon":"{}","quota_provider":"Claude","quota_provider_model":"Claude","quota_5h_warning":"5h 42%","quota_week_normal":"7d 73%","quota_headroom":"042"}}}},"state_labels":{{"blocked":"[卡住]","done":"[已回]","working":"[工作]","idle":"[空闲]","unknown":"[未报]"}}}}]}}}}"#,
             "\u{e1a0}"
         ),
     );
@@ -2145,6 +1853,9 @@ impl AgentHomes {
     fn configure_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
         fs::create_dir_all(&self.state).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-agent-quota"));
+        // These tests pin the usage-row layouts; identity rows are opted into
+        // by the tests about them (an explicit flag or env entry wins).
+        command.env("HERDR_AGENT_QUOTA_SIDEBAR_ROWS", "quota");
         for (key, value) in env {
             command.env(key, value);
         }
@@ -2167,7 +1878,11 @@ impl AgentHomes {
             .env("GROK_HOME", &self.grok_home)
             .env("CURSOR_HOOKS_FILE", &self.cursor_hooks)
             .env("HERDR_BIN_PATH", self.state.join("herdr-absent"))
-            .output()
+            // `configure --apply` sets the Agent view over this socket. Run
+            // from inside a Herdr pane, an inherited path would point the test
+            // at the live server and replace its view.
+            .env_remove("HERDR_SOCKET_PATH")
+            .locked_output()
             .unwrap()
     }
 
@@ -2313,7 +2028,7 @@ fn an_installer_can_narrow_the_selection_through_the_environment() {
 fn stub_missing_omp_integration(state: &Path) {
     fs::create_dir_all(state).unwrap();
     let herdr = state.join("herdr-absent");
-    fs::write(
+    locked_write(
         &herdr,
         r#"#!/bin/sh
 if [ "$1 $2" = "integration status" ]; then
@@ -2440,8 +2155,8 @@ fn an_installer_can_select_flush_gap_through_the_plugin_config_dir() {
     let homes = AgentHomes::new(root.path());
     let config_dir = root.path().join("plugin-config");
     fs::create_dir_all(&config_dir).unwrap();
-    fs::write(config_dir.join("row-gap"), "0\n").unwrap();
-    fs::write(config_dir.join("sidebar-layout"), "stacked\n").unwrap();
+    locked_write(config_dir.join("row-gap"), "0\n").unwrap();
+    locked_write(config_dir.join("sidebar-layout"), "stacked\n").unwrap();
     let output = homes.configure_with_env(
         &["--apply"],
         &[("HERDR_PLUGIN_CONFIG_DIR", config_dir.to_str().unwrap())],
@@ -2515,7 +2230,7 @@ fn an_installer_can_select_gauges_layout_through_the_plugin_config_dir() {
     let homes = AgentHomes::new(root.path());
     let config_dir = root.path().join("plugin-config");
     fs::create_dir_all(&config_dir).unwrap();
-    fs::write(config_dir.join("sidebar-layout"), "gauges\n").unwrap();
+    locked_write(config_dir.join("sidebar-layout"), "gauges\n").unwrap();
     let output = homes.configure_with_env(
         &["--apply"],
         &[("HERDR_PLUGIN_CONFIG_DIR", config_dir.to_str().unwrap())],
@@ -2537,7 +2252,7 @@ fn a_full_uninstall_of_a_gauges_install_restores_the_original_config() {
     let homes = AgentHomes::new(root.path());
     let terminal_config = root.path().join(".config/ghostty/config");
     fs::create_dir_all(terminal_config.parent().unwrap()).unwrap();
-    fs::write(&terminal_config, "# my terminal\n").unwrap();
+    locked_write(&terminal_config, "# my terminal\n").unwrap();
     let font_dir = if cfg!(target_os = "macos") {
         root.path().join("Library/Fonts")
     } else {
@@ -2551,7 +2266,7 @@ fn a_full_uninstall_of_a_gauges_install_restores_the_original_config() {
         "rows = [\n    [\"state_icon\", \"machine\"],\n    [\"agent\"],\n]\n",
     );
     fs::create_dir_all(homes.herdr_config.parent().unwrap()).unwrap();
-    fs::write(&homes.herdr_config, original).unwrap();
+    locked_write(&homes.herdr_config, original).unwrap();
 
     assert!(homes
         .configure(&["--apply", "--sidebar-layout", "gauges"])
@@ -2617,7 +2332,7 @@ fn install_pi_store(
 }
 
 fn write_pi_models_store(agent: &Path, provider: &str, model: &str, context_window: u64) {
-    fs::write(
+    locked_write(
         agent.join("models-store.json"),
         serde_json::json!({
             provider: {
@@ -2632,7 +2347,7 @@ fn write_pi_models_store(agent: &Path, provider: &str, model: &str, context_wind
 fn write_codex_auth(state: &Path, account_id: &str) -> PathBuf {
     let home = state.join("codex-home");
     fs::create_dir_all(&home).unwrap();
-    fs::write(
+    locked_write(
         home.join("auth.json"),
         serde_json::json!({"tokens": {"account_id": account_id}}).to_string(),
     )
@@ -2687,7 +2402,7 @@ fn run_pi_event(
         .env_remove("GROK_AUTH_FILE")
         .env_remove("OPENCODE_API_KEY")
         .env("HERDR_PLUGIN_EVENT_JSON", pi_working_event())
-        .output()
+        .locked_output()
         .unwrap()
 }
 
@@ -2718,7 +2433,7 @@ fn a_manual_refresh_reads_no_pane_at_all() {
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .env("HERDR_BIN_PATH", &herdr)
         .env("CODEX_BIN_PATH", &codex)
-        .output()
+        .locked_output()
         .unwrap();
     assert!(
         output.status.success(),
@@ -2746,11 +2461,238 @@ fn a_quota_less_pane_still_gets_its_brand_icon_on_refresh() {
         .args(["refresh", "--provider", "claude"])
         .env("HERDR_PLUGIN_STATE_DIR", state.path())
         .env("HERDR_BIN_PATH", &herdr)
-        .output()
+        .locked_output()
         .unwrap();
     assert!(output.status.success());
     let calls = fs::read_to_string(herdr_log).unwrap_or_default();
     assert!(calls.contains("pane report-metadata w1:p1"), "{calls}");
     assert!(calls.contains("--token quota_icon="), "{calls}");
     assert!(!calls.contains("pane read"), "{calls}");
+}
+
+#[test]
+fn configure_with_the_attention_order_writes_flat_rows_and_uninstalls_cleanly() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+    let output = homes.configure(&["--apply", "--agent-order", "attention"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sidebar = homes.sidebar();
+    assert_eq!(managed_rows(&sidebar)[0][0], "state_text", "{sidebar}");
+    assert!(!sidebar.contains("$quota_group"), "{sidebar}");
+    assert_eq!(
+        CacheStore::new(&homes.state).agent_order(),
+        Some(herdr_agent_quota::cli::AgentOrder::Attention)
+    );
+
+    assert!(homes
+        .configure(&["--apply", "--agent-order", "quota"])
+        .status
+        .success());
+    let sidebar = homes.sidebar();
+    assert!(sidebar.contains("$quota_group"), "{sidebar}");
+    assert!(!sidebar.contains("state_text"), "{sidebar}");
+
+    assert!(homes
+        .configure(&["--apply", "--agent-order", "attention"])
+        .status
+        .success());
+    assert!(homes.configure(&["--uninstall"]).status.success());
+    let sidebar = homes.sidebar();
+    assert!(!sidebar.contains("state_text"), "{sidebar}");
+    assert!(!sidebar.contains("$quota"), "{sidebar}");
+}
+
+fn run_claude_refresh_logged(state: &Path, agent_list: &str) -> String {
+    let (herdr_stub, herdr_log) = install_herdr_stub(state, agent_list);
+    let _ = fs::remove_file(&herdr_log);
+    run_claude_refresh(state, &herdr_stub);
+    fs::read_to_string(herdr_log).unwrap_or_default()
+}
+
+#[test]
+fn the_attention_order_publishes_state_labels_once_and_a_band_header() {
+    let state = tempdir().unwrap();
+    let (herdr_stub, _) = install_herdr_stub(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"}}]}}"#,
+    );
+    let reset = future_reset_unix();
+    run_claude_collector(
+        state.path(),
+        &herdr_stub,
+        claude_statusline_windows("s1", 58.0, Some(27.0), reset).as_bytes(),
+    );
+    CacheStore::new(state.path())
+        .set_agent_order(herdr_agent_quota::cli::AgentOrder::Attention)
+        .unwrap();
+
+    let report = run_claude_refresh_logged(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"}}]}}"#,
+    );
+    for label in [
+        "--state-label blocked=[卡住]",
+        "--state-label done=[已回]",
+        "--state-label working=[工作]",
+        "--state-label idle=[空闲]",
+        "--state-label unknown=[未报]",
+    ] {
+        assert!(report.contains(label), "missing {label}: {report}");
+    }
+    // Since owner 0928 (option B) attention heads each group inside its
+    // colour band, so a lone pane is its band's head.
+    assert!(report.contains("quota_group=w1"), "{report}");
+    assert!(report.contains("quota_5h_warning=5h 42%"), "{report}");
+
+    // Labels read back unchanged: nothing about them is sent again.
+    let report = run_claude_refresh_logged(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"},"state_labels":{"blocked":"[卡住]","done":"[已回]","working":"[工作]","idle":"[空闲]","unknown":"[未报]"}}]}}"#,
+    );
+    assert!(!report.contains("--state-label"), "{report}");
+}
+
+#[test]
+fn the_grouped_order_sends_state_labels_too() {
+    // Identity rows lead with `state_text` in every order, so the labels are
+    // wanted whether or not the panel is grouped.
+    let state = tempdir().unwrap();
+    let (herdr_stub, _) = install_herdr_stub(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"}}]}}"#,
+    );
+    let reset = future_reset_unix();
+    run_claude_collector(
+        state.path(),
+        &herdr_stub,
+        claude_statusline_windows("s1", 58.0, Some(27.0), reset).as_bytes(),
+    );
+    let report = run_claude_refresh_logged(
+        state.path(),
+        r#"{"result":{"agents":[{"agent":"claude","pane_id":"w1:p1","agent_session":{"value":"s1"}}]}}"#,
+    );
+    assert!(report.contains("quota_5h_warning=5h 42%"), "{report}");
+    assert!(report.contains("--state-label idle=[空闲]"), "{report}");
+    assert!(report.contains("quota_group="), "{report}");
+}
+
+#[test]
+fn configure_defaults_to_identity_rows_and_can_restore_the_usage_rows() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+    // Herdr injects the plugin config directory into actions and hooks; the
+    // stored row choice lives there.
+    let prefs = root.path().join("plugin-config");
+    fs::create_dir_all(&prefs).unwrap();
+    let prefs = prefs.to_str().unwrap();
+    let output = homes.configure_with_env(
+        &["--apply", "--sidebar-rows", "identity"],
+        &[("HERDR_PLUGIN_CONFIG_DIR", prefs)],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sidebar = homes.sidebar();
+    assert!(
+        !managed_rows(&sidebar)[1].contains(&"state_text".to_string()),
+        "{sidebar}"
+    );
+    assert_eq!(managed_rows(&sidebar)[2][2], "$al_channel", "{sidebar}");
+    assert!(sidebar.contains("$al_role"), "{sidebar}");
+    assert!(!sidebar.contains("$quota_5h"), "{sidebar}");
+    assert!(
+        sidebar.contains("herdr-agent-quota.toggle-order"),
+        "{sidebar}"
+    );
+
+    assert!(homes
+        .configure_with_env(
+            &["--apply", "--sidebar-rows", "quota"],
+            &[("HERDR_PLUGIN_CONFIG_DIR", prefs)]
+        )
+        .status
+        .success());
+    let sidebar = homes.sidebar();
+    assert!(sidebar.contains("$quota_5h"), "{sidebar}");
+    assert!(!sidebar.contains("$al_role"), "{sidebar}");
+
+    // No flag, no env: the stored preference (quota, from the run above) wins.
+    assert!(homes
+        .configure_with_env(
+            &["--apply"],
+            &[
+                ("HERDR_AGENT_QUOTA_SIDEBAR_ROWS", ""),
+                ("HERDR_PLUGIN_CONFIG_DIR", prefs)
+            ]
+        )
+        .status
+        .success());
+    assert!(homes.sidebar().contains("$quota_5h"));
+
+    assert!(homes
+        .configure_with_env(&["--uninstall"], &[("HERDR_PLUGIN_CONFIG_DIR", prefs)])
+        .status
+        .success());
+    let sidebar = homes.sidebar();
+    assert!(!sidebar.contains("toggle-order"), "{sidebar}");
+    assert!(!sidebar.contains("$al_"), "{sidebar}");
+}
+
+#[test]
+fn configure_stores_the_candidate_look() {
+    let root = tempdir().unwrap();
+    let homes = AgentHomes::new(root.path());
+    let prefs = root.path().join("plugin-config");
+    fs::create_dir_all(&prefs).unwrap();
+    let prefs = prefs.to_str().unwrap();
+    let output = homes.configure_with_env(
+        &[
+            "--apply",
+            "--sidebar-rows",
+            "identity",
+            "--group-style",
+            "count",
+            "--logo-layout",
+            "second-row",
+        ],
+        &[("HERDR_PLUGIN_CONFIG_DIR", prefs)],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("plugin-config/group-style"))
+            .unwrap()
+            .trim(),
+        "count"
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("plugin-config/logo-layout"))
+            .unwrap()
+            .trim(),
+        "second-row"
+    );
+    let sidebar = homes.sidebar();
+    assert!(sidebar.contains("$al_gap"), "{sidebar}");
+    assert!(sidebar.contains("$al_model_mark"), "{sidebar}");
+    // A bare repair keeps the stored look.
+    assert!(homes
+        .configure_with_env(
+            &["--apply"],
+            &[
+                ("HERDR_PLUGIN_CONFIG_DIR", prefs),
+                ("HERDR_AGENT_QUOTA_SIDEBAR_ROWS", "")
+            ]
+        )
+        .status
+        .success());
+    assert_eq!(homes.sidebar(), sidebar);
 }

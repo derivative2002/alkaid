@@ -111,16 +111,52 @@ pub enum Command {
         /// run a fixed command line.
         #[arg(long, value_parser = parse_row_gap)]
         row_gap: Option<SidebarRowGap>,
-        /// How Herdr's Agent panel is ordered: default (Herdr's own policy)
-        /// or quota (least quota left first). `quota` installs a Herdr agent
-        /// view owned by this plugin and replaces the user's panel sort until
-        /// it is set back to default.
+        /// How Herdr's Agent panel is ordered: default (Herdr's own policy),
+        /// quota (by Space, least quota left first), or attention (across
+        /// Spaces: blocked and unseen completions first, then working, then
+        /// idle; least quota left first in each band). `quota` and `attention`
+        /// install a Herdr agent view owned by this plugin and replace the
+        /// user's panel sort until it is set back to default.
         #[arg(long, value_enum)]
         agent_order: Option<AgentOrder>,
         /// Notify once when a provider's remaining quota falls to this
         /// percentage or below. `off` (default) never notifies.
         #[arg(long, value_parser = parse_low_quota_alert)]
         low_quota_alert: Option<LowQuotaAlert>,
+        /// Sidebar rows: identity (role, model short name, session name and
+        /// Tab; no usage rows — the default) or quota (the earlier rows with
+        /// every usage row). Quota keeps being collected either way.
+        #[arg(long, value_enum)]
+        sidebar_rows: Option<SidebarRows>,
+        /// Vendor marks: glyph (Herdr Agent Icons Alkaid PUA glyphs, default)
+        /// or letter (ASCII badges for a terminal without that face).
+        #[arg(long, value_parser = parse_icon_style)]
+        icon_style: Option<crate::icons::IconStyle>,
+        /// Space header in the identity rows: plain (default), rule, count
+        /// or bar. Candidates for the owner (0927); plain is round two.
+        #[arg(long, value_enum)]
+        group_style: Option<crate::look::GroupStyle>,
+        /// Harness / channel / model marks: second-row (default; channel and
+        /// model beside the role), inline (all three on the first row) or
+        /// none (harness only).
+        #[arg(long, value_enum)]
+        logo_layout: Option<crate::look::LogoLayout>,
+    },
+    /// Step the Agent panel to its next order: grouped by quota, grouped by
+    /// role, attention.
+    ///
+    /// Bound to prefix+shift+o by configure and exposed as the
+    /// `herdr-agent-quota.toggle-order` action. Sets the Agent view and
+    /// republishes from cache; it fetches no quota and rewrites no config.
+    ToggleOrder,
+    /// Check the custom groups file and show which seat lands in which group.
+    ///
+    /// Reads `groups` from the plugin config directory (or `--file`) and the
+    /// pane labels (metadata only). Writes nothing.
+    Groups {
+        /// A rules file to check instead of the installed one.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
     },
     /// Render the settings pane shown in the Herdr popup pane.
     Settings,
@@ -473,6 +509,10 @@ pub struct ConfigureOptions {
     pub brand_colors: Option<BrandColors>,
     pub agent_order: Option<AgentOrder>,
     pub low_quota_alert: Option<LowQuotaAlert>,
+    pub sidebar_rows: Option<SidebarRows>,
+    pub icon_style: Option<crate::icons::IconStyle>,
+    pub group_style: Option<crate::look::GroupStyle>,
+    pub logo_layout: Option<crate::look::LogoLayout>,
 }
 
 /// Which side of a quota window a percentage reports.
@@ -599,10 +639,23 @@ fn parse_row_gap(value: &str) -> Result<SidebarRowGap, String> {
 /// and an active one replaces the user's own `ui.agent_panel_sort` policy
 /// until it is cleared.
 ///
+/// `attention` is the flat, cross-Space variant: Herdr's own `attention`
+/// rank first (blocked, then unseen completion, then working, then idle),
+/// headroom second. Spaces are deliberately not kept contiguous — the point
+/// is to find the agent that needs the user wherever it lives — so the
+/// `$quota_group` header is not published under it and the identity row
+/// names the Space itself.
+///
 /// Default is `quota`: Space grouping is what most installs want with the
 /// `$quota_group` headers, and ranking by headroom is a free extra on top.
 /// Choose `default` to hand the panel back to Herdr's own policy (also
 /// Space-grouped unless the user set `priority`).
+///
+/// Round five (owner 0928) adds `role` — grouped like `quota`, but inside a
+/// group 统筹, 秘书, hub, subhub, spoke, svc come in that order, tightest quota
+/// first within a role — and `tightest`, a flat list by quota alone. Both
+/// grouped orders also honour the user's custom groups (`crate::groups`),
+/// which sit above the Spaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum AgentOrder {
     /// Leave Herdr's own ordering alone.
@@ -610,28 +663,98 @@ pub enum AgentOrder {
     /// By space, then least quota left first.
     #[default]
     Quota,
+    /// Across spaces: needs-you first, then working, then idle; least quota
+    /// left first inside each band.
+    Attention,
+    /// By group, then role (统筹 秘书 hub subhub spoke svc), then least quota
+    /// left first.
+    Role,
+    /// Across spaces, least quota left first.
+    Tightest,
 }
 
 impl AgentOrder {
     pub const ENV: &'static str = "HERDR_AGENT_QUOTA_AGENT_ORDER";
-    /// Herdr's label for the view, shown where it names the active sort.
-    pub const LABEL: &'static str = "Quota by space";
+    /// The order the settings pane cycles through.
+    pub const CHOICES: [Self; 5] = [
+        Self::Default,
+        Self::Quota,
+        Self::Attention,
+        Self::Role,
+        Self::Tightest,
+    ];
+    /// What the toggle key (prefix+shift+o) steps through. `default` hands
+    /// the panel away and `tightest` is rarely wanted with identity rows
+    /// that show no quota digits, so both are left to the settings pane
+    /// (Codex r5 g1 §5).
+    pub const CYCLE: [Self; 3] = [Self::Quota, Self::Role, Self::Attention];
+
+    /// The toggle key's next order; from `default` it starts the cycle.
+    pub fn next(self) -> Self {
+        Self::CYCLE
+            .iter()
+            .position(|order| *order == self)
+            .map_or(Self::Quota, |index| {
+                Self::CYCLE[(index + 1) % Self::CYCLE.len()]
+            })
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::Quota => "quota",
+            Self::Attention => "attention",
+            Self::Role => "role",
+            Self::Tightest => "tightest",
         }
     }
 
-    pub fn is_quota(self) -> bool {
-        self == Self::Quota
+    /// Herdr's label for the view, shown in the Agent panel header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "",
+            // ASCII on purpose: Herdr 0.9.1 lays the panel title out by
+            // characters, so a CJK label overprints its neighbours (sb7 0928).
+            Self::Quota => "Quota by group",
+            Self::Attention => "attention",
+            Self::Role => "Role by group",
+            Self::Tightest => "tightest quota",
+        }
+    }
+
+    /// Does this order install an Agent view owned by this plugin?
+    pub fn owns_view(self) -> bool {
+        self != Self::Default
+    }
+
+    /// Are a Space's (or custom group's) panes contiguous in the panel? Only
+    /// then does the `$quota_group` header on its first pane read as a
+    /// header.
+    pub fn groups_by_space(self) -> bool {
+        matches!(self, Self::Default | Self::Quota | Self::Role)
+    }
+
+    /// Does this order honour the user's custom groups? Only the orders
+    /// whose view this plugin owns and groups: under `default` Herdr orders
+    /// the panel and knows nothing of `al_grp`.
+    pub fn custom_groups(self) -> bool {
+        matches!(self, Self::Quota | Self::Role | Self::Attention)
+    }
+
+    /// Does the plugin publish group headers under this order? The grouped
+    /// orders do, and so does `attention` since owner 0928 (option B):
+    /// colour bands first, then a header for each group inside a band.
+    pub fn headed(self) -> bool {
+        self.groups_by_space() || self == Self::Attention
     }
 
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "default" | "herdr" | "off" => Some(Self::Default),
             "quota" | "headroom" | "grouped" | "on" => Some(Self::Quota),
+            "attention" | "action" | "needs-you" => Some(Self::Attention),
+            "role" | "roles" => Some(Self::Role),
+            "tightest" | "flat" | "flat-quota" => Some(Self::Tightest),
             _ => None,
         }
     }
@@ -644,6 +767,49 @@ impl AgentOrder {
             .ok()
             .as_deref()
             .and_then(Self::parse)
+    }
+}
+
+/// Which rows the sidebar carries.
+///
+/// `identity` (default) is the owner's 0926 ask: who each seat is — role,
+/// model short name, session name, Tab — and no usage rows. Its rows are the
+/// same under every Agent order, so toggling the order never needs the
+/// (client-local) row configuration rewritten. `quota` is the earlier layout
+/// with every usage row; the collectors run and publish either way, so
+/// switching back loses nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum SidebarRows {
+    #[default]
+    Identity,
+    Quota,
+}
+
+impl SidebarRows {
+    pub const ENV: &'static str = "HERDR_AGENT_QUOTA_SIDEBAR_ROWS";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Quota => "quota",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "identity" | "who" => Some(Self::Identity),
+            "quota" | "usage" | "full" => Some(Self::Quota),
+            _ => None,
+        }
+    }
+
+    pub fn from_arg_or_env(value: Option<Self>) -> Option<Self> {
+        value.or_else(|| {
+            std::env::var(Self::ENV)
+                .ok()
+                .as_deref()
+                .and_then(Self::parse)
+        })
     }
 }
 
@@ -712,6 +878,11 @@ impl std::fmt::Display for LowQuotaAlert {
     }
 }
 
+fn parse_icon_style(value: &str) -> Result<crate::icons::IconStyle, String> {
+    crate::icons::IconStyle::parse(value)
+        .ok_or_else(|| "icon-style must be glyph or letter".to_string())
+}
+
 fn parse_low_quota_alert(value: &str) -> Result<LowQuotaAlert, String> {
     LowQuotaAlert::parse(value)
         .ok_or_else(|| "low-quota-alert must be off or a percentage from 1 to 100".to_string())
@@ -775,6 +946,7 @@ impl AgentSelection {
         match harness {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
+            Harness::Cursor => "cursor",
         }
     }
 
@@ -884,12 +1056,54 @@ mod tests {
 
     #[test]
     fn an_agent_order_round_trips_through_its_stored_form() {
-        for order in [AgentOrder::Default, AgentOrder::Quota] {
+        for order in [
+            AgentOrder::Default,
+            AgentOrder::Quota,
+            AgentOrder::Attention,
+        ] {
             assert_eq!(AgentOrder::parse(order.as_str()), Some(order));
         }
         assert_eq!(AgentOrder::parse(" QUOTA "), Some(AgentOrder::Quota));
+        assert_eq!(AgentOrder::parse("Attention"), Some(AgentOrder::Attention));
         assert_eq!(AgentOrder::parse("sideways"), None);
         assert_eq!(AgentOrder::default(), AgentOrder::Quota);
+    }
+
+    #[test]
+    fn only_the_attention_order_scatters_spaces() {
+        assert!(AgentOrder::Default.groups_by_space());
+        assert!(AgentOrder::Quota.groups_by_space());
+        assert!(!AgentOrder::Attention.groups_by_space());
+        assert!(AgentOrder::Role.groups_by_space());
+        assert!(!AgentOrder::Tightest.groups_by_space());
+        assert!(AgentOrder::Attention.headed());
+        assert!(!AgentOrder::Tightest.headed());
+    }
+
+    #[test]
+    fn the_toggle_cycles_three_presets_and_default_starts_it() {
+        let mut order = AgentOrder::Default;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            order = order.next();
+            seen.push(order);
+        }
+        assert_eq!(
+            seen,
+            [
+                AgentOrder::Quota,
+                AgentOrder::Role,
+                AgentOrder::Attention,
+                AgentOrder::Quota,
+                AgentOrder::Role
+            ]
+        );
+        for order in AgentOrder::CHOICES {
+            assert_eq!(AgentOrder::parse(order.as_str()), Some(order));
+        }
+        assert!(!AgentOrder::Default.owns_view());
+        assert!(AgentOrder::Quota.owns_view());
+        assert!(AgentOrder::Attention.owns_view());
     }
 
     #[test]

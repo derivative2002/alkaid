@@ -1,13 +1,15 @@
 use crate::cli::{
-    AgentSelection, BrandColors, FieldSet, SidebarField, SidebarLayout, SidebarRowGap,
+    AgentOrder, AgentSelection, BrandColors, FieldSet, SidebarField, SidebarLayout, SidebarRowGap,
+    SidebarRows,
 };
+use crate::look::{GroupStyle, LogoLayout};
 use crate::model::Harness;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
 
-const QUOTA_ROW_MARKERS: [&str; 51] = [
+const QUOTA_ROW_MARKERS: [&str; 59] = [
     "$quota_badge",
     "$quota_state",
     "$quota_icon",
@@ -59,6 +61,14 @@ const QUOTA_ROW_MARKERS: [&str; 51] = [
     "$quota_month_warning",
     "$quota_month_danger",
     "$quota_month_unknown",
+    "$al_role",
+    "$al_model",
+    "$al_space",
+    "$al_gap",
+    "$al_channel",
+    "$al_model_mark",
+    "$al_pin_head",
+    "$al_pin_bar",
 ];
 const ROW_GAP_MARKER: &str = "herdr-agent-quota";
 const MANAGED_ROW_MARKER: &str = "herdr-agent-quota-row";
@@ -69,6 +79,34 @@ const REFRESH_KEY: &str = "prefix+shift+r";
 const REFRESH_ACTION: &str = "herdr-agent-quota.refresh";
 const SETTINGS_KEY: &str = "prefix+shift+q";
 const SETTINGS_ACTION: &str = "herdr-agent-quota.open-settings";
+const TOGGLE_ORDER_KEY: &str = "prefix+shift+o";
+const TOGGLE_ORDER_ACTION: &str = "herdr-agent-quota.toggle-order";
+
+/// The identity rows' look: Space header style and where logos sit. Both
+/// change the configured rows, so both are part of what uninstall must
+/// recognise as this plugin's own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowLook {
+    pub group: GroupStyle,
+    pub logos: LogoLayout,
+}
+
+impl RowLook {
+    fn every() -> Vec<Self> {
+        let mut looks = Vec::new();
+        for group in [
+            GroupStyle::Plain,
+            GroupStyle::Rule,
+            GroupStyle::Count,
+            GroupStyle::Bar,
+        ] {
+            for logos in [LogoLayout::None, LogoLayout::Inline, LogoLayout::SecondRow] {
+                looks.push(Self { group, logos });
+            }
+        }
+        looks
+    }
+}
 const CONFIG_PRESENCE_FILE: &str = "herdr-config.original.present";
 // Brand answers "who"; status answers "how much is left". All other text
 // inherits Herdr's active theme. Selected state may change background only —
@@ -80,6 +118,12 @@ const QUOTA_WARNING_COLOR: &str = "#e4b957";
 /// `state_icon` palette so the brand glyph replaces the ring without a second
 /// circle on the row.
 const IDLE_ICON_COLOR: &str = "#e9e9f0";
+/// Space headers and channel marks in the rule / bar candidates (0927).
+const ACCENT_COLOR: &str = "#89b4fa";
+/// The band on a pinned seat's rows (owner 0928: the resident coordinator
+/// gets a background; Herdr 0.9.1 rows take no background, so a column of
+/// ▌ in this colour stands in for one).
+const PIN_BAND_COLOR: &str = "#cba6f7";
 /// Secondary ink for Herdr's native `agent` name row. A step dimmer than the
 /// provider/model identity so the harness name reads as a subtitle, not a
 /// second heading.
@@ -125,17 +169,22 @@ fn selected_providers(agents: &[Harness]) -> impl Iterator<Item = &'static str> 
         .map(|(_, provider)| provider)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn check(
     agents: &[Harness],
     layout: SidebarLayout,
     row_gap: SidebarRowGap,
     fields: FieldSet,
     brand: BrandColors,
+    order: AgentOrder,
+    rows: SidebarRows,
+    look: RowLook,
 ) -> Result<()> {
     let path = config_path()?;
     let original = fs::read_to_string(&path).unwrap_or_default();
-    let (updated, skipped) =
-        rewrite_quota_sidebar(&original, agents, layout, row_gap, fields, brand)?;
+    let (updated, skipped) = rewrite_quota_sidebar(
+        &original, agents, layout, row_gap, fields, brand, order, rows, look,
+    )?;
     if updated == original {
         println!(
             "Herdr sidebar already contains quota tokens: {}",
@@ -155,18 +204,23 @@ pub fn check(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply(
     agents: &[Harness],
     layout: SidebarLayout,
     row_gap: SidebarRowGap,
     fields: FieldSet,
     brand: BrandColors,
+    order: AgentOrder,
+    rows: SidebarRows,
+    look: RowLook,
 ) -> Result<()> {
     let path = config_path()?;
     let existed = path.exists();
     let original = fs::read_to_string(&path).unwrap_or_default();
-    let (updated, skipped) =
-        rewrite_quota_sidebar(&original, agents, layout, row_gap, fields, brand)?;
+    let (updated, skipped) = rewrite_quota_sidebar(
+        &original, agents, layout, row_gap, fields, brand, order, rows, look,
+    )?;
     if let Some(line) = skipped_provider_notice(&skipped) {
         println!("{line}");
     }
@@ -384,9 +438,10 @@ fn reversible_backup(
 ///
 /// The stored field set and brand choice come first: they are the ones that
 /// produced the rows on disk. The full defaults follow, so a configuration
-/// written before those settings existed is still recognised. Layout and row
-/// gap stay brute-forced — there are only six combinations, and neither is
-/// recoverable from a config this function is deciding whether to trust.
+/// written before those settings existed is still recognised. Layout, row
+/// gap and the grouped/flat row shape stay brute-forced — there are only
+/// twelve combinations, and none is recoverable from a config this function
+/// is deciding whether to trust.
 fn matches_installed_quota_rows(
     original: &str,
     current: &str,
@@ -400,16 +455,29 @@ fn matches_installed_quota_rows(
     for (fields, brand) in variants {
         for layout in SidebarLayout::CHOICES {
             for gap in [SidebarRowGap::FLUSH, SidebarRowGap::SEPARATED] {
-                if add_quota_row_with(
-                    original,
-                    &AgentSelection::SUPPORTED,
-                    layout,
-                    gap,
-                    fields,
-                    brand,
-                )? == current
-                {
-                    return Ok(true);
+                for order in [AgentOrder::Quota, AgentOrder::Attention] {
+                    let candidates = std::iter::once((SidebarRows::Quota, RowLook::default()))
+                        .chain(
+                            RowLook::every()
+                                .into_iter()
+                                .map(|look| (SidebarRows::Identity, look)),
+                        );
+                    for (rows, look) in candidates {
+                        if add_sidebar_rows_look(
+                            original,
+                            &AgentSelection::SUPPORTED,
+                            layout,
+                            gap,
+                            fields,
+                            brand,
+                            order,
+                            rows,
+                            look,
+                        )? == current
+                        {
+                            return Ok(true);
+                        }
+                    }
                 }
             }
         }
@@ -440,6 +508,7 @@ pub fn add_quota_row_for(input: &str, agents: &[Harness], layout: SidebarLayout)
     )
 }
 
+/// The Space-grouped rows (`quota` and `default` order).
 pub fn add_quota_row_with(
     input: &str,
     agents: &[Harness],
@@ -448,9 +517,86 @@ pub fn add_quota_row_with(
     fields: FieldSet,
     brand: BrandColors,
 ) -> Result<String> {
-    Ok(rewrite_quota_sidebar(input, agents, layout, row_gap, fields, brand)?.0)
+    add_quota_row_ordered(
+        input,
+        agents,
+        layout,
+        row_gap,
+        fields,
+        brand,
+        AgentOrder::Quota,
+    )
 }
 
+/// Rows for a given Agent order. Only [`AgentOrder::Attention`] changes them:
+/// the panel is flat there, so the identity row names the Space itself and
+/// leads with the action state instead of relying on a `$quota_group` header.
+pub fn add_quota_row_ordered(
+    input: &str,
+    agents: &[Harness],
+    layout: SidebarLayout,
+    row_gap: SidebarRowGap,
+    fields: FieldSet,
+    brand: BrandColors,
+    order: AgentOrder,
+) -> Result<String> {
+    add_sidebar_rows(
+        input,
+        agents,
+        layout,
+        row_gap,
+        fields,
+        brand,
+        order,
+        SidebarRows::Quota,
+    )
+}
+
+/// Full form: `rows` picks the identity rows or the usage rows.
+#[allow(clippy::too_many_arguments)]
+pub fn add_sidebar_rows(
+    input: &str,
+    agents: &[Harness],
+    layout: SidebarLayout,
+    row_gap: SidebarRowGap,
+    fields: FieldSet,
+    brand: BrandColors,
+    order: AgentOrder,
+    rows: SidebarRows,
+) -> Result<String> {
+    add_sidebar_rows_look(
+        input,
+        agents,
+        layout,
+        row_gap,
+        fields,
+        brand,
+        order,
+        rows,
+        RowLook::default(),
+    )
+}
+
+/// Full form with the identity rows' look.
+#[allow(clippy::too_many_arguments)]
+pub fn add_sidebar_rows_look(
+    input: &str,
+    agents: &[Harness],
+    layout: SidebarLayout,
+    row_gap: SidebarRowGap,
+    fields: FieldSet,
+    brand: BrandColors,
+    order: AgentOrder,
+    rows: SidebarRows,
+    look: RowLook,
+) -> Result<String> {
+    Ok(rewrite_quota_sidebar(
+        input, agents, layout, row_gap, fields, brand, order, rows, look,
+    )?
+    .0)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rewrite_quota_sidebar(
     input: &str,
     agents: &[Harness],
@@ -458,6 +604,9 @@ fn rewrite_quota_sidebar(
     row_gap: SidebarRowGap,
     fields: FieldSet,
     _brand: BrandColors,
+    order: AgentOrder,
+    rows: SidebarRows,
+    look: RowLook,
 ) -> Result<(String, Vec<&'static str>)> {
     let mut document = if input.trim().is_empty() {
         DocumentMut::new()
@@ -477,6 +626,12 @@ fn rewrite_quota_sidebar(
         SETTINGS_KEY,
         SETTINGS_ACTION,
         "open agent quota settings",
+    )?;
+    add_plugin_keybinding(
+        &mut document,
+        TOGGLE_ORDER_KEY,
+        TOGGLE_ORDER_ACTION,
+        "agent panel: toggle Space grouping / attention order",
     )?;
     ensure_spaces_panel_sort(&mut document)?;
     let table = ensure_table(&mut document, &["ui", "sidebar", "agents"])?;
@@ -501,6 +656,9 @@ fn rewrite_quota_sidebar(
         original_rows,
         layout,
         fields,
+        order,
+        rows,
+        look,
         if rows_safe {
             RowRewrite::Takeover
         } else {
@@ -536,6 +694,9 @@ fn build_managed_rows(
     original: Option<&Array>,
     layout: SidebarLayout,
     fields: FieldSet,
+    order: AgentOrder,
+    rows: SidebarRows,
+    look: RowLook,
     rewrite: RowRewrite,
 ) -> Result<Array> {
     let preserved = match rewrite {
@@ -571,21 +732,27 @@ fn build_managed_rows(
     };
     let user_count = preserved.len();
     let mut updated_rows = preserved;
-    append_quota_rows(&mut updated_rows, layout);
-    // Keep `$quota_group` first so Space aggregation stays the head row;
-    // user-owned extras (pane/git/other plugins) sit directly under it.
+    match rows {
+        SidebarRows::Identity => append_identity_rows(&mut updated_rows, look),
+        SidebarRows::Quota => append_quota_rows(&mut updated_rows, layout, order),
+    }
+    // Keep the head row (`$quota_group`, or the attention identity row)
+    // first; user-owned extras (pane/git/other plugins) sit directly under it.
+    let head_rows = 1;
     if user_count > 0 {
         let mut reordered = Array::new();
-        reordered.push(
-            updated_rows
-                .get(user_count)
-                .expect("group header follows preserved rows")
-                .clone(),
-        );
+        for index in user_count..user_count + head_rows {
+            reordered.push(
+                updated_rows
+                    .get(index)
+                    .expect("head rows follow preserved rows")
+                    .clone(),
+            );
+        }
         for index in 0..user_count {
             reordered.push(updated_rows.get(index).expect("preserved row").clone());
         }
-        for index in (user_count + 1)..updated_rows.len() {
+        for index in (user_count + head_rows)..updated_rows.len() {
             reordered.push(updated_rows.get(index).expect("quota row").clone());
         }
         updated_rows = reordered;
@@ -811,7 +978,7 @@ fn remove_plugin_keybindings(document: &mut DocumentMut) {
     for command in commands.iter() {
         if !matches!(
             command.get("command").and_then(Item::as_str),
-            Some(REFRESH_ACTION | SETTINGS_ACTION)
+            Some(REFRESH_ACTION | SETTINGS_ACTION | TOGGLE_ORDER_ACTION)
         ) {
             retained.push(command.clone());
         }
@@ -947,7 +1114,15 @@ fn is_stock_navigation_row(row: &Array) -> bool {
         && row.iter().all(|item| {
             matches!(
                 configured_token_name(item),
-                Some("state_icon" | "machine" | "workspace" | "tab" | "agent")
+                Some(
+                    "state_icon"
+                        | "state_text"
+                        | "machine"
+                        | "workspace"
+                        | "tab"
+                        | "agent"
+                        | "pane"
+                )
             )
         })
 }
@@ -956,11 +1131,16 @@ fn is_stock_navigation_row(row: &Array) -> bool {
 /// are stripped. A repair must drop them before appending fresh rows, or every
 /// re-apply would stack a second copy of each.
 fn is_managed_navigation_residue(row: &Array) -> bool {
-    row.len() == 1
-        && matches!(
-            row.get(0).and_then(configured_token_name),
-            Some("tab" | "agent")
-        )
+    let names = row
+        .iter()
+        .map(configured_token_name)
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+    matches!(names.as_slice(), ["tab" | "agent" | "pane"])
+        // The attention identity row once its brand icons are stripped.
+        || names == ["state_text", "workspace", "tab"]
+        // The identity row once its icons and `$al_space` are stripped.
+        || names == ["state_text", "tab"]
 }
 
 fn herdr_native_agent_row() -> Value {
@@ -971,7 +1151,11 @@ fn is_standalone_agent_row(row: &Array) -> bool {
     row.len() == 1 && row.get(0).and_then(Value::as_str) == Some("agent")
 }
 
-fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
+fn append_quota_rows(rows: &mut Array, layout: SidebarLayout, order: AgentOrder) {
+    if !order.groups_by_space() {
+        append_attention_rows(rows, layout);
+        return;
+    }
     // Group header first: empty on non-head panes so Herdr collapses the row.
     // The stock machine/workspace identity stays omitted on purpose — the group
     // header is the Space name, and repeating it on every pane is what made the
@@ -1004,6 +1188,155 @@ fn append_quota_rows(rows: &mut Array, layout: SidebarLayout) {
     )));
     // The user prompt, dimmed so it reads as the pane's subtitle rather than a
     // second heading.
+    rows.push(Value::Array(styled_row(
+        "$quota_topic",
+        None,
+        Some(false),
+        Some(true),
+    )));
+    append_quota_body_rows(rows, layout);
+}
+
+/// The identity rows (default since 0926): who each seat is, no usage rows.
+///
+/// One template for every Agent order, so the order can be toggled without
+/// touching this configuration — which matters because Herdr reads rows from
+/// the *client's* local config, and a `--remote` client's config is not on
+/// this machine. What differs by order is published, not configured:
+/// `$quota_group` heads a Space only when grouped, `$al_space` names it on
+/// each seat only when not; the other is empty and Herdr collapses it.
+///
+/// 1. `$quota_group`
+/// 2. the harness icon twins in the existing three colours — the colour is
+///    the state, no state text (owner 0927) — then `$al_space`, `tab`
+/// 3. `$al_role` from the pane label (naming-spec §5), then with the
+///    default second-row logos `$al_channel` and `$al_model_mark`, then
+///    `$al_model`, the short name of the model the seat's own session files
+///    last used (`?` when they cannot be found)
+/// 4. `pane` — the pane label itself, i.e. the session name
+fn append_identity_rows(rows: &mut Array, look: RowLook) {
+    let (group_fg, group_bold) = match look.group {
+        GroupStyle::Plain | GroupStyle::Count => (None, true),
+        GroupStyle::Rule | GroupStyle::Bar => (Some(ACCENT_COLOR), true),
+    };
+    rows.push(Value::Array(styled_row(
+        "$quota_group",
+        group_fg,
+        Some(group_bold),
+        Some(false),
+    )));
+    // Only the harness mark carries status colour; channel and model marks
+    // are the neutral secondary grey so they never read as a status.
+    let channel = styled_token(
+        "$al_channel",
+        Some(AGENT_SECONDARY_COLOR),
+        Some(false),
+        Some(false),
+    );
+    let mark = styled_token(
+        "$al_model_mark",
+        Some(AGENT_SECONDARY_COLOR),
+        Some(false),
+        Some(false),
+    );
+    // A pinned seat's band opens each of its rows; the first row's cell
+    // carries the member indent so the three bars share one column. Empty
+    // on every other seat, so it draws nothing there.
+    let band = |token: &str| styled_token(token, Some(PIN_BAND_COLOR), Some(false), Some(false));
+    // Icons first after the band: a Space member's indent rides on the icon
+    // value (`GROUP_MEMBER_INDENT`), which only indents the row from its
+    // first cell.
+    let mut identity = Array::new();
+    identity.push(band("$al_pin_head"));
+    for cell in brand_icon_cells() {
+        identity.push(cell);
+    }
+    if look.logos == LogoLayout::Inline {
+        identity.push(channel.clone());
+        identity.push(mark.clone());
+    }
+    // No state text: the harness mark's colour is the state (owner 0927 —
+    // white idle or seen, yellow working, teal finished and unseen).
+    identity.push(styled_token(
+        "$al_space",
+        Some(AGENT_SECONDARY_COLOR),
+        Some(false),
+        Some(false),
+    ));
+    identity.push(styled_token("tab", None, Some(true), Some(false)));
+    rows.push(Value::Array(identity));
+    let mut seat = Array::new();
+    seat.push(band("$al_pin_bar"));
+    seat.push(styled_token(
+        "$al_role",
+        Some(IDLE_ICON_COLOR),
+        Some(true),
+        Some(false),
+    ));
+    if look.logos == LogoLayout::SecondRow {
+        seat.push(channel);
+        seat.push(mark);
+    }
+    seat.push(styled_token(
+        "$al_model",
+        Some(AGENT_SECONDARY_COLOR),
+        Some(false),
+        Some(false),
+    ));
+    rows.push(Value::Array(seat));
+    rows.push(Value::Array(Array::from_iter([
+        band("$al_pin_bar"),
+        styled_token("pane", None, Some(false), Some(true)),
+    ])));
+    // A gapped style's blank line: last row, published only on the last
+    // pane of each Space, so it separates Spaces without indenting a header
+    // (Herdr hang-indents every row after a pane's first).
+    if look.group.gaps() {
+        rows.push(Value::Array(styled_row(
+            "$al_gap",
+            None,
+            Some(false),
+            Some(false),
+        )));
+    }
+}
+
+/// The attention order's rows: the Space-grouped rows minus `$quota_group`,
+/// with the identity row carrying what the header used to say.
+///
+/// Row 1 is DESIGN-r3's action-first head: Herdr's `state_text` (the plugin
+/// writes Chinese labels for it, see `herdr::ATTENTION_STATE_LABELS`), the
+/// brand icon twins, the Space name, then the Tab. `state_text` keeps Herdr's
+/// own per-status colour — no `fg` here — and follows a status change on
+/// render, so the head needs no metadata write when an agent starts or
+/// finishes. Everything below the head row is the grouped layout unchanged,
+/// so no quota row is lost by switching order.
+fn append_attention_rows(rows: &mut Array, layout: SidebarLayout) {
+    let mut identity = Array::new();
+    identity.push(styled_token("state_text", None, Some(true), Some(false)));
+    for cell in brand_icon_cells().iter() {
+        identity.push(cell.clone());
+    }
+    identity.push(styled_token(
+        "workspace",
+        Some(AGENT_SECONDARY_COLOR),
+        Some(false),
+        Some(false),
+    ));
+    identity.push(styled_token("tab", None, Some(true), Some(false)));
+    rows.push(Value::Array(identity));
+    rows.push(Value::Array(styled_row(
+        "agent",
+        Some(AGENT_SECONDARY_COLOR),
+        Some(false),
+        Some(false),
+    )));
+    rows.push(Value::Array(styled_row(
+        "$quota_provider_model",
+        Some(IDLE_ICON_COLOR),
+        Some(false),
+        Some(false),
+    )));
     rows.push(Value::Array(styled_row(
         "$quota_topic",
         None,
@@ -2367,6 +2700,9 @@ claude = [["state_icon", "agent"]]
             SidebarRowGap::default(),
             FieldSet::all(),
             BrandColors::On,
+            AgentOrder::Quota,
+            SidebarRows::Quota,
+            RowLook::default(),
         )
         .unwrap()
         .1;

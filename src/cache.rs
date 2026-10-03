@@ -60,6 +60,15 @@ pub struct StatuslineObservation {
     pub payload: Value,
 }
 
+/// One provider's last failed fetch, as written by
+/// [`CacheStore::record_provider_error`]. `error` carries the whole anyhow
+/// chain, so the OS-level cause is in the file and not only its context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderErrorRecord {
+    pub at_unix: u64,
+    pub error: String,
+}
+
 impl CacheStore {
     pub fn from_env() -> Result<Self> {
         let root = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
@@ -755,6 +764,38 @@ impl CacheStore {
             .context("write refresh marker")
     }
 
+    /// Keep a failed fetch where it can be read from outside this process.
+    ///
+    /// A failure is otherwise silent: the watcher started for an event has
+    /// its stderr set to null, and every caller of `refresh_selected` drops
+    /// the outcome. On Windows the whole diagnosis of a missing Codex quota
+    /// is one line — the OS error behind `start codex app-server` — so the
+    /// whole chain is written here, with the provider it belongs to.
+    pub fn record_provider_error(&self, provider: Provider, error: &str) -> Result<()> {
+        self.ensure()?;
+        fs::write(
+            self.provider_error_path(provider),
+            serde_json::to_vec(&ProviderErrorRecord {
+                at_unix: Self::now_unix(),
+                error: error.to_string(),
+            })?,
+        )
+        .context("write provider error")
+    }
+
+    /// Drop a provider's recorded failure once a fetch succeeds.
+    pub fn clear_provider_error(&self, provider: Provider) -> Result<()> {
+        match fs::remove_file(self.provider_error_path(provider)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("remove provider error"),
+        }
+    }
+
+    fn provider_error_path(&self, provider: Provider) -> PathBuf {
+        self.root.join(format!("{}.error.json", provider.source()))
+    }
+
     pub fn mark_refresh_account(
         &self,
         provider: Provider,
@@ -1240,6 +1281,36 @@ mod tests {
             directory.path().join("icon-attention.json").exists(),
             "empty attention must stay on disk so hydrate does not re-run"
         );
+    }
+
+    #[test]
+    fn a_failed_fetch_is_recorded_with_its_whole_chain_and_cleared_on_success() {
+        // A watcher's stderr is null and every caller drops the outcome, so
+        // this file is the only place a spawn failure (Windows 1001: the OS
+        // error under "start codex app-server") can be read from outside.
+        let directory = tempdir().unwrap();
+        let cache = CacheStore::new(directory.path());
+        let path = directory.path().join("codex-app-server.error.json");
+        cache.clear_provider_error(Provider::Codex).unwrap();
+        assert!(!path.exists());
+
+        cache
+            .record_provider_error(Provider::Codex, "start codex app-server: not found")
+            .unwrap();
+        let recorded: ProviderErrorRecord =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(recorded.error, "start codex app-server: not found");
+        assert!(recorded.at_unix > 0);
+        // Another provider's record is a different file.
+        assert!(!directory
+            .path()
+            .join("claude-statusline.error.json")
+            .exists());
+
+        cache.clear_provider_error(Provider::Codex).unwrap();
+        assert!(!path.exists());
+        // Clearing one that is not there is not an error.
+        cache.clear_provider_error(Provider::Codex).unwrap();
     }
 
     #[test]
