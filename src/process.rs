@@ -292,6 +292,12 @@ fn has_exited(child: &mut Child) -> Result<bool> {
         .context("look at previous statusLine")
 }
 
+/// What a test double gets to look at when a tree is ended: the root, at that
+/// instant. Named once so the field and the two helpers that build a double
+/// read the same, and so the shape stays below `clippy::type_complexity`.
+#[cfg(test)]
+type EndWatcher = Arc<dyn Fn(&mut Child) + Send + Sync>;
+
 /// Everything a child we started went on to start, so it can be ended as
 /// one. On Unix the child was put in its own process group before exec
 /// (`setpgid`). On Windows there are no POSIX process groups, and Git's MSYS
@@ -311,7 +317,7 @@ pub(crate) struct Tree {
     /// often: the root's state at that instant, and the number of endings.
     /// Carried on the value for the same reason `fails` is.
     #[cfg(test)]
-    on_end: Option<Arc<dyn Fn(&mut Child) + Send + Sync>>,
+    on_end: Option<EndWatcher>,
 }
 
 impl Tree {
@@ -843,10 +849,9 @@ mod tests {
             run_shell_with_deadline("printf done; exit 0", b"", Duration::from_secs(2)).unwrap();
         clear();
         assert_eq!(result.exit_code, Some(0));
-        let report = ROOT_AT_END
+        let report = *ROOT_AT_END
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
+            .unwrap_or_else(|error| error.into_inner());
         match report {
             Some(Ok(pid)) if pid != 0 => {}
             other => panic!(
@@ -1061,7 +1066,7 @@ mod tests {
 
     /// What `conforming_tree` gives, with a double that is told each time
     /// the tree is ended, so a caller that ends it twice is visible.
-    fn conforming_tree_watching(on_end: Option<Arc<dyn Fn(&mut Child) + Send + Sync>>) -> Tree {
+    fn conforming_tree_watching(on_end: Option<EndWatcher>) -> Tree {
         Tree {
             #[cfg(windows)]
             job: None,
@@ -1079,7 +1084,7 @@ mod tests {
     /// The same failing tree, with a double that is told each time the tree
     /// is ended. The ending still fails, so a caller that acts on the tree
     /// after the command is finished shows up as a second call.
-    fn failing_tree_watching(on_end: Option<Arc<dyn Fn(&mut Child) + Send + Sync>>) -> Tree {
+    fn failing_tree_watching(on_end: Option<EndWatcher>) -> Tree {
         Tree {
             #[cfg(windows)]
             job: None,
